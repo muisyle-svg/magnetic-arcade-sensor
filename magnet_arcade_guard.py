@@ -2,6 +2,7 @@ import ctypes
 import json
 import os
 import queue
+import random
 import subprocess
 import sys
 import threading
@@ -62,6 +63,13 @@ except ImportError:
     PIL_AVAILABLE = False
 
 try:
+    import av
+
+    AV_AVAILABLE = True
+except ImportError:
+    AV_AVAILABLE = False
+
+try:
     import pygame
 
     PYGAME_AVAILABLE = True
@@ -84,14 +92,36 @@ DEFAULT_CONFIG = {
     "auto_activate": False,
     "serial_port": "",
     "big_box_ready_delay_seconds": 1.5,
-    "sensor_stable_ms": 100,
+    "sensor_stable_ms": 60,
     "final_emerald_pause_ms": 150,
     "sound_effect_cooldown_ms": 350,
     "counter_flash_ms": 300,
     "robotnik_fade_ms": 250,
     "music_volume": 0.75,
     "sound_effect_volume": 1.0,
-    "removal_sound_file": "emerald-removed.mp3",
+    "removal_sound_files": [
+        "ohh-no-the-chaos-emerald.mp3",
+        "ohh-no.mp3",
+        "ohh-now-what.mp3",
+        "stop.mp3",
+    ],
+    "last_emerald_removal_sound_file": (
+        "no-he-s-got-the-last-emerald.mp3"
+    ),
+    "final_completion_sound_file": (
+        "i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3"
+    ),
+    "default_mode": "story",
+    "normal_warning_seconds": 10.0,
+    "story_announcement_seconds": 2.5,
+    "story_shutdown_seconds": 5.0,
+    "story_question_seconds": 6.0,
+    "story_eggman_seconds": 3.0,
+    "cinematic_fade_seconds": 0.8,
+    "cinematic_video_file": (
+        "2015-02-19-SonictheHedgehogCD-Opening"
+        "(SonicBoomNAVersion).mp4.7fb0570ab57510d4a7d54beb920f6517.mp4"
+    ),
 }
 
 
@@ -170,11 +200,14 @@ EMULATOR_PROCESS_NAMES = {
 }
 
 BAUD_RATE = 115200
-CONNECTION_TIMEOUT_SECONDS = 3.0
+# The serial reader thread timestamps raw heartbeats independently of the Tk
+# UI thread. The extra margin also tolerates a slow Windows audio/session
+# operation without declaring a healthy ESP32 disconnected.
+CONNECTION_TIMEOUT_SECONDS = 5.0
 RECONNECT_DELAY_SECONDS = 1.0
 STABLE_COUNT_SECONDS = config_number(
-    RUNTIME_CONFIG.get("sensor_stable_ms", 100),
-    100,
+    RUNTIME_CONFIG.get("sensor_stable_ms", 60),
+    60,
     25,
     1000,
 ) / 1000.0
@@ -218,6 +251,50 @@ SOUND_EFFECT_VOLUME = config_number(
     0.0,
     1.0,
 )
+NORMAL_WARNING_SECONDS = config_number(
+    RUNTIME_CONFIG.get("normal_warning_seconds", 10.0),
+    10.0,
+    1.0,
+    60.0,
+)
+STORY_ANNOUNCEMENT_SECONDS = config_number(
+    RUNTIME_CONFIG.get("story_announcement_seconds", 2.5),
+    2.5,
+    0.5,
+    15.0,
+)
+STORY_SHUTDOWN_SECONDS = config_number(
+    RUNTIME_CONFIG.get("story_shutdown_seconds", 5.0),
+    5.0,
+    0.5,
+    15.0,
+)
+STORY_QUESTION_SECONDS = config_number(
+    RUNTIME_CONFIG.get("story_question_seconds", 6.0),
+    6.0,
+    1.0,
+    30.0,
+)
+STORY_EGGMAN_SECONDS = config_number(
+    RUNTIME_CONFIG.get("story_eggman_seconds", 3.0),
+    3.0,
+    1.0,
+    15.0,
+)
+CINEMATIC_FADE_SECONDS = config_number(
+    RUNTIME_CONFIG.get("cinematic_fade_seconds", 0.8),
+    0.8,
+    0.0,
+    5.0,
+)
+configured_default_mode = str(
+    RUNTIME_CONFIG.get("default_mode", "story")
+).strip().lower()
+DEFAULT_GUARD_MODE = (
+    configured_default_mode
+    if configured_default_mode in {"story", "normal"}
+    else "story"
+)
 try:
     BIG_BOX_READY_DELAY_SECONDS = max(
         0.5,
@@ -235,19 +312,50 @@ SUPERSONIC_IMAGE_NAME = "supersonic.gif"
 COMPLETION_AUDIO_NAME = "27. Sonic the Hedgehog Victory Theme.mp3"
 MISSING_AUDIO_NAME = "Dr Robotniks Theme.mp3"
 EMERALD_AUDIO_NAME = "emerald.mp3"
-REMOVAL_AUDIO_NAME = (
-    str(
+configured_removal_audio_names = RUNTIME_CONFIG.get(
+    "removal_sound_files",
+)
+if not isinstance(configured_removal_audio_names, list):
+    configured_removal_audio_names = [
         RUNTIME_CONFIG.get(
             "removal_sound_file",
-            "emerald-removed.mp3",
+            "ohh-no-the-chaos-emerald.mp3",
+        )
+    ]
+REMOVAL_AUDIO_NAMES = tuple(
+    dict.fromkeys(
+        str(name).strip()
+        for name in configured_removal_audio_names
+        if str(name).strip()
+    )
+) or ("ohh-no-the-chaos-emerald.mp3",)
+LAST_EMERALD_REMOVAL_AUDIO_NAME = str(
+    RUNTIME_CONFIG.get(
+        "last_emerald_removal_sound_file",
+        "no-he-s-got-the-last-emerald.mp3",
+    )
+).strip() or "no-he-s-got-the-last-emerald.mp3"
+FINAL_COMPLETION_AUDIO_NAME = str(
+    RUNTIME_CONFIG.get(
+        "final_completion_sound_file",
+        "i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3",
+    )
+).strip() or "i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3"
+EGGMAN_REVEAL_AUDIO_NAME = "so-egg-man-s-behind-this-huh.mp3"
+CINEMATIC_VIDEO_NAME = (
+    str(
+        RUNTIME_CONFIG.get(
+            "cinematic_video_file",
+            DEFAULT_CONFIG["cinematic_video_file"],
         )
     ).strip()
-    or "emerald-removed.mp3"
+    or DEFAULT_CONFIG["cinematic_video_file"]
 )
+
 SOURCE_ASSET_DIRECTORY = Path(
     os.environ.get(
         "MAGNET_GUARD_ASSET_DIR",
-        str(Path(__file__).resolve().parent.parent / "Emerald"),
+        str(Path(__file__).resolve().parents[2] / "Emerald"),
     )
 )
 ORIGINAL_BACKGROUND_IMAGE_PATH = (
@@ -268,21 +376,115 @@ ORIGINAL_MISSING_AUDIO_PATH = (
 ORIGINAL_EMERALD_AUDIO_PATH = (
     SOURCE_ASSET_DIRECTORY / EMERALD_AUDIO_NAME
 )
-ORIGINAL_REMOVAL_AUDIO_PATH = (
-    SOURCE_ASSET_DIRECTORY / REMOVAL_AUDIO_NAME
+ORIGINAL_REMOVAL_AUDIO_PATHS = tuple(
+    SOURCE_ASSET_DIRECTORY / name
+    for name in REMOVAL_AUDIO_NAMES
+)
+ORIGINAL_LAST_EMERALD_REMOVAL_AUDIO_PATH = (
+    SOURCE_ASSET_DIRECTORY / LAST_EMERALD_REMOVAL_AUDIO_NAME
+)
+ORIGINAL_FINAL_COMPLETION_AUDIO_PATH = (
+    SOURCE_ASSET_DIRECTORY / FINAL_COMPLETION_AUDIO_NAME
+)
+ORIGINAL_EGGMAN_REVEAL_AUDIO_PATH = (
+    SOURCE_ASSET_DIRECTORY / EGGMAN_REVEAL_AUDIO_NAME
+)
+ORIGINAL_CINEMATIC_VIDEO_PATH = (
+    SOURCE_ASSET_DIRECTORY / CINEMATIC_VIDEO_NAME
 )
 
-LOCK_MESSAGE = "Dr. Robotnik has stolen the Chaos Emeralds!"
+LOCK_MESSAGE = "ROBOTNIK STOLE THE CHAOS EMERALDS!"
 COMPLETION_MESSAGE = (
     "Thank you, Sonic, for returning all the Chaos Emeralds!"
 )
 GAME_ON_MESSAGE = "EMERALDS FOUND! GAME ON!"
 RESTORED_MESSAGE = "ALL CHAOS EMERALDS RESTORED!"
+NORMAL_WARNING_MESSAGE = "Hey! Put that back! We already did the thing!"
+STORY_REMOVAL_OVERLAY_TITLE = "A Chaos Emerald Was Stolen!"
+STORY_SHUTDOWN_TITLE = "ROBOTNIK'S CHAOS HEIST!"
+STORY_SHUTDOWN_MESSAGE = (
+    "Robotnik has stolen the Chaos Emeralds and taken them back to his fortress!"
+)
+STORY_QUESTION_TITLE = "THE ARCADE HAS LOST ITS CHAOS ENERGY!"
+STORY_QUESTION_MESSAGE = (
+    "Where can we find someone fast enough to fight Robotnik\n"
+    "and bring the Chaos Emeralds home?"
+)
+STORY_EGGMAN_TITLE = "SO EGGMAN'S BEHIND THIS, HUH?"
+STORY_EGGMAN_MESSAGE = ""
+ENERGY_METER_SEGMENTS = 12
+ENERGY_ANIMATION_STEP_MS = 55
+ENERGY_EMPHASIS_MS = 420
+
+STORY_STOLEN_TEXT = {
+    1: (
+        "ONE CHAOS EMERALD STOLEN!",
+        "ROBOTNIK HAS MADE OFF WITH THE FIRST EMERALD!",
+    ),
+    2: (
+        "TWO CHAOS EMERALDS STOLEN!",
+        "THE CHAOS HEIST IS UNDERWAY - THE SHRINE IS FADING!",
+    ),
+    3: (
+        "THREE CHAOS EMERALDS STOLEN!",
+        "ROBOTNIK'S FORTRESS IS DRAINING THE SHRINE!",
+    ),
+    4: (
+        "FOUR CHAOS EMERALDS STOLEN!",
+        "THE EGGMAN EMPIRE'S CHAOS POWER IS RISING!",
+    ),
+    5: (
+        "FIVE CHAOS EMERALDS STOLEN!",
+        "SONIC, THE SHRINE IS LOSING ITS POWER!",
+    ),
+    6: (
+        "SIX CHAOS EMERALDS STOLEN!",
+        "ONE MORE AND THE ARCADE WILL GO DARK!",
+    ),
+}
+
+STORY_RETURNED_TEXT = {
+    1: (
+        "A CHAOS EMERALD RETURNS!",
+        "THE SHRINE SPARKS BACK TO LIFE!",
+    ),
+    2: (
+        "TWO CHAOS EMERALDS RESTORED!",
+        "CHAOS ENERGY IS RUSHING BACK!",
+    ),
+    3: (
+        "THREE CHAOS EMERALDS RESTORED!",
+        "THE EGGMAN EMPIRE'S POWER IS FALTERING!",
+    ),
+    4: (
+        "FOUR CHAOS EMERALDS RESTORED!",
+        "THE SHRINE IS PUSHING BACK!",
+    ),
+    5: (
+        "FIVE CHAOS EMERALDS RESTORED!",
+        "ROBOTNIK'S CHAOS HEIST IS UNRAVELING!",
+    ),
+    6: (
+        "SIX CHAOS EMERALDS RESTORED!",
+        "ONE MORE AND THE ARCADE WILL AWAKEN!",
+    ),
+    7: (
+        "ALL SEVEN CHAOS EMERALDS RESTORED!",
+        "THE SHRINE IS FULLY CHARGED!",
+    ),
+}
+
 HWND_TOPMOST = ctypes.c_void_p(-1)
 HWND_NOTOPMOST = ctypes.c_void_p(-2)
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+SW_SHOWNOACTIVATE = 4
 PROCESS_SUSPEND_RESUME = 0x0800
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x00100000
@@ -530,18 +732,27 @@ class MagnetArcadeGuard:
 
         self.running = True
         self.guard_active = False
+        self.guard_mode = DEFAULT_GUARD_MODE
         self.activation_generation = 0
         self.last_fault = ""
         self.overlay_visible = False
+        self.overlay_kind: Optional[str] = None
         self.completion_in_progress = False
         self.completion_after_id = None
         self.final_emerald_after_id = None
         self.completion_audio_playing = False
         self.completion_started_at = 0.0
         self.completion_animation_finished = False
+        self.final_completion_sound_started = False
+        self.final_completion_sound_playing = False
         self.music_mode: Optional[str] = None
         self.emerald_sound = None
         self.removal_sound = None
+        self.removal_sounds = []
+        self.last_removal_sound_index = None
+        self.last_emerald_removal_sound = None
+        self.final_completion_sound = None
+        self.eggman_reveal_sound = None
         self.event_channel = None
         self.event_audio_after_id = None
         self.last_event_sound_kind: Optional[str] = None
@@ -550,6 +761,33 @@ class MagnetArcadeGuard:
         self.final_emerald_pause_started_at: Optional[float] = None
         self.counter_animation_after_id = None
         self.counter_animation_generation = 0
+        self.energy_animation_after_id = None
+        self.energy_animation_generation = 0
+        self.energy_display_count = TOTAL_EMERALDS
+        self.story_armed = False
+        self.story_cycle_started = False
+        self.story_intro_completed = False
+        self.story_sequence_after_id = None
+        self.announcement_after_id = None
+        self.normal_warning_after_id = None
+        self.normal_warning_trigger_count: Optional[int] = None
+        self.pending_normal_warning: Optional[tuple[int, int]] = None
+        self.cinematic_prepare_state = "unavailable"
+        self.cinematic_prepare_error = ""
+        self.cinematic_audio_pcm = b""
+        self.cinematic_audio_rate = 44100
+        self.cinematic_duration = 0.0
+        self.cinematic_channel = None
+        self.cinematic_sound = None
+        self.cinematic_after_id = None
+        self.cinematic_started_at = 0.0
+        self.cinematic_generation = 0
+        self.cinematic_cancel_event = threading.Event()
+        self.cinematic_frame_queue = queue.Queue(maxsize=4)
+        self.cinematic_pending_frame = None
+        self.cinematic_worker_done = False
+        self.cinematic_worker_error = ""
+        self.cinematic_photo = None
         self.return_window_handle = 0
         self.suspended_process_handle = None
         self.suspended_process_id = 0
@@ -577,6 +815,7 @@ class MagnetArcadeGuard:
         self.reader_connected = False
         self.last_good_port = PREFERRED_SERIAL_PORT
         self.last_valid_message = 0.0
+        self.last_serial_message_at = 0.0
         self.pending_count: Optional[int] = None
         self.pending_count_since = 0.0
         self.accepted_count: Optional[int] = None
@@ -596,6 +835,13 @@ class MagnetArcadeGuard:
         self.control_state_label = None
         self.control_activate_button = None
         self.control_deactivate_button = None
+        self.control_story_button = None
+        self.control_normal_button = None
+        self.announcement_window = None
+        self.announcement_title_label = None
+        self.announcement_detail_label = None
+        self.announcement_flash_window = None
+        self.announcement_flash_after_id = None
 
         self.screen_width = self.root.winfo_screenwidth()
         self.screen_height = self.root.winfo_screenheight()
@@ -661,9 +907,28 @@ class MagnetArcadeGuard:
             EMERALD_AUDIO_NAME,
             ORIGINAL_EMERALD_AUDIO_PATH,
         )
-        self.removal_audio_path = self.find_asset(
-            REMOVAL_AUDIO_NAME,
-            ORIGINAL_REMOVAL_AUDIO_PATH,
+        self.removal_audio_paths = tuple(
+            self.find_asset(name, original_path)
+            for name, original_path in zip(
+                REMOVAL_AUDIO_NAMES,
+                ORIGINAL_REMOVAL_AUDIO_PATHS,
+            )
+        )
+        self.last_emerald_removal_audio_path = self.find_asset(
+            LAST_EMERALD_REMOVAL_AUDIO_NAME,
+            ORIGINAL_LAST_EMERALD_REMOVAL_AUDIO_PATH,
+        )
+        self.final_completion_audio_path = self.find_asset(
+            FINAL_COMPLETION_AUDIO_NAME,
+            ORIGINAL_FINAL_COMPLETION_AUDIO_PATH,
+        )
+        self.eggman_reveal_audio_path = self.find_asset(
+            EGGMAN_REVEAL_AUDIO_NAME,
+            ORIGINAL_EGGMAN_REVEAL_AUDIO_PATH,
+        )
+        self.cinematic_video_path = self.find_asset(
+            CINEMATIC_VIDEO_NAME,
+            ORIGINAL_CINEMATIC_VIDEO_PATH,
         )
         self.active_frames = []
         self.active_delays = []
@@ -688,9 +953,11 @@ class MagnetArcadeGuard:
                 pygame.mixer.set_num_channels(
                     max(8, pygame.mixer.get_num_channels())
                 )
-                pygame.mixer.set_reserved(1)
+                pygame.mixer.set_reserved(2)
                 self.event_channel = pygame.mixer.Channel(0)
                 self.event_channel.set_volume(SOUND_EFFECT_VOLUME)
+                self.cinematic_channel = pygame.mixer.Channel(1)
+                self.cinematic_channel.set_volume(MUSIC_VOLUME)
                 pygame.mixer.music.set_volume(MUSIC_VOLUME)
                 self.audio_ready = True
                 if self.emerald_audio_path.exists():
@@ -699,18 +966,55 @@ class MagnetArcadeGuard:
                     )
                     self.emerald_sound.set_volume(SOUND_EFFECT_VOLUME)
 
-                if self.removal_audio_path.exists():
+                for removal_audio_path in self.removal_audio_paths:
+                    if not removal_audio_path.exists():
+                        continue
                     try:
-                        self.removal_sound = pygame.mixer.Sound(
-                            str(self.removal_audio_path)
+                        removal_sound = pygame.mixer.Sound(
+                            str(removal_audio_path)
                         )
-                        self.removal_sound.set_volume(
+                        removal_sound.set_volume(SOUND_EFFECT_VOLUME)
+                        self.removal_sounds.append(removal_sound)
+                    except pygame.error:
+                        continue
+
+                if self.removal_sounds:
+                    self.removal_sound = self.removal_sounds[0]
+
+                if self.last_emerald_removal_audio_path.exists():
+                    try:
+                        self.last_emerald_removal_sound = (
+                            pygame.mixer.Sound(
+                                str(self.last_emerald_removal_audio_path)
+                            )
+                        )
+                        self.last_emerald_removal_sound.set_volume(
                             SOUND_EFFECT_VOLUME
                         )
                     except pygame.error:
-                        # This sound is optional; the visual and LED removal
-                        # feedback still work if it has not been added yet.
-                        self.removal_sound = None
+                        self.last_emerald_removal_sound = None
+
+                if self.final_completion_audio_path.exists():
+                    try:
+                        self.final_completion_sound = pygame.mixer.Sound(
+                            str(self.final_completion_audio_path)
+                        )
+                        self.final_completion_sound.set_volume(
+                            SOUND_EFFECT_VOLUME
+                        )
+                    except pygame.error:
+                        self.final_completion_sound = None
+
+                if self.eggman_reveal_audio_path.exists():
+                    try:
+                        self.eggman_reveal_sound = pygame.mixer.Sound(
+                            str(self.eggman_reveal_audio_path)
+                        )
+                        self.eggman_reveal_sound.set_volume(
+                            SOUND_EFFECT_VOLUME
+                        )
+                    except pygame.error:
+                        self.eggman_reveal_sound = None
 
             except pygame.error:
                 self.audio_ready = False
@@ -738,7 +1042,30 @@ class MagnetArcadeGuard:
         self.count_label.place(anchor="center")
         self.position_counter()
 
+        self.energy_label = tk.Label(
+            self.root,
+            text="",
+            font=("Arial", 16, "bold"),
+            foreground="#66ff99",
+            background="#000000",
+        )
+        self.energy_label.place_forget()
+
         self.messages: queue.Queue[tuple[str, str, int]] = queue.Queue()
+        self.create_announcement_window()
+
+        if AV_AVAILABLE and self.cinematic_video_path.exists():
+            self.cinematic_prepare_state = "preparing"
+            threading.Thread(
+                target=self.prepare_cinematic_audio,
+                daemon=True,
+            ).start()
+        elif not AV_AVAILABLE:
+            self.cinematic_prepare_state = "unavailable"
+            self.cinematic_prepare_error = "PyAV unavailable"
+        else:
+            self.cinematic_prepare_state = "unavailable"
+            self.cinematic_prepare_error = "cinematic file missing"
 
         self.root.protocol("WM_DELETE_WINDOW", lambda: None)
 
@@ -771,7 +1098,8 @@ class MagnetArcadeGuard:
         self.root.after(500, self.keep_window_on_top)
         self.root.after(100, self.status_heartbeat)
 
-        # Start dormant. Ctrl + Alt + F12 enables the guard.
+        # Start dormant. Ctrl + Alt + F10 selects and activates Story Mode;
+        # Ctrl + Alt + F12 activates the currently selected mode.
         self.root.withdraw()
         self.create_control_panel()
         self.update_control_panel()
@@ -795,12 +1123,24 @@ class MagnetArcadeGuard:
                 pass
             self.counter_animation_after_id = None
 
+    def fitted_count_font_size(self) -> int:
+        if not getattr(self, "count_label", None):
+            return self.count_font_size
+        _, _, monitor_width, _ = self.overlay_monitor_bounds
+        return self.fit_font_size(
+            (str(self.count_label.cget("text")),),
+            max_size=self.count_font_size,
+            min_size=12,
+            available_width=monitor_width,
+        )
+
     def reset_counter_style(self) -> None:
         self.cancel_counter_animation()
         try:
+            font_size = self.fitted_count_font_size()
             self.count_label.configure(
                 foreground="white",
-                font=("Arial", self.count_font_size, "bold"),
+                font=("Arial", font_size, "bold"),
             )
         except tk.TclError:
             pass
@@ -814,9 +1154,16 @@ class MagnetArcadeGuard:
         color = colors.get(event_kind, "white")
         self.cancel_counter_animation()
         generation = self.counter_animation_generation
-        enlarged_size = self.count_font_size + max(
+        base_size = self.fitted_count_font_size()
+        _, _, monitor_width, _ = self.overlay_monitor_bounds
+        enlarged_size = self.fit_font_size(
+            (str(self.count_label.cget("text")),),
+            max_size=base_size + max(
             2,
-            min(6, self.count_font_size // 10),
+                min(6, base_size // 10),
+            ),
+            min_size=base_size,
+            available_width=monitor_width,
         )
 
         try:
@@ -832,9 +1179,10 @@ class MagnetArcadeGuard:
                 return
             self.counter_animation_after_id = None
             try:
+                font_size = self.fitted_count_font_size()
                 self.count_label.configure(
                     foreground="white",
-                    font=("Arial", self.count_font_size, "bold"),
+                    font=("Arial", font_size, "bold"),
                 )
             except tk.TclError:
                 pass
@@ -844,18 +1192,162 @@ class MagnetArcadeGuard:
             finish_animation,
         )
 
+    def cancel_energy_animation(self) -> None:
+        self.energy_animation_generation += 1
+        if self.energy_animation_after_id is not None:
+            try:
+                self.root.after_cancel(self.energy_animation_after_id)
+            except tk.TclError:
+                pass
+            self.energy_animation_after_id = None
+
+    def energy_meter_text(self, present_count: int) -> str:
+        present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
+        percent = round(present_count * 100 / TOTAL_EMERALDS)
+        filled = round(
+            present_count * ENERGY_METER_SEGMENTS / TOTAL_EMERALDS
+        )
+        bar = "#" * filled + "-" * (ENERGY_METER_SEGMENTS - filled)
+        return f"MASTER EMERALD ENERGY [{bar}] {percent}%"
+
+    def energy_meter_color(self, present_count: int) -> str:
+        present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
+        if present_count == TOTAL_EMERALDS:
+            return "#66ff99"
+        if present_count >= TOTAL_EMERALDS // 2:
+            return "#ffd766"
+        return "#ff6666"
+
+    def position_energy_meter(self) -> None:
+        if not getattr(self, "energy_label", None):
+            return
+
+        _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
+        self.energy_label.update_idletasks()
+        self.count_label.update_idletasks()
+        count_info = self.count_label.place_info()
+        try:
+            count_y = float(count_info.get("y", monitor_height * 0.8))
+        except (TypeError, ValueError):
+            count_y = monitor_height * 0.8
+
+        count_height = self.count_label.winfo_reqheight()
+        energy_height = self.energy_label.winfo_reqheight()
+        gap = max(5, int(monitor_height * 0.012))
+        energy_y = count_y + count_height / 2 + gap + energy_height / 2
+        energy_y = min(
+            energy_y,
+            monitor_height - energy_height / 2 - max(4, gap),
+        )
+        self.energy_label.place(
+            x=monitor_width / 2,
+            y=max(energy_height / 2, energy_y),
+            anchor="center",
+        )
+
+    def set_energy_meter(
+        self,
+        present_count: int,
+        *,
+        emphasis: bool = False,
+        visible: bool = True,
+    ) -> None:
+        if not getattr(self, "energy_label", None):
+            return
+
+        present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
+        self.energy_display_count = present_count
+        _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
+        text = self.energy_meter_text(present_count)
+        base_size = max(12, min(24, int(monitor_height * 0.045)))
+        if emphasis:
+            base_size += 4
+        font_size = self.fit_font_size(
+            (text,),
+            max_size=base_size,
+            min_size=10,
+            available_width=monitor_width,
+        )
+        self.energy_label.configure(
+            text=text,
+            foreground=self.energy_meter_color(present_count),
+            font=("Arial", font_size, "bold"),
+        )
+        if visible:
+            self.position_energy_meter()
+        else:
+            self.energy_label.place_forget()
+
+    def animate_energy_meter(
+        self,
+        previous_count: int,
+        current_count: int,
+    ) -> None:
+        if not getattr(self, "energy_label", None):
+            return
+
+        previous_count = max(
+            0,
+            min(TOTAL_EMERALDS, int(previous_count)),
+        )
+        current_count = max(
+            0,
+            min(TOTAL_EMERALDS, int(current_count)),
+        )
+        self.cancel_energy_animation()
+        generation = self.energy_animation_generation
+        step = 1 if current_count >= previous_count else -1
+        values = list(
+            range(previous_count, current_count + step, step)
+        )
+
+        def show_step(index: int) -> None:
+            if generation != self.energy_animation_generation:
+                return
+            self.energy_animation_after_id = None
+            self.set_energy_meter(values[index], emphasis=True)
+            if index + 1 < len(values):
+                self.energy_animation_after_id = self.root.after(
+                    ENERGY_ANIMATION_STEP_MS,
+                    lambda: show_step(index + 1),
+                )
+                return
+
+            self.energy_animation_after_id = self.root.after(
+                ENERGY_EMPHASIS_MS,
+                lambda: self.set_energy_meter(
+                    current_count,
+                    emphasis=False,
+                ),
+            )
+
+        show_step(0)
+
+    def hide_energy_meter(self) -> None:
+        self.cancel_energy_animation()
+        if getattr(self, "energy_label", None):
+            self.energy_label.place_forget()
+
     def fit_font_size(
         self,
         text_options: tuple[str, ...],
         max_size: int,
         min_size: int,
+        available_width: Optional[int] = None,
     ) -> int:
         # Leave extra horizontal margin for CRT overscan and the arcade
         # monitor's visible bezel area.
+        target_width = available_width or self.screen_width
         available_width = max(
             1,
-            int(self.screen_width * 0.82),
+            int(target_width * 0.82),
         )
+
+        text_lines = [
+            line
+            for text in text_options
+            for line in str(text).splitlines()
+        ] or [""]
 
         for size in range(max_size, min_size - 1, -1):
             font = tkfont.Font(
@@ -865,7 +1357,7 @@ class MagnetArcadeGuard:
                 weight="bold",
             )
 
-            if max(font.measure(text) for text in text_options) <= available_width:
+            if max(font.measure(line) for line in text_lines) <= available_width:
                 return size
 
         return min_size
@@ -1051,9 +1543,10 @@ class MagnetArcadeGuard:
         )
 
     def position_counter(self) -> None:
+        _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
         if self.background_display_height:
             image_bottom = (
-                self.screen_height / 2
+                monitor_height / 2
                 + self.background_display_height / 2
             )
             counter_y = image_bottom + max(
@@ -1062,36 +1555,39 @@ class MagnetArcadeGuard:
             )
             counter_y = min(
                 counter_y,
-                self.screen_height - int(self.count_font_size * 0.7),
+                monitor_height - int(self.count_font_size * 0.7),
             )
         else:
-            counter_y = self.screen_height * 0.8
+            counter_y = monitor_height * 0.8
 
         self.count_label.place(
-            x=self.screen_width / 2,
+            x=monitor_width / 2,
             y=counter_y,
             anchor="center",
         )
 
     def position_title(self) -> None:
+        _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
         if self.background_display_height:
             image_top = (
-                self.screen_height / 2
+                monitor_height / 2
                 - self.background_display_height / 2
             )
+            self.title_label.update_idletasks()
+            title_height = self.title_label.winfo_reqheight()
             title_y = image_top - max(
                 8,
-                int(self.title_font_size * 0.8),
+                int(title_height / 2) + 4,
             )
             title_y = max(
                 self.title_font_size,
                 title_y,
             )
         else:
-            title_y = self.screen_height * 0.08
+            title_y = monitor_height * 0.08
 
         self.title_label.place(
-            x=self.screen_width / 2,
+            x=monitor_width / 2,
             y=title_y,
             anchor="center",
         )
@@ -1157,6 +1653,585 @@ class MagnetArcadeGuard:
         )
 
     # --------------------------------------------------
+    # Non-blocking Story Mode announcements
+    # --------------------------------------------------
+
+    def create_announcement_window(self) -> None:
+        self.announcement_window = tk.Toplevel(self.root)
+        self.announcement_window.overrideredirect(True)
+        self.announcement_window.configure(background="#090909")
+        self.announcement_window.attributes("-topmost", True)
+        try:
+            self.announcement_window.attributes("-alpha", 0.94)
+        except tk.TclError:
+            pass
+
+        self.announcement_title_label = tk.Label(
+            self.announcement_window,
+            text="",
+            font=("Arial", 22, "bold"),
+            foreground="#ff5555",
+            background="#090909",
+        )
+        self.announcement_title_label.pack(pady=(10, 0))
+        self.announcement_detail_label = tk.Label(
+            self.announcement_window,
+            text="",
+            font=("Arial", 15, "bold"),
+            foreground="white",
+            background="#090909",
+            justify="center",
+        )
+        self.announcement_detail_label.pack(pady=(2, 10))
+        self.announcement_window.withdraw()
+
+        self.announcement_flash_window = tk.Toplevel(self.root)
+        self.announcement_flash_window.overrideredirect(True)
+        self.announcement_flash_window.configure(background="#fff6b0")
+        self.announcement_flash_window.attributes("-topmost", True)
+        try:
+            self.announcement_flash_window.attributes("-alpha", 0.78)
+        except tk.TclError:
+            pass
+        self.announcement_flash_window.withdraw()
+
+    def apply_announcement_window_style(self, window=None) -> None:
+        window = window or self.announcement_window
+        if not window:
+            return
+        try:
+            window.update_idletasks()
+            window_handle = window.winfo_id()
+            user32 = ctypes.windll.user32
+            get_style = getattr(
+                user32,
+                "GetWindowLongPtrW",
+                user32.GetWindowLongW,
+            )
+            set_style = getattr(
+                user32,
+                "SetWindowLongPtrW",
+                user32.SetWindowLongW,
+            )
+            style = get_style(window_handle, GWL_EXSTYLE)
+            set_style(
+                window_handle,
+                GWL_EXSTYLE,
+                style
+                | WS_EX_TRANSPARENT
+                | WS_EX_NOACTIVATE
+                | WS_EX_TOOLWINDOW,
+            )
+        except (AttributeError, tk.TclError):
+            pass
+
+    def hide_announcement_flash(self) -> None:
+        self.announcement_flash_after_id = None
+        if self.announcement_flash_window:
+            try:
+                self.announcement_flash_window.withdraw()
+            except tk.TclError:
+                pass
+
+    def flash_story_screen(self) -> None:
+        if (
+            not self.announcement_flash_window
+            or not self.overlay_monitor_bounds
+        ):
+            return
+
+        if self.announcement_flash_after_id is not None:
+            try:
+                self.root.after_cancel(self.announcement_flash_after_id)
+            except tk.TclError:
+                pass
+            self.announcement_flash_after_id = None
+
+        x, y, width, height = self.overlay_monitor_bounds
+        self.announcement_flash_window.geometry(
+            f"{width}x{height}{x:+d}{y:+d}"
+        )
+        self.apply_announcement_window_style(
+            self.announcement_flash_window
+        )
+        self.announcement_flash_window.deiconify()
+        try:
+            window_handle = self.announcement_flash_window.winfo_id()
+            ctypes.windll.user32.SetWindowPos(
+                window_handle,
+                HWND_TOPMOST,
+                x,
+                y,
+                width,
+                height,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            )
+            ctypes.windll.user32.ShowWindow(
+                window_handle,
+                SW_SHOWNOACTIVATE,
+            )
+        except (AttributeError, tk.TclError):
+            pass
+
+        self.announcement_flash_after_id = self.root.after(
+            120,
+            self.hide_announcement_flash,
+        )
+
+    def can_show_story_announcement(self) -> bool:
+        try:
+            foreground_window = ctypes.windll.user32.GetForegroundWindow()
+        except AttributeError:
+            return False
+
+        if self.get_window_process_name(foreground_window) != BIG_BOX_PROCESS_NAME:
+            return False
+
+        monitor_bounds = self.get_monitor_bounds(foreground_window)
+        window_rect = self.get_window_rect(foreground_window)
+        if (
+            monitor_bounds is None
+            or window_rect is None
+            or not self.window_covers_monitor(window_rect, monitor_bounds)
+        ):
+            return False
+
+        self.overlay_monitor_bounds = monitor_bounds
+        return True
+
+    def show_story_announcement(
+        self,
+        present_count: int,
+        event_kind: str,
+        duration_seconds: Optional[float] = None,
+    ) -> bool:
+        if not self.can_show_story_announcement():
+            return False
+
+        self.hide_story_announcement()
+        missing_count = TOTAL_EMERALDS - present_count
+        energy_percent = round(present_count * 100 / TOTAL_EMERALDS)
+        if event_kind == "removed":
+            _, detail = STORY_STOLEN_TEXT.get(
+                missing_count,
+                (
+                    f"{missing_count} CHAOS EMERALDS STOLEN!",
+                    "ROBOTNIK'S CHAOS HEIST CONTINUES!",
+                ),
+            )
+            title = STORY_REMOVAL_OVERLAY_TITLE
+            detail = f"{detail}\nCHAOS ENERGY: {energy_percent}%"
+            color = "#ff5555"
+        elif event_kind == "normal":
+            title = STORY_REMOVAL_OVERLAY_TITLE
+            detail = (
+                "Hey! Put that back!\n"
+                "We already did the thing!\n"
+                f"CHAOS ENERGY: {energy_percent}%"
+            )
+            color = "#ffcc66"
+        else:
+            title, detail = STORY_RETURNED_TEXT.get(
+                present_count,
+                (
+                    f"{present_count} CHAOS EMERALDS RESTORED!",
+                    "THE SHRINE IS RECLAIMING ITS POWER!",
+                ),
+            )
+            detail = f"{detail}\nCHAOS ENERGY: {energy_percent}%"
+            color = "#77ff99"
+
+        x, y, width, height = self.overlay_monitor_bounds
+        banner_width = max(1, int(width * 0.90))
+        banner_height = max(88, min(180, int(height * 0.30)))
+        banner_x = x + (width - banner_width) // 2
+        banner_y = y + (height - banner_height) // 2
+        title_size = self.fit_font_size(
+            (title,),
+            max_size=max(14, min(26, int(height * 0.052))),
+            min_size=12,
+            available_width=banner_width,
+        )
+        detail_size = self.fit_font_size(
+            (detail,),
+            max_size=max(11, min(19, int(height * 0.035))),
+            min_size=10,
+            available_width=banner_width,
+        )
+
+        self.announcement_title_label.configure(
+            text=title,
+            foreground=color,
+            font=("Arial", title_size, "bold"),
+            wraplength=max(1, int(banner_width * 0.82)),
+            justify="center",
+        )
+        self.announcement_detail_label.configure(
+            text=detail,
+            font=("Arial", detail_size, "bold"),
+            wraplength=max(1, int(banner_width * 0.82)),
+            justify="center",
+        )
+        self.announcement_window.geometry(
+            f"{banner_width}x{banner_height}{banner_x:+d}{banner_y:+d}"
+        )
+        self.apply_announcement_window_style()
+        self.announcement_window.deiconify()
+        try:
+            window_handle = self.announcement_window.winfo_id()
+            ctypes.windll.user32.SetWindowPos(
+                window_handle,
+                HWND_TOPMOST,
+                banner_x,
+                banner_y,
+                banner_width,
+                banner_height,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            )
+            ctypes.windll.user32.ShowWindow(
+                window_handle,
+                SW_SHOWNOACTIVATE,
+            )
+        except (AttributeError, tk.TclError):
+            pass
+
+        self.flash_story_screen()
+        self.announcement_after_id = self.root.after(
+            int(
+                (duration_seconds or STORY_ANNOUNCEMENT_SECONDS)
+                * 1000
+            ),
+            self.hide_story_announcement,
+        )
+        return True
+
+    def hide_story_announcement(self) -> None:
+        if self.announcement_after_id is not None:
+            try:
+                self.root.after_cancel(self.announcement_after_id)
+            except tk.TclError:
+                pass
+            self.announcement_after_id = None
+        self.hide_announcement_flash()
+        if self.announcement_window:
+            try:
+                self.announcement_window.withdraw()
+            except tk.TclError:
+                pass
+
+    # --------------------------------------------------
+    # In-overlay cinematic playback
+    # --------------------------------------------------
+
+    def prepare_cinematic_audio(self) -> None:
+        try:
+            mixer_settings = pygame.mixer.get_init() if self.audio_ready else None
+            sample_rate = mixer_settings[0] if mixer_settings else 44100
+            channel_count = mixer_settings[2] if mixer_settings else 2
+            layout = "mono" if channel_count == 1 else "stereo"
+            bytes_per_sample = 2 * channel_count
+            audio_chunks = []
+
+            with av.open(str(self.cinematic_video_path)) as container:
+                if container.duration:
+                    self.cinematic_duration = float(
+                        container.duration / av.time_base
+                    )
+                audio_stream = next(
+                    (
+                        stream
+                        for stream in container.streams
+                        if stream.type == "audio"
+                    ),
+                    None,
+                )
+                if audio_stream is not None:
+                    resampler = av.AudioResampler(
+                        format="s16",
+                        layout=layout,
+                        rate=sample_rate,
+                    )
+                    for input_frame in container.decode(audio_stream):
+                        for output_frame in resampler.resample(input_frame):
+                            required_bytes = (
+                                output_frame.samples * bytes_per_sample
+                            )
+                            audio_chunks.append(
+                                bytes(output_frame.planes[0])[
+                                    :required_bytes
+                                ]
+                            )
+                    for output_frame in resampler.resample(None):
+                        required_bytes = (
+                            output_frame.samples * bytes_per_sample
+                        )
+                        audio_chunks.append(
+                            bytes(output_frame.planes[0])[:required_bytes]
+                        )
+
+            self.cinematic_audio_rate = sample_rate
+            self.cinematic_audio_pcm = b"".join(audio_chunks)
+            self.cinematic_prepare_state = "ready"
+            self.cinematic_prepare_error = ""
+        except Exception as error:
+            self.cinematic_prepare_state = "error"
+            self.cinematic_prepare_error = str(error).replace("\n", " ")[:160]
+
+    def decode_cinematic_frames(self, generation: int) -> None:
+        try:
+            with av.open(str(self.cinematic_video_path)) as container:
+                video_stream = next(
+                    stream
+                    for stream in container.streams
+                    if stream.type == "video"
+                )
+                first_timestamp = None
+                _, _, monitor_width, monitor_height = (
+                    self.overlay_monitor_bounds
+                )
+
+                for frame in container.decode(video_stream):
+                    if (
+                        self.cinematic_cancel_event.is_set()
+                        or generation != self.cinematic_generation
+                    ):
+                        break
+
+                    timestamp = (
+                        float(frame.pts * frame.time_base)
+                        if frame.pts is not None
+                        else 0.0
+                    )
+                    if first_timestamp is None:
+                        first_timestamp = timestamp
+                    timestamp -= first_timestamp
+
+                    # Detach each frame from PyAV's YUV/padded buffers before
+                    # Tk displays it. A direct conversion can expose stale
+                    # stride bytes as narrow black marks on some displays.
+                    frame_image = (
+                        frame.reformat(format="rgb24")
+                        .to_image()
+                        .convert("RGB")
+                        .copy()
+                    )
+                    # Repack the final pixels into a tightly packed RGB image
+                    # before Tk receives them. This avoids occasional narrow
+                    # vertical artifacts when a frame retains decoder stride
+                    # metadata through repeated PhotoImage updates.
+                    frame_image = Image.frombytes(
+                        "RGB",
+                        frame_image.size,
+                        frame_image.tobytes(),
+                    )
+                    scale = min(
+                        1.0,
+                        monitor_width / frame_image.width,
+                        monitor_height / frame_image.height,
+                    )
+                    target_size = (
+                        max(1, int(frame_image.width * scale)),
+                        max(1, int(frame_image.height * scale)),
+                    )
+                    if target_size != frame_image.size:
+                        frame_image = frame_image.resize(
+                            target_size,
+                            resample=getattr(
+                                Image,
+                                "Resampling",
+                                Image,
+                            ).BILINEAR,
+                        )
+
+                    while not self.cinematic_cancel_event.is_set():
+                        try:
+                            self.cinematic_frame_queue.put(
+                                (timestamp, frame_image),
+                                timeout=0.1,
+                            )
+                            break
+                        except queue.Full:
+                            if generation != self.cinematic_generation:
+                                return
+
+            if generation == self.cinematic_generation:
+                self.cinematic_worker_done = True
+        except Exception as error:
+            if generation == self.cinematic_generation:
+                self.cinematic_worker_error = (
+                    str(error).replace("\n", " ")[:160]
+                )
+                self.cinematic_worker_done = True
+
+    def start_story_cinematic(self) -> None:
+        self.story_sequence_after_id = None
+        if self.cinematic_prepare_state == "preparing":
+            self.story_sequence_after_id = self.root.after(
+                100,
+                self.start_story_cinematic,
+            )
+            return
+        if self.cinematic_prepare_state != "ready":
+            self.fault_disable_guard(
+                "Could not prepare Sonic cinematic: "
+                + (self.cinematic_prepare_error or "unknown error")
+            )
+            return
+
+        self.cancel_cinematic()
+        self.overlay_kind = "cinematic"
+        self.hide_energy_meter()
+        self.title_label.configure(text="")
+        self.count_label.configure(text="")
+        self.animation_generation += 1
+        self.active_frames = []
+        self.active_delays = []
+        self.background_label.configure(image="", background="black")
+        self.stop_music()
+        self.stop_event_sound()
+
+        self.cinematic_generation += 1
+        generation = self.cinematic_generation
+        self.cinematic_cancel_event.clear()
+        self.cinematic_frame_queue = queue.Queue(maxsize=4)
+        self.cinematic_pending_frame = None
+        self.cinematic_worker_done = False
+        self.cinematic_worker_error = ""
+        self.cinematic_started_at = 0.0
+        threading.Thread(
+            target=self.decode_cinematic_frames,
+            args=(generation,),
+            daemon=True,
+        ).start()
+        self.cinematic_after_id = self.root.after(
+            10,
+            self.poll_cinematic_playback,
+        )
+
+    def start_cinematic_audio(self) -> bool:
+        if not self.cinematic_audio_pcm:
+            return True
+        if not self.audio_ready or self.cinematic_channel is None:
+            return False
+        try:
+            self.cinematic_sound = pygame.mixer.Sound(
+                buffer=self.cinematic_audio_pcm
+            )
+            self.cinematic_channel.set_volume(MUSIC_VOLUME)
+            self.cinematic_channel.play(self.cinematic_sound)
+            return True
+        except pygame.error:
+            self.cinematic_sound = None
+            return False
+
+    def display_cinematic_frame(
+        self,
+        frame_image,
+        elapsed: float,
+    ) -> None:
+        if CINEMATIC_FADE_SECONDS > 0 and elapsed < CINEMATIC_FADE_SECONDS:
+            alpha = max(0.0, min(1.0, elapsed / CINEMATIC_FADE_SECONDS))
+            black_frame = Image.new("RGB", frame_image.size, "black")
+            frame_image = Image.blend(black_frame, frame_image, alpha)
+
+        self.cinematic_photo = ImageTk.PhotoImage(frame_image.copy())
+        self.background_label.configure(
+            image=self.cinematic_photo,
+            background="black",
+        )
+
+    def poll_cinematic_playback(self) -> None:
+        self.cinematic_after_id = None
+        if not (
+            self.running
+            and self.guard_active
+            and self.overlay_visible
+            and self.overlay_kind == "cinematic"
+        ):
+            return
+
+        if self.cinematic_worker_error:
+            self.fault_disable_guard(
+                "Sonic cinematic failed: " + self.cinematic_worker_error
+            )
+            return
+
+        if self.cinematic_pending_frame is None:
+            try:
+                self.cinematic_pending_frame = (
+                    self.cinematic_frame_queue.get_nowait()
+                )
+            except queue.Empty:
+                self.cinematic_pending_frame = None
+
+        if self.cinematic_started_at == 0.0:
+            if self.cinematic_pending_frame is None:
+                self.cinematic_after_id = self.root.after(
+                    10,
+                    self.poll_cinematic_playback,
+                )
+                return
+            self.cinematic_started_at = time.monotonic()
+            if not self.start_cinematic_audio():
+                self.fault_disable_guard(
+                    "Could not play Sonic cinematic audio"
+                )
+                return
+
+        elapsed = time.monotonic() - self.cinematic_started_at
+        while (
+            self.cinematic_pending_frame is not None
+            and self.cinematic_pending_frame[0] <= elapsed + 0.02
+        ):
+            _, frame_image = self.cinematic_pending_frame
+            self.display_cinematic_frame(frame_image, elapsed)
+            try:
+                self.cinematic_pending_frame = (
+                    self.cinematic_frame_queue.get_nowait()
+                )
+            except queue.Empty:
+                self.cinematic_pending_frame = None
+
+        playback_finished = (
+            self.cinematic_worker_done
+            and self.cinematic_pending_frame is None
+            and self.cinematic_frame_queue.empty()
+            and elapsed >= max(0.0, self.cinematic_duration - 0.1)
+        )
+        if playback_finished:
+            self.finish_story_cinematic()
+            return
+
+        self.cinematic_after_id = self.root.after(
+            10,
+            self.poll_cinematic_playback,
+        )
+
+    def cancel_cinematic(self) -> None:
+        self.cinematic_generation += 1
+        self.cinematic_cancel_event.set()
+        if self.cinematic_after_id is not None:
+            try:
+                self.root.after_cancel(self.cinematic_after_id)
+            except tk.TclError:
+                pass
+            self.cinematic_after_id = None
+        if self.cinematic_channel is not None:
+            try:
+                self.cinematic_channel.stop()
+            except pygame.error:
+                pass
+        self.cinematic_sound = None
+        self.cinematic_pending_frame = None
+
+    def finish_story_cinematic(self) -> None:
+        self.cancel_cinematic()
+        self.show_story_robotnik_screen()
+
+    # --------------------------------------------------
+    # Overlay behavior
+    # --------------------------------------------------
+
     def append_event_log(self, line: str) -> None:
         try:
             self.event_log_path.parent.mkdir(
@@ -1236,9 +2311,9 @@ class MagnetArcadeGuard:
 
     def create_control_panel(self) -> None:
         self.control_window = tk.Toplevel(self.root)
-        self.control_window.title("Magnetic Arcade Guard")
-        self.control_window.geometry("620x340+40+40")
-        self.control_window.minsize(520, 300)
+        self.control_window.title("Magnetic Arcade Guard — Story/Normal Edition")
+        self.control_window.geometry("680x410+40+40")
+        self.control_window.minsize(620, 380)
         self.control_window.resizable(True, True)
         self.control_window.configure(background="#202020")
         try:
@@ -1294,45 +2369,60 @@ class MagnetArcadeGuard:
         )
         button_frame.pack()
 
-        self.control_activate_button = tk.Button(
+        self.control_story_button = tk.Button(
             button_frame,
-            text="ACTIVATE GUARD",
-            width=18,
-            command=self.activate_guard,
+            text="STORY MODE",
+            width=24,
+            command=self.select_story_mode,
         )
-        self.control_activate_button.grid(
+        self.control_story_button.grid(
             row=0,
             column=0,
-            padx=4,
+            padx=6,
+            pady=(0, 8),
+        )
+
+        self.control_normal_button = tk.Button(
+            button_frame,
+            text="NORMAL MODE",
+            width=24,
+            command=self.select_normal_mode,
+        )
+        self.control_normal_button.grid(
+            row=0,
+            column=1,
+            padx=6,
+            pady=(0, 8),
         )
 
         self.control_deactivate_button = tk.Button(
             button_frame,
             text="DEACTIVATE GUARD",
-            width=18,
+            width=24,
             command=self.deactivate_guard,
         )
         self.control_deactivate_button.grid(
-            row=0,
-            column=1,
-            padx=4,
+            row=1,
+            column=0,
+            padx=6,
         )
 
         tk.Button(
             button_frame,
             text="CLOSE PROGRAM",
-            width=18,
+            width=24,
             command=self.exit_program,
         ).grid(
-            row=0,
-            column=2,
-            padx=4,
+            row=1,
+            column=1,
+            padx=6,
         )
 
         tk.Label(
             self.control_window,
             text=(
-                "Keyboard: Activate Ctrl+Alt+F12  |  "
+                "Keyboard: Story Mode Ctrl+Alt+F10  |  "
+                "Activate Ctrl+Alt+F12\n"
                 "Deactivate Ctrl+Alt+F11  |  "
                 "Close Ctrl+Shift+F12"
             ),
@@ -1342,19 +2432,34 @@ class MagnetArcadeGuard:
         ).pack(pady=(10, 0))
 
     def get_control_state(self) -> tuple[str, str]:
+        mode_name = "STORY" if self.guard_mode == "story" else "NORMAL"
         if not self.guard_active:
             if self.last_fault:
                 return "DISABLED — " + self.last_fault, "#ff9966"
-            return "DORMANT — GUARD OFF", "#9e9e9e"
+            return f"{mode_name} MODE SELECTED — GUARD OFF", "#9e9e9e"
 
         if self.completion_in_progress:
             return "SONIC VICTORY SCREEN", "#66ccff"
 
         if self.overlay_visible:
-            return "ROBOTNIK LOCK SCREEN ACTIVE", "#ff6666"
+            overlay_states = {
+                "normal_warning": "NORMAL MODE WARNING ACTIVE",
+                "story_shutdown": "STORY MODE ARCADE SHUTDOWN",
+                "story_question": "STORY MODE HERO PROMPT",
+                "story_eggman": "STORY MODE EGGMAN REVEAL",
+                "cinematic": "SONIC CD CINEMATIC PLAYING",
+                "robotnik": "ROBOTNIK LOCK SCREEN ACTIVE",
+            }
+            return (
+                overlay_states.get(
+                    self.overlay_kind,
+                    "FULL-SCREEN OVERLAY ACTIVE",
+                ),
+                "#ff6666",
+            )
 
         if self.accepted_count is None:
-            return "ACTIVE — WAITING FOR SENSOR", "#ffcc66"
+            return f"{mode_name} MODE — WAITING FOR SENSOR", "#ffcc66"
 
         if self.accepted_count < TOTAL_EMERALDS:
             if self.overlay_gate_state == "WAITING_FOR_BIGBOX_READY":
@@ -1364,9 +2469,9 @@ class MagnetArcadeGuard:
                 )
             if self.overlay_gate_state == "WAITING_FOR_BIGBOX":
                 return "ACTIVE — WAITING FOR BIG BOX", "#ffcc66"
-            return "ACTIVE — MONITORING", "#66dd88"
+            return f"{mode_name} MODE — MONITORING", "#66dd88"
 
-        return "ACTIVE — ALL EMERALDS PRESENT", "#66dd88"
+        return f"{mode_name} MODE — ALL EMERALDS PRESENT", "#66dd88"
 
     def update_control_panel(self) -> None:
         if not self.control_window or not self.control_window.winfo_exists():
@@ -1400,17 +2505,25 @@ class MagnetArcadeGuard:
             f"Input: {input_text}\n"
             "Return SFX: ready    Removal SFX: "
             + ("ready" if self.removal_sound is not None else "not installed")
+            + "    Cinematic: "
+            + self.cinematic_prepare_state
         )
 
         self.control_state_var.set(state_text)
         self.control_sensor_var.set(sensor_text)
         self.control_details_var.set(details_text)
         self.control_state_label.configure(foreground=state_color)
-        self.control_activate_button.configure(
-            state=tk.DISABLED if self.guard_active else tk.NORMAL
-        )
         self.control_deactivate_button.configure(
             state=tk.NORMAL if self.guard_active else tk.DISABLED
+        )
+        story_selected = self.guard_mode == "story"
+        self.control_story_button.configure(
+            relief=tk.SUNKEN if story_selected else tk.RAISED,
+            background="#d6b84b" if story_selected else "SystemButtonFace",
+        )
+        self.control_normal_button.configure(
+            relief=tk.SUNKEN if not story_selected else tk.RAISED,
+            background="#66b8e8" if not story_selected else "SystemButtonFace",
         )
 
     def set_control_panel_visible(self, visible: bool) -> None:
@@ -1454,8 +2567,10 @@ class MagnetArcadeGuard:
 
         self.write_status(
             f"RUNNING | {state} | "
+            f"mode={self.guard_mode} | "
             f"connected={self.reader_connected} | "
             f"audio={audio_state} | "
+            f"cinematic={self.cinematic_prepare_state} | "
             f"overlay_monitor={self.overlay_monitor_bounds} | "
             f"return_window={self.return_window_handle or 'none'} | "
             f"input_blocked_pid={self.suspended_process_id or 'none'} | "
@@ -1934,10 +3049,25 @@ class MagnetArcadeGuard:
         missing_count = self.pending_overlay_missing
         self.pending_overlay_missing = None
         self.last_gate_log_key = ""
-        self.show_missing_overlay(missing_count)
+        if (
+            self.guard_mode == "story"
+            and self.accepted_count == 0
+            and not self.story_intro_completed
+        ):
+            self.start_story_shutdown_sequence()
+        else:
+            self.show_missing_overlay(missing_count)
 
     def foreground_watchdog(self) -> None:
         if self.running and self.guard_active:
+            # Keep the Big Box readiness timer warm even before a sensor event.
+            # That makes announcements and takeovers feel immediate while still
+            # retaining the settle delay after an emulator closes.
+            if (
+                not self.overlay_visible
+                and self.pending_overlay_missing is None
+            ):
+                self.update_overlay_gate()
             self.maybe_show_pending_overlay()
 
         if self.running:
@@ -2411,6 +3541,260 @@ class MagnetArcadeGuard:
                 return
             self.schedule_audio_watchdog()
 
+    def show_text_takeover(
+        self,
+        title: str,
+        message: str,
+        overlay_kind: str,
+    ) -> bool:
+        self.hide_story_announcement()
+        if not self.overlay_visible:
+            self.capture_return_window()
+            self.prepare_overlay_monitor()
+            if not self.suspend_return_process():
+                self.fault_disable_guard("Could not safely pause Big Box")
+                return False
+
+        if not self.mute_other_audio():
+            self.fault_disable_guard("Could not mute background audio")
+            return False
+
+        self.cancel_completion()
+        self.stop_music()
+        self.stop_event_sound()
+        self.schedule_audio_watchdog()
+        self.animation_generation += 1
+        self.active_frames = []
+        self.active_delays = []
+        self.background_label.configure(image="", background="black")
+        self.overlay_visible = True
+        self.overlay_kind = overlay_kind
+        self.reset_counter_style()
+        self.hide_energy_meter()
+
+        _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
+        story_takeover = overlay_kind in {
+            "story_shutdown",
+            "story_question",
+            "story_eggman",
+        }
+        title_max_size = self.title_font_size
+        message_max_size = self.count_font_size
+        title_min_size = 12
+        message_min_size = 12
+        if story_takeover:
+            # The story cards are meant to be read from across the arcade.
+            # Their limits are based on the actual target monitor, then the
+            # normal width fitting still prevents any clipping.
+            title_max_size = max(
+                title_max_size,
+                int(monitor_height * 0.12),
+            )
+            message_max_size = max(
+                message_max_size,
+                int(monitor_height * 0.11),
+            )
+            title_min_size = 14
+            message_min_size = 14
+
+        title_size = self.fit_font_size(
+            tuple(title.splitlines()) or (title,),
+            max_size=title_max_size,
+            min_size=title_min_size,
+            available_width=monitor_width,
+        )
+        message_size = self.fit_font_size(
+            tuple(message.splitlines()) or (message,),
+            max_size=message_max_size,
+            min_size=message_min_size,
+            available_width=monitor_width,
+        )
+        self.title_label.configure(
+            text=title,
+            foreground="white",
+            font=("Arial", title_size, "bold"),
+            wraplength=max(1, int(monitor_width * 0.80)),
+            justify="center",
+        )
+        self.count_label.configure(
+            text=message,
+            foreground="white",
+            font=("Arial", message_size, "bold"),
+            wraplength=max(1, int(monitor_width * 0.80)),
+            justify="center",
+        )
+        self.title_label.update_idletasks()
+        self.count_label.update_idletasks()
+        title_height = self.title_label.winfo_reqheight()
+        message_height = self.count_label.winfo_reqheight()
+        vertical_gap = max(12, int(monitor_height * 0.035))
+        total_height = title_height + message_height + vertical_gap
+        top_y = max(10, (monitor_height - total_height) / 2)
+        self.title_label.place(
+            x=monitor_width / 2,
+            y=top_y + title_height / 2,
+            anchor="center",
+        )
+        self.count_label.place(
+            x=monitor_width / 2,
+            y=top_y + title_height + vertical_gap + message_height / 2,
+            anchor="center",
+        )
+
+        if not self.reveal_overlay_window():
+            self.fault_disable_guard("Overlay could not cover the display")
+            return False
+        return True
+
+    def cancel_story_sequence(self) -> None:
+        if self.story_sequence_after_id is not None:
+            try:
+                self.root.after_cancel(self.story_sequence_after_id)
+            except tk.TclError:
+                pass
+            self.story_sequence_after_id = None
+        self.cancel_cinematic()
+
+    def start_story_shutdown_sequence(self) -> None:
+        self.pending_overlay_missing = None
+        self.story_cycle_started = True
+        self.story_intro_completed = False
+        if not self.show_text_takeover(
+            STORY_SHUTDOWN_TITLE,
+            STORY_SHUTDOWN_MESSAGE,
+            "story_shutdown",
+        ):
+            return
+        self.play_last_emerald_removal_sound()
+        self.story_sequence_after_id = self.root.after(
+            int(STORY_SHUTDOWN_SECONDS * 1000),
+            self.show_story_question,
+        )
+
+    def show_story_question(self) -> None:
+        self.story_sequence_after_id = None
+        if not (
+            self.guard_active
+            and self.guard_mode == "story"
+            and self.overlay_visible
+        ):
+            return
+        if not self.show_text_takeover(
+            STORY_QUESTION_TITLE,
+            STORY_QUESTION_MESSAGE,
+            "story_question",
+        ):
+            return
+        self.story_sequence_after_id = self.root.after(
+            int(STORY_QUESTION_SECONDS * 1000),
+            self.show_story_eggman,
+        )
+
+    def show_story_eggman(self) -> None:
+        self.story_sequence_after_id = None
+        if not (
+            self.guard_active
+            and self.guard_mode == "story"
+            and self.overlay_visible
+        ):
+            return
+        if not self.show_text_takeover(
+            STORY_EGGMAN_TITLE,
+            STORY_EGGMAN_MESSAGE,
+            "story_eggman",
+        ):
+            return
+        self.play_event_sound(
+            self.eggman_reveal_sound,
+            "story_eggman",
+            force=True,
+            duck_music=False,
+        )
+        self.story_sequence_after_id = self.root.after(
+            int(STORY_EGGMAN_SECONDS * 1000),
+            self.start_story_cinematic,
+        )
+
+    def story_recovery_message(self, present_count: int) -> str:
+        energy_percent = round(present_count * 100 / TOTAL_EMERALDS)
+        title, detail = STORY_RETURNED_TEXT.get(
+            present_count,
+            (
+                f"{present_count} CHAOS EMERALDS RESTORED!",
+                "THE SHRINE IS RECLAIMING ITS POWER!",
+            ),
+        )
+        return f"{title}  {detail}  CHAOS ENERGY: {energy_percent}%"
+
+    def show_story_robotnik_screen(self) -> None:
+        if not self.guard_active or self.guard_mode != "story":
+            return
+        self.story_intro_completed = True
+        present_count = self.accepted_count or 0
+        missing_count = TOTAL_EMERALDS - present_count
+        self.show_missing_overlay(max(1, missing_count))
+        if not self.guard_active:
+            return
+        if present_count > 0:
+            self.set_robotnik_title(
+                self.story_recovery_message(present_count)
+            )
+        if present_count == TOTAL_EMERALDS:
+            self.begin_final_emerald_transition()
+
+    def cancel_normal_warning(self) -> None:
+        if self.normal_warning_after_id is not None:
+            try:
+                self.root.after_cancel(self.normal_warning_after_id)
+            except tk.TclError:
+                pass
+            self.normal_warning_after_id = None
+        self.normal_warning_trigger_count = None
+
+    def show_normal_warning(
+        self,
+        previous_count: int,
+        current_count: int,
+    ) -> bool:
+        if not self.can_show_story_announcement():
+            return False
+        self.cancel_normal_warning()
+        if not self.show_story_announcement(
+            current_count,
+            "normal",
+            duration_seconds=NORMAL_WARNING_SECONDS,
+        ):
+            return False
+        self.normal_warning_trigger_count = current_count
+        self.normal_warning_after_id = self.root.after(
+            int(NORMAL_WARNING_SECONDS * 1000),
+            self.finish_normal_warning,
+        )
+        return True
+
+    def finish_normal_warning(self) -> None:
+        self.normal_warning_after_id = None
+        self.normal_warning_trigger_count = None
+        self.hide_story_announcement()
+        if self.overlay_kind == "normal_warning":
+            self.hide_overlay()
+
+    def set_robotnik_title(self, text: str) -> None:
+        _, _, monitor_width, _ = self.overlay_monitor_bounds
+        title_size = self.fit_font_size(
+            tuple(text.splitlines()) or (text,),
+            max_size=self.title_font_size,
+            min_size=12,
+            available_width=monitor_width,
+        )
+        self.title_label.configure(
+            text=text,
+            foreground="white",
+            font=("Arial", title_size, "bold"),
+            wraplength=max(1, int(monitor_width * 0.82)),
+            justify="center",
+        )
+
     def show_missing_overlay(self, missing_count: int) -> None:
         self.set_control_panel_visible(False)
 
@@ -2439,20 +3823,36 @@ class MagnetArcadeGuard:
                 loop=True,
             )
         self.overlay_visible = True
-        self.title_label.configure(
-            text=LOCK_MESSAGE,
+        self.overlay_kind = "robotnik"
+        _, _, monitor_width, _ = self.overlay_monitor_bounds
+        count_size = self.fit_font_size(
+            (self.missing_text(missing_count),),
+            max_size=self.count_font_size,
+            min_size=12,
+            available_width=monitor_width,
         )
+        self.set_robotnik_title(LOCK_MESSAGE)
         self.reset_counter_style()
         self.count_label.configure(
             text=self.missing_text(missing_count),
+            font=("Arial", count_size, "bold"),
+            wraplength=max(1, int(monitor_width * 0.82)),
+            justify="center",
         )
+        self.set_energy_meter(TOTAL_EMERALDS - missing_count)
+        self.position_title()
+        self.position_counter()
+        self.position_energy_meter()
+
         if not self.reveal_overlay_window():
             self.fault_disable_guard("Overlay could not cover the display")
             return
 
     def hide_overlay(self, stop_music: bool = True) -> None:
         self.overlay_visible = False
+        self.overlay_kind = None
         self.cancel_audio_watchdog()
+        self.hide_energy_meter()
         self.set_control_panel_visible(False)
         self.reset_counter_style()
 
@@ -2487,7 +3887,10 @@ class MagnetArcadeGuard:
         self.set_control_panel_visible(False)
         self.completion_in_progress = True
         self.completion_animation_finished = False
+        self.final_completion_sound_started = False
+        self.final_completion_sound_playing = False
         self.reset_counter_style()
+        self.hide_energy_meter()
 
         if self.completion_frames:
             self.switch_background(
@@ -2500,12 +3903,20 @@ class MagnetArcadeGuard:
             self.start_supersonic_animation()
 
         self.overlay_visible = True
+        self.overlay_kind = "completion"
         self.title_label.configure(
             text=COMPLETION_MESSAGE,
+            foreground="white",
+            font=("Arial", self.title_font_size, "bold"),
+            wraplength=0,
         )
         self.count_label.configure(
             text=GAME_ON_MESSAGE,
+            wraplength=0,
         )
+        self.position_title()
+        self.position_counter()
+
         if not self.reveal_overlay_window():
             self.fault_disable_guard("Overlay could not cover the display")
             return
@@ -2630,11 +4041,42 @@ class MagnetArcadeGuard:
         )
 
     def play_removal_sound(self) -> bool:
-        return self.play_event_sound(
-            self.removal_sound,
+        sounds = list(getattr(self, "removal_sounds", ()) or ())
+        if not sounds and self.removal_sound is not None:
+            sounds = [self.removal_sound]
+        if not sounds:
+            return False
+
+        previous_index = getattr(
+            self,
+            "last_removal_sound_index",
+            None,
+        )
+        if len(sounds) == 1:
+            sound_index = 0
+        else:
+            sound_index = random.choice(
+                [index for index in range(len(sounds)) if index != previous_index]
+            )
+
+        sound = sounds[sound_index]
+        played = self.play_event_sound(
+            sound,
             "removed",
-            force=False,
+            force=True,
             duck_music=True,
+        )
+        if played:
+            self.last_removal_sound_index = sound_index
+            self.removal_sound = sound
+        return played
+
+    def play_last_emerald_removal_sound(self) -> bool:
+        return self.play_event_sound(
+            self.last_emerald_removal_sound,
+            "last_removed",
+            force=True,
+            duck_music=False,
         )
 
     def cancel_event_audio_watchdog(self) -> None:
@@ -2706,6 +4148,10 @@ class MagnetArcadeGuard:
         self.cancel_final_emerald_transition()
         self.count_label.configure(text=RESTORED_MESSAGE)
         self.animate_counter("restored")
+        self.animate_energy_meter(
+            self.energy_display_count,
+            TOTAL_EMERALDS,
+        )
         self.fade_missing_music()
         self.final_emerald_sound_started = self.play_emerald_sound(
             final=True
@@ -2786,14 +4232,38 @@ class MagnetArcadeGuard:
             except pygame.error:
                 audio_finished = True
 
-        if (
-            (self.completion_audio_playing and audio_finished)
+        victory_audio_done = (
+            (
+                self.completion_audio_playing
+                and audio_finished
+            )
             or (
                 not self.completion_audio_playing
                 and elapsed >= COMPLETION_FALLBACK_SECONDS
             )
             or elapsed >= COMPLETION_MAX_SECONDS
-        ) and self.completion_animation_finished:
+        )
+        if victory_audio_done and self.completion_animation_finished:
+            if not self.final_completion_sound_started:
+                self.final_completion_sound_started = True
+                self.final_completion_sound_playing = (
+                    self.play_event_sound(
+                        self.final_completion_sound,
+                        "final_completion",
+                        force=True,
+                        duck_music=False,
+                    )
+                )
+
+            if self.final_completion_sound_playing:
+                if self.event_channel_busy():
+                    self.completion_after_id = self.root.after(
+                        100,
+                        self.wait_for_completion_audio,
+                    )
+                    return
+                self.final_completion_sound_playing = False
+
             self.finish_completion()
             return
 
@@ -2810,8 +4280,22 @@ class MagnetArcadeGuard:
             and not self.controller_lost
             and self.completion_animation_finished
         ):
+            completed_story = (
+                self.guard_mode == "story"
+                and self.story_cycle_started
+            )
             self.completion_in_progress = False
+            self.final_completion_sound_started = False
+            self.final_completion_sound_playing = False
             self.hide_overlay()
+            if completed_story:
+                self.guard_mode = "normal"
+                self.story_armed = False
+                self.story_cycle_started = False
+                self.story_intro_completed = False
+                self.write_status(
+                    "STORY COMPLETE | switched automatically to Normal Mode"
+                )
 
     def cancel_completion(self) -> None:
         self.cancel_final_emerald_transition()
@@ -2831,6 +4315,10 @@ class MagnetArcadeGuard:
                 pass
 
         self.completion_audio_playing = False
+        if self.final_completion_sound_playing:
+            self.stop_event_sound()
+        self.final_completion_sound_started = False
+        self.final_completion_sound_playing = False
 
     def keep_window_on_top(self) -> None:
         if self.running and self.overlay_visible:
@@ -2882,8 +4370,6 @@ class MagnetArcadeGuard:
             for _ in range(20):
                 if (
                     not self.running
-                    or not self.guard_active
-                    or generation != self.activation_generation
                 ):
                     device.close()
                     return None
@@ -2894,8 +4380,6 @@ class MagnetArcadeGuard:
             while time.monotonic() < deadline:
                 if (
                     not self.running
-                    or not self.guard_active
-                    or generation != self.activation_generation
                 ):
                     device.close()
                     return None
@@ -2927,10 +4411,6 @@ class MagnetArcadeGuard:
 
     def serial_worker(self) -> None:
         while self.running:
-            if not self.guard_active:
-                time.sleep(0.10)
-                continue
-
             generation = self.activation_generation
             device: Optional[serial.Serial] = None
 
@@ -2951,8 +4431,6 @@ class MagnetArcadeGuard:
             for port_name in available_ports:
                 if (
                     not self.running
-                    or not self.guard_active
-                    or generation != self.activation_generation
                 ):
                     break
 
@@ -2979,8 +4457,6 @@ class MagnetArcadeGuard:
             try:
                 while (
                     self.running
-                    and self.guard_active
-                    and generation == self.activation_generation
                 ):
                     raw_line = device.readline()
                     if not raw_line:
@@ -2992,7 +4468,14 @@ class MagnetArcadeGuard:
                     ).strip()
 
                     if line.startswith(PROTOCOL_PREFIX):
-                        self.messages.put(("SERIAL", line, generation))
+                        self.last_serial_message_at = time.monotonic()
+                        self.messages.put(
+                            (
+                                "SERIAL",
+                                line,
+                                self.activation_generation,
+                            )
+                        )
 
             except (SerialException, OSError) as error:
                 self.messages.put(
@@ -3023,7 +4506,9 @@ class MagnetArcadeGuard:
         if message == "MAGNET_LOCK:READY":
             self.reader_connected = True
             self.controller_lost = False
-            self.last_valid_message = time.monotonic()
+            now = time.monotonic()
+            self.last_valid_message = now
+            self.last_serial_message_at = now
             return
 
         prefix = "MAGNET_LOCK:COUNT:"
@@ -3040,9 +4525,10 @@ class MagnetArcadeGuard:
 
         self.reader_connected = True
         self.controller_lost = False
-        self.last_valid_message = time.monotonic()
-        self.overlay_gate_state = "MONITORING"
         now = time.monotonic()
+        self.last_valid_message = now
+        self.last_serial_message_at = now
+        self.overlay_gate_state = "MONITORING"
 
         if count != self.pending_count:
             self.pending_count = count
@@ -3065,33 +4551,128 @@ class MagnetArcadeGuard:
         previous_count = self.accepted_count
         self.accepted_count = count
 
-        if count < TOTAL_EMERALDS:
-            self.request_missing_overlay(TOTAL_EMERALDS - count)
-            # Event sounds are deliberately limited to an active overlay.
-            # Changes during MAME/RetroArch are remembered silently and the
-            # correct count appears after Big Box has safely returned.
-            if self.overlay_visible and previous_count is not None:
-                if count < previous_count:
+        # The first accepted reading establishes a baseline. In particular,
+        # launching while an emerald is already absent must never create a
+        # warning or begin the story on its own.
+        if previous_count is None:
+            if self.guard_mode == "story" and count == TOTAL_EMERALDS:
+                self.story_armed = True
+            return
+
+        if self.guard_mode == "story":
+            self.handle_story_count_change(previous_count, count)
+        else:
+            self.handle_normal_count_change(previous_count, count)
+
+    def handle_story_count_change(
+        self,
+        previous_count: int,
+        current_count: int,
+    ) -> None:
+        if current_count == previous_count:
+            return
+
+        # Once the intro has finished, every recovery update belongs on the
+        # blocking Robotnik screen. Removing one again during the victory
+        # sequence safely cancels that sequence and returns to Robotnik.
+        if self.story_intro_completed and self.overlay_kind in {
+            "robotnik",
+            "completion",
+        }:
+            if current_count == TOTAL_EMERALDS:
+                if (
+                    current_count > previous_count
+                    and self.overlay_kind == "robotnik"
+                ):
+                    self.begin_final_emerald_transition()
+                return
+
+            self.show_missing_overlay(TOTAL_EMERALDS - current_count)
+            if not self.guard_active:
+                return
+            if current_count > 0:
+                self.set_robotnik_title(
+                    self.story_recovery_message(current_count)
+                )
+            self.animate_energy_meter(previous_count, current_count)
+            if current_count < previous_count:
+                if current_count == 0:
+                    self.play_last_emerald_removal_sound()
+                else:
                     self.play_removal_sound()
-                    self.animate_counter("removed")
-                elif count > previous_count:
+                self.animate_counter("removed")
+            else:
+                self.play_emerald_sound()
+                self.animate_counter("returned")
+            return
+
+        # Sensor changes during the shutdown narration or cinematic are
+        # remembered, then reflected when the Robotnik screen appears.
+        if self.overlay_kind in {
+            "story_shutdown",
+            "story_question",
+            "story_eggman",
+            "cinematic",
+        }:
+            return
+
+        # Story Mode arms only after all seven have been observed together.
+        # This preserves the fail-open baseline behavior when the guard starts
+        # with one or more emeralds already absent.
+        if current_count == TOTAL_EMERALDS:
+            self.story_armed = True
+            self.pending_overlay_missing = None
+            if previous_count < current_count:
+                if self.show_story_announcement(current_count, "returned"):
                     self.play_emerald_sound()
-                    self.animate_counter("returned")
+            return
+
+        if not self.story_armed:
+            return
+
+        if current_count < previous_count:
+            if current_count == 0:
+                self.hide_story_announcement()
+                self.pending_overlay_missing = TOTAL_EMERALDS
+                self.maybe_show_pending_overlay()
+            elif self.show_story_announcement(current_count, "removed"):
+                self.play_removal_sound()
+            return
+
+        # Returning an emerald before the complete theft cancels a pending
+        # shutdown and gives a non-blocking energy update over Big Box.
+        self.pending_overlay_missing = None
+        if self.show_story_announcement(current_count, "returned"):
+            self.play_emerald_sound()
+
+    def handle_normal_count_change(
+        self,
+        previous_count: int,
+        current_count: int,
+    ) -> None:
+        if current_count == previous_count:
             return
 
         if (
-            previous_count is not None
-            and previous_count < TOTAL_EMERALDS
-            and not self.controller_lost
+            self.overlay_kind == "normal_warning"
+            or getattr(self, "normal_warning_trigger_count", None)
+            is not None
         ):
-            if self.overlay_visible:
-                self.begin_final_emerald_transition()
+            if current_count > previous_count:
+                self.finish_normal_warning()
             else:
-                self.pending_overlay_missing = None
-        else:
-            self.pending_overlay_missing = None
-            if self.overlay_visible:
-                self.hide_overlay()
+                # A second real removal is a new event, so keep the warning up
+                # for a full interval from the newest removal.
+                if self.show_normal_warning(previous_count, current_count):
+                    self.play_removal_sound()
+            return
+
+        # Normal Mode reacts only to a downward edge observed while Big Box is
+        # the usable full-screen foreground. A missing baseline or a steady
+        # missing count never opens the warning.
+        if current_count < previous_count:
+            if self.show_normal_warning(previous_count, current_count):
+                self.play_removal_sound()
 
     def handle_disconnect(self, reason: str) -> None:
         if not self.guard_active:
@@ -3100,6 +4681,7 @@ class MagnetArcadeGuard:
         self.reader_connected = False
         self.controller_lost = True
         self.pending_count = None
+        self.last_serial_message_at = 0.0
         self.fault_disable_guard(reason or "ESP32 disconnected")
 
     def process_messages(self) -> None:
@@ -3111,6 +4693,8 @@ class MagnetArcadeGuard:
                     if value == "EXIT":
                         self.exit_program()
                         return
+                    elif value == "STORY_MODE":
+                        self.select_story_mode()
                     elif value == "DEACTIVATE":
                         self.deactivate_guard()
                     elif value == "ACTIVATE":
@@ -3139,7 +4723,7 @@ class MagnetArcadeGuard:
 
     def connection_watchdog(self) -> None:
         if self.guard_active and self.reader_connected:
-            elapsed = time.monotonic() - self.last_valid_message
+            elapsed = time.monotonic() - self.last_serial_message_at
 
             if elapsed > CONNECTION_TIMEOUT_SECONDS:
                 self.handle_disconnect("ESP32 heartbeat timed out")
@@ -3154,29 +4738,56 @@ class MagnetArcadeGuard:
     def guard_readiness_error(self) -> str:
         problems = []
 
-        if not PIL_AVAILABLE:
-            problems.append("Pillow image support unavailable")
-        elif not self.background_frames:
-            problems.append("Robotnik GIF unavailable")
-        elif not self.completion_frames:
-            problems.append("Sonic GIF unavailable")
-        elif not self.supersonic_frames:
-            problems.append("Super Sonic GIF unavailable")
+        if self.guard_mode == "story":
+            if not PIL_AVAILABLE:
+                problems.append("Pillow image support unavailable")
+            elif not self.background_frames:
+                problems.append("Robotnik GIF unavailable")
+            elif not self.completion_frames:
+                problems.append("Sonic GIF unavailable")
+            elif not self.supersonic_frames:
+                problems.append("Super Sonic GIF unavailable")
 
-        if not PYGAME_AVAILABLE or not self.audio_ready:
-            problems.append("audio system unavailable")
-        else:
-            if not self.missing_audio_path.exists():
-                problems.append("Robotnik music unavailable")
-            if not self.completion_audio_path.exists():
-                problems.append("victory music unavailable")
-            if self.emerald_sound is None:
-                problems.append("emerald sound unavailable")
+            if not PYGAME_AVAILABLE or not self.audio_ready:
+                problems.append("audio system unavailable")
+            else:
+                if not self.missing_audio_path.exists():
+                    problems.append("Robotnik music unavailable")
+                if not self.completion_audio_path.exists():
+                    problems.append("victory music unavailable")
+                if self.emerald_sound is None:
+                    problems.append("emerald sound unavailable")
+
+            if not AV_AVAILABLE:
+                problems.append("cinematic decoder unavailable")
+            elif not self.cinematic_video_path.exists():
+                problems.append("Sonic CD cinematic unavailable")
+            elif self.cinematic_prepare_state in {"error", "unavailable"}:
+                problems.append(
+                    "cinematic preparation failed: "
+                    + (self.cinematic_prepare_error or "unknown error")
+                )
 
         if not PYCAW_AVAILABLE:
             problems.append("background-audio muting unavailable")
 
         return "; ".join(problems)
+
+    def select_story_mode(self) -> None:
+        self.select_guard_mode("story")
+
+    def select_normal_mode(self) -> None:
+        self.select_guard_mode("normal")
+
+    def select_guard_mode(self, mode: str) -> None:
+        if mode not in {"story", "normal"} or not self.running:
+            return
+        if self.guard_active:
+            self._deactivate_guard(None)
+        self.guard_mode = mode
+        self.last_fault = ""
+        self.write_status(f"MODE SELECTED | {mode.upper()}")
+        self.activate_guard()
 
     def activate_guard(self) -> None:
         if self.guard_active or not self.running:
@@ -3193,13 +4804,18 @@ class MagnetArcadeGuard:
         self.guard_active = True
         self.last_fault = ""
         self.pending_count = None
+        self.last_serial_message_at = 0.0
         self.accepted_count = None
         self.pending_overlay_missing = None
+        self.pending_normal_warning = None
+        self.story_armed = False
+        self.story_cycle_started = False
+        self.story_intro_completed = False
         self.controller_lost = True
         self.reader_connected = False
         self.overlay_gate_state = "WAITING_FOR_SENSOR"
         self.reset_big_box_readiness()
-        self.write_status("ACTIVATING GUARD")
+        self.write_status(f"ACTIVATING GUARD | mode={self.guard_mode}")
 
     def deactivate_guard(self, event=None) -> str:
         if not self.running:
@@ -3230,6 +4846,13 @@ class MagnetArcadeGuard:
         self.pending_count = None
         self.accepted_count = None
         self.pending_overlay_missing = None
+        self.pending_normal_warning = None
+        self.hide_story_announcement()
+        self.cancel_story_sequence()
+        self.cancel_normal_warning()
+        self.story_armed = False
+        self.story_cycle_started = False
+        self.story_intro_completed = False
         self.cancel_completion()
         self.completion_in_progress = False
         self.reset_big_box_readiness()
@@ -3246,9 +4869,11 @@ class MagnetArcadeGuard:
 
         exit_combo = (0x11, 0x10, 0x7B)  # Ctrl, Shift, F12
         deactivate_combo = (0x11, 0x12, 0x7A)  # Ctrl, Alt, F11
+        story_mode_combo = (0x11, 0x12, 0x79)  # Ctrl, Alt, F10
         keyboard_activate_combo = (0x11, 0x12, 0x7B)
         was_exit_pressed = False
         was_deactivate_pressed = False
+        was_story_mode_pressed = False
         was_activate_pressed = False
 
         while self.running:
@@ -3260,6 +4885,10 @@ class MagnetArcadeGuard:
                 user32.GetAsyncKeyState(key) & 0x8000
                 for key in deactivate_combo
             )
+            ctrl_alt_f10_pressed = all(
+                user32.GetAsyncKeyState(key) & 0x8000
+                for key in story_mode_combo
+            )
             ctrl_alt_f12_pressed = all(
                 user32.GetAsyncKeyState(key) & 0x8000
                 for key in keyboard_activate_combo
@@ -3269,6 +4898,7 @@ class MagnetArcadeGuard:
                 ctrl_alt_f11_pressed
                 and self.guard_active
             )
+            story_mode_pressed = ctrl_alt_f10_pressed
             activate_pressed = (
                 ctrl_alt_f12_pressed and not self.guard_active
             )
@@ -3279,11 +4909,15 @@ class MagnetArcadeGuard:
             if deactivate_pressed and not was_deactivate_pressed:
                 self.messages.put(("CONTROL", "DEACTIVATE", -1))
 
+            if story_mode_pressed and not was_story_mode_pressed:
+                self.messages.put(("CONTROL", "STORY_MODE", -1))
+
             if activate_pressed and not was_activate_pressed:
                 self.messages.put(("CONTROL", "ACTIVATE", -1))
 
             was_exit_pressed = exit_pressed
             was_deactivate_pressed = deactivate_pressed
+            was_story_mode_pressed = story_mode_pressed
             was_activate_pressed = activate_pressed
             time.sleep(0.05)
 
@@ -3313,6 +4947,9 @@ class MagnetArcadeGuard:
         self.overlay_visible = False
 
         try:
+            self.hide_story_announcement()
+            self.cancel_story_sequence()
+            self.cancel_normal_warning()
             self.cancel_completion()
             self.cancel_audio_watchdog()
             self.stop_music()

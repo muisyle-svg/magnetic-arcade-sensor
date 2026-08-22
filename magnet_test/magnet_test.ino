@@ -27,8 +27,19 @@ const bool RGB_COMMON_ANODE = true;
 const bool SENSOR_ACTIVE_LOW = true;
 
 const unsigned long HEARTBEAT_INTERVAL_MS = 1000;
-const unsigned long LED_PULSE_PERIOD_MS = 2200;
-const unsigned long SENSOR_DEBOUNCE_MS = 60;
+const unsigned long SENSOR_DEBOUNCE_MS = 30;
+const unsigned long RETURN_ENERGY_BOOST_MS = 1600;
+const unsigned long RETURN_BOOST_PULSE_PERIOD_MS = 700;
+
+// Resting energy color for 0 through 7 detected emeralds. The LED has only
+// red and green connected, so these values move through red, orange, amber,
+// yellow-green, and finally pure green as the shrine's energy is restored.
+const byte ENERGY_RED[SENSOR_COUNT + 1] = {
+  255, 255, 255, 255, 235, 190, 95, 0
+};
+const byte ENERGY_GREEN[SENSOR_COUNT + 1] = {
+  0, 12, 30, 58, 95, 145, 220, 255
+};
 
 enum LedEffect {
   LED_EFFECT_NONE,
@@ -44,6 +55,8 @@ bool stableSensorStates[SENSOR_COUNT];
 unsigned long rawStateChangedAt[SENSOR_COUNT];
 LedEffect activeLedEffect = LED_EFFECT_NONE;
 unsigned long ledEffectStartedAt = 0;
+bool returnEnergyBoostActive = false;
+unsigned long returnEnergyBoostStartedAt = 0;
 
 bool magnetDetected(int pin) {
   int reading = digitalRead(pin);
@@ -115,10 +128,15 @@ void startLedEffect(int oldCount, int newCount) {
 
   if (newCount < oldCount) {
     activeLedEffect = LED_EFFECT_REMOVED;
+    returnEnergyBoostActive = false;
   } else if (newCount == SENSOR_COUNT) {
     activeLedEffect = LED_EFFECT_ALL_RETURNED;
+    returnEnergyBoostActive = true;
+    returnEnergyBoostStartedAt = millis();
   } else {
     activeLedEffect = LED_EFFECT_RETURNED;
+    returnEnergyBoostActive = true;
+    returnEnergyBoostStartedAt = millis();
   }
 
   ledEffectStartedAt = millis();
@@ -129,21 +147,21 @@ bool renderLedEffect() {
 
   if (activeLedEffect == LED_EFFECT_REMOVED) {
     // Two sharp red alarm flashes.
-    if (elapsed < 110 || (elapsed >= 180 && elapsed < 290)) {
+    if (elapsed < 70 || (elapsed >= 110 && elapsed < 180)) {
       setLed(255, 0);
       return true;
     }
-    if (elapsed < 380) {
+    if (elapsed < 230) {
       setLed(0, 0);
       return true;
     }
   } else if (activeLedEffect == LED_EFFECT_RETURNED) {
     // A short green absorption flash before returning to red warning mode.
-    if (elapsed < 220) {
+    if (elapsed < 120) {
       setLed(0, 255);
       return true;
     }
-    if (elapsed < 300) {
+    if (elapsed < 170) {
       setLed(0, 0);
       return true;
     }
@@ -175,13 +193,31 @@ void updateLed(int currentCount) {
     return;
   }
 
+  currentCount = constrain(currentCount, 0, SENSOR_COUNT);
+  unsigned long now = millis();
+  if (
+    returnEnergyBoostActive
+    && now - returnEnergyBoostStartedAt >= RETURN_ENERGY_BOOST_MS
+  ) {
+    returnEnergyBoostActive = false;
+  }
+
+  // More recovered emeralds make the shrine pulse more quickly. Returning an
+  // emerald temporarily speeds it up further so the placement feels charged.
+  unsigned long pulsePeriod = 2600UL - (
+    static_cast<unsigned long>(currentCount) * 150UL
+  );
+  if (returnEnergyBoostActive) {
+    pulsePeriod = RETURN_BOOST_PULSE_PERIOD_MS;
+  }
+
   // Integer-only triangle wave. The ESP32-C3 has no hardware floating-point
   // unit, so avoid float/cosf here; some libm builds can emit illegal FP
   // instructions on this chip.
-  const int minimumBrightness = 70;
+  const int minimumBrightness = 62;
   const int brightnessRange = 255 - minimumBrightness;
-  const unsigned long halfPeriod = LED_PULSE_PERIOD_MS / 2;
-  unsigned long phase = millis() % LED_PULSE_PERIOD_MS;
+  const unsigned long halfPeriod = pulsePeriod / 2;
+  unsigned long phase = now % pulsePeriod;
   int brightness;
 
   if (phase <= halfPeriod) {
@@ -190,17 +226,13 @@ void updateLed(int currentCount) {
     );
   } else {
     brightness = minimumBrightness + static_cast<int>(
-      brightnessRange * (LED_PULSE_PERIOD_MS - phase) / halfPeriod
+      brightnessRange * (pulsePeriod - phase) / halfPeriod
     );
   }
 
-  if (currentCount == SENSOR_COUNT) {
-    // All emeralds present: green magic is being stored.
-    setLed(0, brightness);
-  } else {
-    // Any emerald missing: Robotnik's warning state.
-    setLed(brightness, 0);
-  }
+  int red = static_cast<int>(ENERGY_RED[currentCount]) * brightness / 255;
+  int green = static_cast<int>(ENERGY_GREEN[currentCount]) * brightness / 255;
+  setLed(red, green);
 }
 
 void sendCount(int count) {

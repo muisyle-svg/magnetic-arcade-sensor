@@ -1,20 +1,59 @@
-# Magnetic Arcade Guard
+# Magnetic Arcade Guard — Story/Normal Edition
 
-The guard watches seven ESP32 magnetic sensors while Big Box is at its menu. If an emerald is removed, it pauses Big Box, mutes Big Box audio, and displays the Robotnik screen. It does not attempt to cover MAME, GroovyMAME, or RetroArch games.
+This is an experimental version kept completely separate from the known-good guard. It has its own source folder, build folder, EXE name, and distribution folder.
 
-The ESP32 independently drives a two-color portion of a four-leg RGB LED:
+The frozen release remains at:
 
-- Emerald removed: two bright red alarm flashes.
-- Emerald returned while others are missing: one bright green absorption flash.
-- Final emerald returned: three increasingly bright green charge pulses.
-- Fewer than seven emeralds at rest: slowly pulsing red.
-- All seven emeralds at rest: slowly pulsing bright green.
+`C:\Users\Projector\Documents\RFIDlock\versions\stable-pre-story-mode`
 
-The LED is controlled entirely by the ESP32 and does not depend on the Windows guard, Big Box, or the USB connection. Each Hall sensor is independently debounced before its state is reported. LED animation uses integer-only timing for compatibility with the ESP32-C3.
+Its portable ZIP is:
+
+`C:\Users\Projector\Documents\RFIDlock\versions\MagnetArcadeGuard-stable-pre-story-mode.zip`
+
+## Modes
+
+### Story Mode
+
+Story Mode arms only after the guard has observed all seven emeralds in place. Starting the guard with an emerald already absent does nothing until all seven are restored and a later removal occurs.
+
+- Removing emeralds 1–6 shows a centered, briefly flashing, non-blocking theft/energy banner over a full-screen Big Box menu. Big Box remains usable and the banner does not take keyboard or joystick focus.
+- The shutdown story cards use larger monitor-aware text, while still shrinking or wrapping to stay inside the arcade display.
+- Each partial theft chooses a different removal sound from the four bundled clips; the same clip is never chosen twice in a row.
+- Removing the seventh emerald starts the full takeover only after Big Box is the stable full-screen foreground. It pauses Big Box, mutes its audio, announces the shutdown, asks where a hero can be found, and plays the bundled Sonic CD opening.
+- The final theft uses the dedicated `no-he-s-got-the-last-emerald.mp3` clip. Before the cinematic, the Eggman reveal screen only says `SO EGGMAN'S BEHIND THIS, HUH?` and plays its matching voice clip.
+- After the cinematic, the Robotnik recovery screen shows the number recovered and current Chaos Energy percentage as each emerald returns.
+- The final return immediately updates the text, lets the return sound finish, pauses briefly, and plays the Sonic/Super Sonic victory sequence. After the victory music finishes while Super Sonic is displayed, the bundled `i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3` clip plays.
+- Completing the full story automatically changes the running guard to Normal Mode.
+
+Changes made while MAME, GroovyMAME, or RetroArch is active never try to draw over the emulator. A complete seven-emerald theft waits until Big Box has safely returned before starting the story takeover.
+
+### Normal Mode
+
+Normal Mode reacts only to a new downward sensor transition while Big Box is the usable full-screen foreground.
+
+- It displays a non-blocking banner: `A Chaos Emerald Was Stolen!` followed by `Hey! Put that back! We already did the thing!` and the current Chaos Energy percentage. It also plays one of the randomized removal voice clips.
+- It returns to the normal Big Box view after 10 seconds even if the emerald is still missing.
+- It returns immediately if any emerald is put back first.
+- A missing count present when the mode starts does not trigger it, and a steady missing count does not retrigger it.
+
+Select either mode from the regular Windows operator panel. Selecting a mode activates the guard in that mode.
+
+## LED energy meter
+
+The ESP32 independently controls the existing red and green LED legs; the blue leg remains disconnected.
+
+- The resting color moves from red through orange, amber, and yellow-green to bright green as the detected count rises from 0 to 7.
+- The pulse gradually becomes faster as Chaos Energy rises.
+- The Robotnik screen shows a dedicated `MASTER EMERALD ENERGY` meter with a short stepped increase/decrease animation whenever the count changes.
+- Removing an emerald produces two red alarm flashes.
+- Returning an emerald produces a green absorption flash followed by a temporary faster energy pulse.
+- Returning the final emerald produces the three-stage green charge effect followed by the fast green pulse.
+
+The LED does not depend on the Windows guard, Big Box, or the USB connection. The Windows guard keeps its serial connection open while dormant so deactivation does not unnecessarily interrupt the controller. The animation remains integer-only to avoid the ESP32-C3 floating-point crash encountered during earlier testing.
 
 ## ESP32 wiring
 
-Power every KY-003 from `3V3`, not `5V`, so its digital output remains safe for the ESP32. Join every Hall module to the same ground connection. The common-anode LED's long/common leg connects to `3V3`; it does not connect directly to ground.
+No hardware changes are required for this version.
 
 | Part | XIAO ESP32-C3 |
 |---|---|
@@ -25,43 +64,32 @@ Power every KY-003 from `3V3`, not `5V`, so its digital output remains safe for 
 | KY-003 #5 `S` / `OUT` | `D5` |
 | KY-003 #6 `S` / `OUT` | `D6` |
 | KY-003 #7 `S` / `OUT` | `D7` |
-| RGB LED red leg | `D8` through its own 220-330 ohm resistor |
-| RGB LED green leg | `D10` through its own 220-330 ohm resistor |
+| RGB LED red leg | `D8` through its own 220–330 ohm resistor |
+| RGB LED green leg | `D10` through its own 220–330 ohm resistor |
 | RGB LED common/long anode | `3V3` |
 | RGB LED blue leg | Not connected |
 
-Use a **separate 220-330 ohm, 1/4-watt resistor on each connected color leg**. A 330-ohm resistor is the safer default; use 220 ohms if that channel is too dim. Do not put one shared resistor on the common leg, and never connect an LED color leg directly to a GPIO.
+Power every KY-003 from `3V3`, share ground, and leave `D0` and `D9` unconnected. The sketch is configured for the existing common-anode LED. Use a separate resistor on each connected color leg; 330 ohms is the safer default and 220 ohms is brighter.
 
-The sketch is configured for your common-anode RGB LED. Connect its common/long leg to `3V3`; the sketch automatically inverts the channel outputs. RGB LED leg order varies, so identify the red and green legs for the specific LED rather than relying only on physical order. If you use a common-cathode LED later, connect its common leg to `GND` and change `RGB_COMMON_ANODE` to `false`.
+Upload `magnet_test\magnet_test.ino` with Arduino IDE set to `XIAO_ESP32C3` and **Tools > USB CDC On Boot > Enabled**.
 
-Leave `D0` and `D9` unconnected. They map to ESP32-C3 boot-strapping pins that are poor choices for magnet sensors. `D8` is also a strapping pin, but normal SPI boot permits either level there; it is used only as a current-limited LED output, never as a Hall input.
+## Fail-open behavior
 
-Upload `magnet_test\magnet_test.ino` after wiring. Most KY-003 modules detect only one magnet pole; reverse a magnet if its sensor does not activate.
-
-When uploading in Arduino IDE, select `XIAO_ESP32C3` and set **Tools > USB CDC On Boot > Enabled**. This is important because the sketch reports counts over USB serial while `D6` is also used as sensor input. With USB CDC disabled, `D6` is the XIAO's UART transmit pin and the serial heartbeat can make the sensor indicator flicker. Use only Serial Monitor or the guard at one time, and press RESET once after uploading if the USB serial port does not reappear.
-
-## Safety behavior
-
-The guard is intentionally **fail-open**. An ESP32 disconnect, heartbeat timeout, missing media dependency, overlay sizing failure, audio failure, or internal callback failure disables the guard and restores Big Box input/audio. It stays disabled until an operator activates it again or restarts the program. A separate helper process resumes Big Box if the main guard process crashes while Big Box is paused.
+The guard favors access to the arcade over lockout. An ESP32 disconnect, heartbeat timeout, media/decoder failure, overlay failure, audio failure, or internal callback failure disables the guard, restores Big Box input/audio, and leaves the guard off until an operator activates it again. A helper process also resumes Big Box if the main process crashes while Big Box is paused.
 
 Only one guard instance can run at a time.
 
-## Experience behavior
-
-- Return and removal events use one dedicated sound-effects channel, so repeated sounds cannot overlap. Multiple rapid returns are combined into one clean chime.
-- The Robotnik music is lowered briefly under ordinary event sounds.
-- When the final emerald is returned, the counter immediately changes to `ALL CHAOS EMERALDS RESTORED!` and Robotnik's music fades. The guard waits for the final emerald sound to actually finish, pauses briefly, and then starts the Sonic victory screen.
-- Counter text briefly grows and flashes red for a removal or green for a return.
-- Emerald changes made while MAME, GroovyMAME, or RetroArch is active are tracked silently. Sounds and presentation resume only after Big Box has safely returned.
-
-The optional removal sound defaults to `emerald-removed.mp3`. Put that file beside `MagnetArcadeGuard.exe` and restart the guard; no rebuild is required. You can use a different filename by changing `removal_sound_file` in `guard-config.json`. If the file is absent, the guard remains usable and provides the visual and LED feedback without a removal sound.
-
 ## Operator controls
 
-- `Ctrl+Alt+F12`: activate the guard from anywhere.
-- `Ctrl+Alt+F11`: deactivate the guard from anywhere.
-- `Ctrl+Shift+F12`: close the program from anywhere.
-- The operator panel is an ordinary resizable Windows window with standard minimize, maximize, and close controls. The guard does not automatically hide, restore, or unminimize it. Big Box and the full-screen takeover naturally cover it on the arcade display.
+- Story Mode and Normal Mode buttons select and activate that mode.
+- Deactivate Guard stops monitoring and closes any presentation.
+- Close Program exits the guard.
+- `Ctrl+Alt+F10` selects and activates Story Mode from anywhere.
+- `Ctrl+Alt+F12` activates the currently selected mode from anywhere.
+- `Ctrl+Alt+F11` deactivates the guard from anywhere.
+- `Ctrl+Shift+F12` closes the program from anywhere.
+
+The panel is an ordinary resizable/minimizable Windows window. Big Box and the takeover naturally cover it on the arcade display; the guard does not force the panel open or restore it from the taskbar.
 
 Status files are written to:
 
@@ -70,48 +98,55 @@ Status files are written to:
 
 ## Configuration
 
-Keep `guard-config.json` beside `MagnetArcadeGuard.exe`.
+Keep `guard-config.json` beside `MagnetArcadeGuardStoryMode.exe`.
 
-- `total_emeralds`: must match the ESP32 firmware sensor count.
-- `auto_activate`: `false` starts dormant; `true` starts checking automatically.
-- `serial_port`: leave empty for automatic detection, or set a value such as `COM4`.
-- `big_box_ready_delay_seconds`: how long a full-monitor Big Box menu must remain stable before the overlay can appear.
-- `sensor_stable_ms`: additional Windows-side stabilization after the ESP32's per-sensor debounce. The default is `100`.
-- `final_emerald_pause_ms`: pause after the final emerald sound finishes and before Sonic appears. The default is `150`.
-- `sound_effect_cooldown_ms`: suppresses repeated copies of the same sound. The default is `350`.
-- `counter_flash_ms`: duration of the red/green counter animation. The default is `300`.
-- `robotnik_fade_ms`: final-emeral fade time for Robotnik's music. The default is `250`.
+- `default_mode`: `story` or `normal`.
+- `auto_activate`: normally `false` so the operator chooses a mode after launching.
+- `serial_port`: empty for automatic detection, or a fixed value such as `COM4`.
+- `normal_warning_seconds`: Normal Mode timeout; default `10.0`.
+- `story_announcement_seconds`: duration of each non-blocking theft banner.
+- `story_shutdown_seconds`: duration of the arcade-shutdown announcement.
+- `story_question_seconds`: duration of the hero prompt before the cinematic.
+- `story_eggman_seconds`: duration of the Eggman reveal before the cinematic.
+- `cinematic_fade_seconds`: black-to-video fade duration.
+- `cinematic_video_file`: exact Sonic CD video filename used when building.
+- `big_box_ready_delay_seconds`: how long Big Box must cover its monitor and remain stable before a full takeover.
+- `sensor_stable_ms`: Windows-side sensor stabilization after the firmware debounce.
+- `final_emerald_pause_ms`: pause after the final return sound and before Sonic appears.
 - `music_volume` and `sound_effect_volume`: values from `0.0` to `1.0`.
-- `removal_sound_file`: optional removal-effect filename beside the EXE.
+- `removal_sound_files`: list of partial-theft sounds; the guard randomly chooses without repeating the previous clip.
+- `last_emerald_removal_sound_file`: dedicated sound for the seventh and final theft.
+- `final_completion_sound_file`: sound played after the victory music and Super Sonic animation.
 
-If all emeralds are present at activation, the guard establishes that as its baseline and shows nothing until one is removed.
+Other GIF, MP3, and MP4 files beside the EXE also override their bundled copies when their configured filenames match.
 
-## Build
+## Build this separate version
 
 From PowerShell on the development computer:
 
 ```powershell
-Set-Location "C:\Users\Projector\Documents\RFIDlock"
-.\build_guard.cmd
+Set-Location "C:\Users\Projector\Documents\RFIDlock\StoryModeVersion"
+.\build_story_guard.cmd
 ```
 
 To install or refresh the pinned build dependencies first:
 
 ```powershell
-.\build_guard.cmd -InstallDependencies
+.\build_story_guard.cmd -InstallDependencies
 ```
 
-The finished portable files are `dist\MagnetArcadeGuard.exe` and `dist\guard-config.json`. The arcade PC does not need Python installed.
+The portable files are created only at:
 
-## Arcade PC checklist
+- `dist-story-mode\MagnetArcadeGuardStoryMode.exe`
+- `dist-story-mode\guard-config.json`
+- `dist-story-mode\MagnetArcadeGuardStoryMode-test.zip` (EXE, config, firmware, version note, and this guide)
 
-1. Replace the old EXE and copy `guard-config.json` beside it.
-2. Connect the ESP32 and verify its COM port appears in Device Manager.
-3. Start the guard. Confirm the operator panel says `DORMANT — GUARD OFF`.
-4. Start Big Box, then press `Ctrl+Alt+F12` or activate from the panel before entering Big Box.
-5. Test removal/return only at a Big Box menu first.
-6. Confirm each removal causes red LED alarm flashes and each return causes a green flash without overlapping return sounds.
-7. Confirm the final return updates the counter immediately, finishes the emerald sound, and then starts the Sonic victory sequence.
-8. Unplug the ESP32 while the Robotnik screen is active. The overlay should close, Big Box should resume, and the panel should report `DISABLED` with the disconnect reason.
+The arcade PC does not need Python installed.
 
-The supplied firmware and `guard-config.json` are both configured for seven emeralds.
+## Revert to the stable version
+
+1. Close `MagnetArcadeGuardStoryMode.exe`.
+2. Run `MagnetArcadeGuard.exe` from `versions\stable-pre-story-mode` instead.
+3. If the stable firmware is also desired, upload `versions\stable-pre-story-mode\magnet_test.ino`.
+
+The separate names allow both versions to remain on the arcade PC without replacing each other.

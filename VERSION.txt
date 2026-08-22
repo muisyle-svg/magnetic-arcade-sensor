@@ -1,0 +1,9 @@
+MAGNETIC ARCADE GUARD — STORY/NORMAL MODE DEVELOPMENT VERSION
+
+This project is intentionally separate from the stable pre-Story-Mode
+release. Its build output must remain inside this StoryModeVersion folder and
+must use a distinct executable name so it cannot overwrite the stable build.
+
+The frozen stable release is located at:
+..\versions\stable-pre-story-mode\
+
