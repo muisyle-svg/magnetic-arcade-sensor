@@ -1,0 +1,12 @@
+This folder contains the frozen pre-Story-Mode release.
+
+MagnetArcadeGuard.exe is the authoritative stable executable. Its SHA256 is:
+BE04D2C30B391E2096863B4EC50FBE12CA62A6A795F8FA5B6CC116C6C4C1A78D
+
+magnet_arcade_guard.py was reconstructed from the stable executable after the
+original source file had already received early Story Mode edits. The
+reconstructed source compiles to the same module and class-method bytecode as
+the stable executable; only source line-number metadata and comments differ.
+
+magnet_arcade_guard.stable.pyc is the extracted compiled module used for that
+verification. Keep the EXE and ZIP as the operational rollback copies.

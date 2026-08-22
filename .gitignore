@@ -1,0 +1,44 @@
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Local runtime state and logs
+ring-counter.json
+guard-status.txt
+guard-events.log
+guard-bootstrap.log
+*.log
+
+# Build and packaging output
+build/
+build-*/
+dist/
+dist-*/
+*.exe
+*.zip
+*.7z
+firmware-build/
+
+# Bundled runtimes and local environments
+Python/
+.venv/
+venv/
+
+# Media and generated artwork
+*.gif
+*.mp3
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.wav
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

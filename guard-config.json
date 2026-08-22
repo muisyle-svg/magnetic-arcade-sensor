@@ -1,0 +1,14 @@
+{
+  "total_emeralds": 7,
+  "auto_activate": false,
+  "serial_port": "",
+  "big_box_ready_delay_seconds": 1.5,
+  "sensor_stable_ms": 100,
+  "final_emerald_pause_ms": 150,
+  "sound_effect_cooldown_ms": 350,
+  "counter_flash_ms": 300,
+  "robotnik_fade_ms": 250,
+  "music_volume": 0.75,
+  "sound_effect_volume": 1.0,
+  "removal_sound_file": "emerald-removed.mp3"
+}
