@@ -20,25 +20,25 @@ if ($InstallDependencies) {
 if ($LASTEXITCODE -ne 0) { throw "Tests failed; the EXE was not rebuilt." }
 
 & $PythonPath -m PyInstaller --noconfirm --clean `
-    --distpath dist-story-mode `
-    --workpath build-story-mode `
+    --distpath dist-ring-enabled `
+    --workpath build-ring-enabled `
     MagnetArcadeGuardStoryMode.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 
-Copy-Item -LiteralPath guard-config.json -Destination dist-story-mode\guard-config.json -Force
-Copy-Item -LiteralPath README.md -Destination dist-story-mode\README-StoryMode.md -Force
-Copy-Item -LiteralPath VERSION.txt -Destination dist-story-mode\VERSION.txt -Force
-Copy-Item -LiteralPath magnet_test\magnet_test.ino -Destination dist-story-mode\magnet_test-story-mode.ino -Force
+Copy-Item -LiteralPath guard-config.json -Destination dist-ring-enabled\guard-config.json -Force
+Copy-Item -LiteralPath README.md -Destination dist-ring-enabled\README-RingEnabled.md -Force
+Copy-Item -LiteralPath VERSION.txt -Destination dist-ring-enabled\VERSION.txt -Force
+Copy-Item -LiteralPath magnet_test\magnet_test.ino -Destination dist-ring-enabled\magnet_test-ring-enabled.ino -Force
 
 $ReleaseFiles = @(
-    "dist-story-mode\MagnetArcadeGuardStoryMode.exe",
-    "dist-story-mode\guard-config.json",
-    "dist-story-mode\README-StoryMode.md",
-    "dist-story-mode\VERSION.txt",
-    "dist-story-mode\magnet_test-story-mode.ino"
+    "dist-ring-enabled\MagnetArcadeGuardRings.exe",
+    "dist-ring-enabled\guard-config.json",
+    "dist-ring-enabled\README-RingEnabled.md",
+    "dist-ring-enabled\VERSION.txt",
+    "dist-ring-enabled\magnet_test-ring-enabled.ino"
 )
 Compress-Archive -LiteralPath $ReleaseFiles `
-    -DestinationPath dist-story-mode\MagnetArcadeGuardStoryMode-test.zip `
+    -DestinationPath dist-ring-enabled\MagnetArcadeGuardRings-test.zip `
     -Force
-Write-Host "Built dist-story-mode\MagnetArcadeGuardStoryMode.exe"
-Write-Host "Packed dist-story-mode\MagnetArcadeGuardStoryMode-test.zip"
+Write-Host "Built dist-ring-enabled\MagnetArcadeGuardRings.exe"
+Write-Host "Packed dist-ring-enabled\MagnetArcadeGuardRings-test.zip"

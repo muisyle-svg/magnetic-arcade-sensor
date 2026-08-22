@@ -24,6 +24,8 @@
   "story_shutdown_seconds": 5.0,
   "story_question_seconds": 6.0,
   "story_eggman_seconds": 3.0,
+  "ring_joystick_button": 12,
+  "ring_announcement_seconds": 5.0,
   "cinematic_fade_seconds": 0.8,
   "cinematic_video_file": "2015-02-19-SonictheHedgehogCD-Opening(SonicBoomNAVersion).mp4.7fb0570ab57510d4a7d54beb920f6517.mp4"
 }

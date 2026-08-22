@@ -121,9 +121,9 @@ exe = EXE(
     a.datas,
     [],
     name=(
-        'MagnetArcadeGuardStoryModeDebug'
+        'MagnetArcadeGuardRingsDebug'
         if debug_build
-        else 'MagnetArcadeGuardStoryMode'
+        else 'MagnetArcadeGuardRings'
     ),
     debug='all' if debug_build else False,
     bootloader_ignore_signals=False,

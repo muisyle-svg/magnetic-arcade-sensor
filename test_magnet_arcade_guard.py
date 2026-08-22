@@ -33,6 +33,86 @@ class GuardLogicTests(unittest.TestCase):
             100,
         )
 
+    def test_ring_button_number_maps_to_zero_based_pygame_index(self):
+        self.assertEqual(guard_module.pygame_button_index(12), 11)
+        self.assertEqual(guard_module.pygame_button_index(1), 0)
+
+    def test_ring_entry_is_counted_while_guard_is_off(self):
+        guard = self.make_guard()
+        guard.ring_count = 4
+        guard.ring_milestones_shown = set()
+        guard.ring_burst_active = False
+        guard.pending_ring_milestone = False
+        guard.save_ring_state = lambda: None
+        guard.write_status = lambda *args, **kwargs: None
+        guard.maybe_show_pending_ring_milestone = lambda: None
+        guard.ring_burst_is_eligible = lambda: False
+        guard.guard_active = False
+
+        guard.handle_ring_entry()
+
+        self.assertEqual(guard.ring_count, 5)
+
+    def test_fiftieth_ring_queues_milestone_once(self):
+        guard = self.make_guard()
+        guard.ring_count = 49
+        guard.ring_milestones_shown = set()
+        guard.ring_burst_active = False
+        guard.pending_ring_milestone = False
+        guard.save_ring_state = lambda: None
+        guard.write_status = lambda *args, **kwargs: None
+        milestone_checks = []
+        guard.maybe_show_pending_ring_milestone = (
+            lambda: milestone_checks.append(True)
+        )
+        guard.ring_burst_is_eligible = lambda: False
+        guard.guard_active = False
+
+        guard.handle_ring_entry()
+
+        self.assertEqual(guard.ring_count, 50)
+        self.assertTrue(guard.pending_ring_milestone)
+        self.assertEqual(milestone_checks, [True])
+        self.assertIn(guard_module.RING_MILESTONE, guard.ring_milestones_shown)
+
+    def test_ring_burst_requires_robotnik_or_normal_all_missing(self):
+        guard = self.make_guard()
+        guard.guard_active = True
+        guard.guard_mode = "story"
+        guard.overlay_kind = "robotnik"
+        self.assertTrue(guard.ring_burst_is_eligible())
+
+        guard.overlay_kind = None
+        guard.guard_mode = "normal"
+        guard.accepted_count = 0
+        guard.can_show_story_announcement = lambda: True
+        self.assertTrue(guard.ring_burst_is_eligible())
+
+        guard.accepted_count = 1
+        self.assertFalse(guard.ring_burst_is_eligible())
+
+    def test_ring_burst_is_consumed_only_after_game_returns(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_game_seen = True
+        guard.ring_burst_restore_pending = False
+        guard.guard_active = True
+        guard.accepted_count = 2
+        guard.guard_mode = "story"
+        guard.story_intro_completed = True
+        pending = []
+        guard.write_status = lambda *args, **kwargs: None
+        guard.maybe_show_pending_overlay = lambda: pending.append(True)
+
+        guard.consume_ring_burst_on_return()
+
+        self.assertFalse(guard.ring_burst_active)
+        self.assertEqual(
+            guard.pending_overlay_missing,
+            guard_module.TOTAL_EMERALDS - 2,
+        )
+        self.assertEqual(pending, [True])
+
     def test_missing_text_uses_singular_emerald(self):
         guard = self.make_guard()
         self.assertEqual(

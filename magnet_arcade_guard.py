@@ -118,6 +118,8 @@ DEFAULT_CONFIG = {
     "story_question_seconds": 6.0,
     "story_eggman_seconds": 3.0,
     "cinematic_fade_seconds": 0.8,
+    "ring_joystick_button": 12,
+    "ring_announcement_seconds": 5.0,
     "cinematic_video_file": (
         "2015-02-19-SonictheHedgehogCD-Opening"
         "(SonicBoomNAVersion).mp4.7fb0570ab57510d4a7d54beb920f6517.mp4"
@@ -179,6 +181,11 @@ def config_number(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, number))
+
+
+def pygame_button_index(human_button_number: int) -> int:
+    """Convert the arcade encoder's 1-based button number to pygame's index."""
+    return max(0, int(human_button_number) - 1)
 
 
 AUTO_ACTIVATE = config_boolean(
@@ -287,6 +294,29 @@ CINEMATIC_FADE_SECONDS = config_number(
     0.0,
     5.0,
 )
+RING_JOYSTICK_BUTTON = int(
+    config_number(
+        RUNTIME_CONFIG.get("ring_joystick_button", 12),
+        12,
+        1,
+        32,
+    )
+)
+RING_ANNOUNCEMENT_SECONDS = config_number(
+    RUNTIME_CONFIG.get("ring_announcement_seconds", 5.0),
+    5.0,
+    1.0,
+    30.0,
+)
+RING_MILESTONE = 50
+RING_MILESTONE_TITLE = "50 RINGS!"
+RING_MILESTONE_MESSAGE = "Find Alex for your prize!"
+RING_BURST_TITLE = "RING POWER!"
+RING_BURST_MESSAGE = (
+    "MASTER EMERALD ENERGY FULL!\n"
+    "ONE GAME OF CHAOS POWER CHARGED!"
+)
+RING_BURST_ANNOUNCEMENT_SECONDS = 2.0
 configured_default_mode = str(
     RUNTIME_CONFIG.get("default_mode", "story")
 ).strip().lower()
@@ -796,6 +826,18 @@ class MagnetArcadeGuard:
         self.audio_mute_error_reported = False
         self.audio_last_error = ""
         self.audio_watchdog_after_id = None
+        self.ring_input_stop_event = threading.Event()
+        self.ring_input_thread = None
+        self.ring_joystick_initialized = False
+        self.ring_pygame_video_initialized = False
+        self.ring_joystick_error = ""
+        self.ring_joystick_signature = ()
+        self.ring_button_states = {}
+        self.ring_burst_active = False
+        self.ring_burst_game_seen = False
+        self.ring_burst_restore_pending = False
+        self.pending_ring_milestone = False
+        self.ring_milestone_after_id = None
         local_app_data = Path(
             os.environ.get(
                 "LOCALAPPDATA",
@@ -811,6 +853,14 @@ class MagnetArcadeGuard:
             local_app_data
             / "MagnetArcadeGuard"
             / "guard-events.log"
+        )
+        self.ring_counter_path = (
+            local_app_data
+            / "MagnetArcadeGuard"
+            / "ring-counter.json"
+        )
+        self.ring_count, self.ring_milestones_shown = (
+            self.load_ring_state()
         )
         self.reader_connected = False
         self.last_good_port = PREFERRED_SERIAL_PORT
@@ -1020,6 +1070,18 @@ class MagnetArcadeGuard:
                 self.audio_ready = False
         bootstrap_event("audio mixer initialization complete")
 
+        if PYGAME_AVAILABLE:
+            try:
+                # pygame.event.pump() requires SDL's video subsystem even
+                # though the visible application window is Tk. Initializing
+                # the subsystem alone creates no visible pygame window.
+                pygame.display.init()
+                self.ring_pygame_video_initialized = True
+                pygame.joystick.init()
+                self.ring_joystick_initialized = True
+            except pygame.error as error:
+                self.ring_joystick_error = str(error)
+        
         self.title_label = tk.Label(
             self.root,
             text=LOCK_MESSAGE,
@@ -1091,6 +1153,13 @@ class MagnetArcadeGuard:
             daemon=True,
         )
         worker.start()
+
+        self.ring_input_thread = threading.Thread(
+            target=self.worker_entry,
+            args=("ring input", self.ring_input_worker),
+            daemon=True,
+        )
+        self.ring_input_thread.start()
 
         self.root.after(50, self.process_messages)
         self.root.after(250, self.connection_watchdog)
@@ -2293,6 +2362,274 @@ class MagnetArcadeGuard:
         except OSError:
             pass
 
+    def load_ring_state(self) -> tuple[int, set[int]]:
+        """Load the persistent ring total without making startup fragile."""
+        try:
+            loaded = json.loads(
+                self.ring_counter_path.read_text(encoding="utf-8")
+            )
+            total = max(0, int(loaded.get("total_rings", 0)))
+            milestones = {
+                int(value)
+                for value in loaded.get("milestones_shown", [])
+                if int(value) > 0
+            }
+            return total, milestones
+        except (AttributeError, FileNotFoundError, OSError, TypeError, ValueError):
+            return 0, set()
+
+    def save_ring_state(self) -> None:
+        try:
+            self.ring_counter_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            temporary_path = self.ring_counter_path.with_suffix(".tmp")
+            temporary_path.write_text(
+                json.dumps(
+                    {
+                        "total_rings": self.ring_count,
+                        "milestones_shown": sorted(
+                            self.ring_milestones_shown
+                        ),
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            temporary_path.replace(self.ring_counter_path)
+        except OSError:
+            self.write_status(
+                "RING COUNTER SAVE FAILED | total="
+                + str(self.ring_count),
+                event=False,
+            )
+
+    def ring_input_worker(self) -> None:
+        """Watch every connected encoder for its human-numbered button 12."""
+        if not self.ring_joystick_initialized:
+            while self.running and not self.ring_input_stop_event.wait(1.0):
+                pass
+            return
+
+        button_index = pygame_button_index(RING_JOYSTICK_BUTTON)
+        while self.running and not self.ring_input_stop_event.is_set():
+            try:
+                if self.ring_pygame_video_initialized:
+                    pygame.event.pump()
+                joystick_count = pygame.joystick.get_count()
+                live_keys = set()
+
+                for joystick_index in range(joystick_count):
+                    joystick = pygame.joystick.Joystick(joystick_index)
+                    if not joystick.get_init():
+                        joystick.init()
+
+                    try:
+                        instance_id = joystick.get_instance_id()
+                    except AttributeError:
+                        instance_id = joystick_index
+                    state_key = (instance_id, joystick_index)
+                    live_keys.add(state_key)
+
+                    pressed = False
+                    if joystick.get_numbuttons() > button_index:
+                        pressed = bool(joystick.get_button(button_index))
+
+                    was_pressed = self.ring_button_states.get(
+                        state_key,
+                        False,
+                    )
+                    if pressed and not was_pressed:
+                        self.messages.put(("RING", "", -1))
+                    self.ring_button_states[state_key] = pressed
+
+                for state_key in tuple(self.ring_button_states):
+                    if state_key not in live_keys:
+                        del self.ring_button_states[state_key]
+
+                self.ring_joystick_signature = tuple(
+                    sorted(live_keys)
+                )
+                self.ring_joystick_error = ""
+            except (AttributeError, OSError, pygame.error) as error:
+                self.ring_joystick_error = str(error)[:120]
+                self.ring_button_states.clear()
+                if self.ring_input_stop_event.wait(0.5):
+                    break
+                continue
+
+            if self.ring_input_stop_event.wait(0.02):
+                break
+
+    def ring_burst_is_eligible(self) -> bool:
+        if not self.guard_active:
+            return False
+        if self.overlay_kind == "robotnik":
+            return True
+        if self.guard_mode == "normal" and self.accepted_count == 0:
+            return self.can_show_story_announcement()
+        return False
+
+    def handle_ring_entry(self) -> None:
+        previous_total = self.ring_count
+        self.ring_count += 1
+        self.save_ring_state()
+        self.write_status(
+            f"RING ENTERED | total={self.ring_count}",
+        )
+
+        if (
+            previous_total < RING_MILESTONE <= self.ring_count
+            and RING_MILESTONE not in self.ring_milestones_shown
+        ):
+            self.ring_milestones_shown.add(RING_MILESTONE)
+            self.save_ring_state()
+            self.pending_ring_milestone = True
+            self.maybe_show_pending_ring_milestone()
+
+        if self.ring_burst_active or not self.ring_burst_is_eligible():
+            return
+
+        self.ring_burst_active = True
+        self.ring_burst_game_seen = False
+        self.ring_burst_restore_pending = False
+        self.write_status("RING BURST ACTIVE | waiting for a game")
+
+        if self.overlay_visible:
+            self.hide_overlay()
+        else:
+            self.hide_story_announcement()
+            self.cancel_normal_warning()
+
+        if not self.pending_ring_milestone:
+            self.show_plain_announcement(
+                RING_BURST_TITLE,
+                RING_BURST_MESSAGE,
+                "#66ff99",
+                RING_BURST_ANNOUNCEMENT_SECONDS,
+            )
+
+    def show_plain_announcement(
+        self,
+        title: str,
+        detail: str,
+        color: str,
+        duration_seconds: float,
+    ) -> bool:
+        if not self.can_show_story_announcement():
+            return False
+
+        self.hide_story_announcement()
+        x, y, width, height = self.overlay_monitor_bounds
+        banner_width = max(1, int(width * 0.90))
+        banner_height = max(88, min(200, int(height * 0.32)))
+        banner_x = x + (width - banner_width) // 2
+        banner_y = y + (height - banner_height) // 2
+        title_size = self.fit_font_size(
+            (title,),
+            max_size=max(16, min(32, int(height * 0.065))),
+            min_size=12,
+            available_width=banner_width,
+        )
+        detail_size = self.fit_font_size(
+            tuple(detail.splitlines()),
+            max_size=max(12, min(24, int(height * 0.045))),
+            min_size=10,
+            available_width=banner_width,
+        )
+        self.announcement_title_label.configure(
+            text=title,
+            foreground=color,
+            font=("Arial", title_size, "bold"),
+            wraplength=max(1, int(banner_width * 0.82)),
+            justify="center",
+        )
+        self.announcement_detail_label.configure(
+            text=detail,
+            font=("Arial", detail_size, "bold"),
+            wraplength=max(1, int(banner_width * 0.82)),
+            justify="center",
+        )
+        self.announcement_window.geometry(
+            f"{banner_width}x{banner_height}{banner_x:+d}{banner_y:+d}"
+        )
+        self.apply_announcement_window_style()
+        self.announcement_window.deiconify()
+        try:
+            window_handle = self.announcement_window.winfo_id()
+            ctypes.windll.user32.SetWindowPos(
+                window_handle,
+                HWND_TOPMOST,
+                banner_x,
+                banner_y,
+                banner_width,
+                banner_height,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            )
+            ctypes.windll.user32.ShowWindow(
+                window_handle,
+                SW_SHOWNOACTIVATE,
+            )
+        except (AttributeError, tk.TclError):
+            pass
+
+        self.announcement_after_id = self.root.after(
+            int(duration_seconds * 1000),
+            self.hide_story_announcement,
+        )
+        return True
+
+    def maybe_show_pending_ring_milestone(self) -> None:
+        if not self.running or not self.pending_ring_milestone:
+            return
+        if not self.show_plain_announcement(
+            RING_MILESTONE_TITLE,
+            RING_MILESTONE_MESSAGE,
+            "#ffdd55",
+            RING_ANNOUNCEMENT_SECONDS,
+        ):
+            return
+        self.pending_ring_milestone = False
+        self.write_status("RING MILESTONE DISPLAYED | 50 rings")
+
+    def consume_ring_burst_on_return(self) -> None:
+        if not self.ring_burst_active:
+            return
+
+        self.ring_burst_active = False
+        self.ring_burst_game_seen = False
+        self.ring_burst_restore_pending = False
+        self.write_status("RING BURST CONSUMED | Big Box returned")
+
+        if not self.guard_active or self.accepted_count == TOTAL_EMERALDS:
+            return
+
+        if self.guard_mode == "story" and self.story_intro_completed:
+            self.pending_overlay_missing = (
+                TOTAL_EMERALDS - (self.accepted_count or 0)
+            )
+            self.maybe_show_pending_overlay()
+
+    def handle_ring_burst_foreground(self) -> None:
+        if not self.ring_burst_active or not self.guard_active:
+            return
+
+        self.update_overlay_gate()
+        if self.foreground_process_name in EMULATOR_PROCESS_NAMES:
+            if not self.ring_burst_game_seen:
+                self.ring_burst_game_seen = True
+                self.write_status("RING BURST GAME DETECTED")
+            return
+
+        if (
+            self.ring_burst_game_seen
+            and self.foreground_process_name == BIG_BOX_PROCESS_NAME
+            and self.overlay_gate_state == "BIGBOX_READY"
+        ):
+            self.consume_ring_burst_on_return()
+
     def handle_tk_exception(self, exception_type, exception, trace) -> None:
         detail = "".join(
             traceback.format_exception(
@@ -2503,6 +2840,9 @@ class MagnetArcadeGuard:
             f"Foreground: {self.foreground_process_name}\n"
             f"Gate: {self.overlay_gate_state}    "
             f"Input: {input_text}\n"
+            f"Rings entered: {self.ring_count}    "
+            "Ring input: joystick button "
+            f"{RING_JOYSTICK_BUTTON}\n"
             "Return SFX: ready    Removal SFX: "
             + ("ready" if self.removal_sound is not None else "not installed")
             + "    Cinematic: "
@@ -3060,6 +3400,7 @@ class MagnetArcadeGuard:
 
     def foreground_watchdog(self) -> None:
         if self.running and self.guard_active:
+            self.handle_ring_burst_foreground()
             # Keep the Big Box readiness timer warm even before a sensor event.
             # That makes announcements and takeovers feel immediate while still
             # retaining the settle delay after an emulator closes.
@@ -3069,6 +3410,9 @@ class MagnetArcadeGuard:
             ):
                 self.update_overlay_gate()
             self.maybe_show_pending_overlay()
+
+        if self.running:
+            self.maybe_show_pending_ring_milestone()
 
         if self.running:
             self.root.after(250, self.foreground_watchdog)
@@ -4701,6 +5045,10 @@ class MagnetArcadeGuard:
                         self.activate_guard()
                     continue
 
+                if message_type == "RING":
+                    self.handle_ring_entry()
+                    continue
+
                 if generation != self.activation_generation:
                     continue
 
@@ -4811,6 +5159,9 @@ class MagnetArcadeGuard:
         self.story_armed = False
         self.story_cycle_started = False
         self.story_intro_completed = False
+        self.ring_burst_active = False
+        self.ring_burst_game_seen = False
+        self.ring_burst_restore_pending = False
         self.controller_lost = True
         self.reader_connected = False
         self.overlay_gate_state = "WAITING_FOR_SENSOR"
@@ -4853,6 +5204,9 @@ class MagnetArcadeGuard:
         self.story_armed = False
         self.story_cycle_started = False
         self.story_intro_completed = False
+        self.ring_burst_active = False
+        self.ring_burst_game_seen = False
+        self.ring_burst_restore_pending = False
         self.cancel_completion()
         self.completion_in_progress = False
         self.reset_big_box_readiness()
@@ -4942,6 +5296,13 @@ class MagnetArcadeGuard:
 
         self.cleanup_complete = True
         self.running = False
+        self.ring_input_stop_event.set()
+        if (
+            self.ring_input_thread
+            and self.ring_input_thread.is_alive()
+            and self.ring_input_thread is not threading.current_thread()
+        ):
+            self.ring_input_thread.join(timeout=0.75)
         self.guard_active = False
         self.activation_generation += 1
         self.overlay_visible = False
@@ -5000,6 +5361,18 @@ class MagnetArcadeGuard:
         if self.audio_ready:
             try:
                 pygame.mixer.quit()
+            except pygame.error:
+                pass
+
+        if self.ring_joystick_initialized:
+            try:
+                pygame.joystick.quit()
+            except pygame.error:
+                pass
+
+        if self.ring_pygame_video_initialized:
+            try:
+                pygame.display.quit()
             except pygame.error:
                 pass
 

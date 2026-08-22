@@ -38,6 +38,26 @@ Normal Mode reacts only to a new downward sensor transition while Big Box is the
 
 Select either mode from the regular Windows operator panel. Selecting a mode activates the guard in that mode.
 
+## Ring input and one-game energy burst
+
+This build watches all connected USB joystick encoders independently of guard
+activation. Human-numbered joystick button 12 is treated as the coin/ring
+input; pygame reads that as button index 11. A press is edge-detected, so a
+held coin button counts once rather than repeatedly.
+
+- Every ring is counted, including while the guard is dormant or deactivated.
+- The persistent total is stored in `%LOCALAPPDATA%\MagnetArcadeGuard\ring-counter.json`.
+- When the Robotnik screen is active, one ring hides the takeover and gives a
+  one-game Ring Power burst.
+- In Normal Mode, the same burst is available when all seven emeralds are
+  missing.
+- The burst remains available while the menu is idle. It becomes consumed only
+  after an emulator is detected and Big Box has safely returned. The Robotnik
+  screen is then restored in Story Mode if emeralds are still missing.
+- At the first total of 50 rings, the non-blocking message `50 RINGS!` and
+  `Find Alex for your prize!` is shown when Big Box is safely visible. If a game
+  is active at that moment, the message waits until Big Box returns.
+
 ## LED energy meter
 
 The ESP32 independently controls the existing red and green LED legs; the blue leg remains disconnected.
@@ -95,6 +115,7 @@ Status files are written to:
 
 - `%LOCALAPPDATA%\MagnetArcadeGuard\guard-status.txt`
 - `%LOCALAPPDATA%\MagnetArcadeGuard\guard-events.log`
+- `%LOCALAPPDATA%\MagnetArcadeGuard\ring-counter.json`
 
 ## Configuration
 
@@ -117,6 +138,8 @@ Keep `guard-config.json` beside `MagnetArcadeGuardStoryMode.exe`.
 - `removal_sound_files`: list of partial-theft sounds; the guard randomly chooses without repeating the previous clip.
 - `last_emerald_removal_sound_file`: dedicated sound for the seventh and final theft.
 - `final_completion_sound_file`: sound played after the victory music and Super Sonic animation.
+- `ring_joystick_button`: human-numbered joystick button used for rings; default `12`.
+- `ring_announcement_seconds`: how long the 50-ring message remains visible; default `5.0`.
 
 Other GIF, MP3, and MP4 files beside the EXE also override their bundled copies when their configured filenames match.
 
@@ -125,7 +148,7 @@ Other GIF, MP3, and MP4 files beside the EXE also override their bundled copies 
 From PowerShell on the development computer:
 
 ```powershell
-Set-Location "C:\Users\Projector\Documents\RFIDlock\StoryModeVersion"
+Set-Location "C:\Users\Projector\Documents\RFIDlock\RingEnabledVersion"
 .\build_story_guard.cmd
 ```
 
@@ -137,15 +160,15 @@ To install or refresh the pinned build dependencies first:
 
 The portable files are created only at:
 
-- `dist-story-mode\MagnetArcadeGuardStoryMode.exe`
-- `dist-story-mode\guard-config.json`
-- `dist-story-mode\MagnetArcadeGuardStoryMode-test.zip` (EXE, config, firmware, version note, and this guide)
+- `dist-ring-enabled\MagnetArcadeGuardRings.exe`
+- `dist-ring-enabled\guard-config.json`
+- `dist-ring-enabled\MagnetArcadeGuardRings-test.zip` (EXE, config, firmware, version note, and this guide)
 
 The arcade PC does not need Python installed.
 
 ## Revert to the stable version
 
-1. Close `MagnetArcadeGuardStoryMode.exe`.
+1. Close `MagnetArcadeGuardRings.exe`.
 2. Run `MagnetArcadeGuard.exe` from `versions\stable-pre-story-mode` instead.
 3. If the stable firmware is also desired, upload `versions\stable-pre-story-mode\magnet_test.ino`.
 
