@@ -33,6 +33,44 @@ class GuardLogicTests(unittest.TestCase):
             100,
         )
 
+    def test_emulator_process_names_are_normalized_and_configurable(self):
+        self.assertEqual(
+            guard_module.config_process_names(
+                [" MAME.EXE ", r"C:\\Arcade\\new-emulator", ""],
+                ("fallback.exe",),
+            ),
+            frozenset({"mame.exe", "new-emulator.exe"}),
+        )
+        self.assertEqual(
+            guard_module.config_process_names([], ("fallback.exe",)),
+            frozenset({"fallback.exe"}),
+        )
+
+    def test_protocol_parser_rejects_malformed_heartbeat_traffic(self):
+        self.assertEqual(
+            guard_module.parse_magnet_protocol_message(
+                "MAGNET_LOCK:READY"
+            ),
+            ("ready", None),
+        )
+        self.assertEqual(
+            guard_module.parse_magnet_protocol_message(
+                "MAGNET_LOCK:COUNT:7"
+            ),
+            ("count", 7),
+        )
+        for malformed in (
+            "MAGNET_LOCK:",
+            "MAGNET_LOCK:COUNT:nope",
+            "MAGNET_LOCK:COUNT:+7",
+            "MAGNET_LOCK:COUNT: 7",
+            "MAGNET_LOCK:COUNT:8",
+            "MAGNET_LOCK:UNKNOWN",
+        ):
+            self.assertIsNone(
+                guard_module.parse_magnet_protocol_message(malformed)
+            )
+
     def test_missing_text_uses_singular_emerald(self):
         guard = self.make_guard()
         self.assertEqual(
@@ -111,6 +149,37 @@ class GuardLogicTests(unittest.TestCase):
         self.assertTrue(guard.controller_lost)
         self.assertIsNone(guard.pending_count)
         self.assertEqual(reasons, ["ESP32 unplugged"])
+
+    def test_malformed_serial_message_does_not_refresh_heartbeat(self):
+        guard = self.make_guard()
+        guard.guard_active = True
+        guard.reader_connected = False
+        guard.controller_lost = True
+        guard.last_valid_message = 10.0
+        guard.last_serial_message_at = 10.0
+        guard.pending_count = None
+
+        guard.handle_serial_message("MAGNET_LOCK:COUNT:corrupt")
+
+        self.assertFalse(guard.reader_connected)
+        self.assertEqual(guard.last_valid_message, 10.0)
+        self.assertEqual(guard.last_serial_message_at, 10.0)
+
+    def test_invalid_sensor_count_configuration_blocks_activation(self):
+        guard = self.make_guard()
+        guard.guard_mode = "normal"
+        with (
+            patch.object(
+                guard_module,
+                "CONFIG_VALIDATION_ERRORS",
+                ["total_emeralds must be 7"],
+            ),
+            patch.object(guard_module, "PYCAW_AVAILABLE", True),
+        ):
+            self.assertIn(
+                "total_emeralds must be 7",
+                guard.guard_readiness_error(),
+            )
 
     def test_same_recent_event_sound_does_not_overlap(self):
         class FakeChannel:

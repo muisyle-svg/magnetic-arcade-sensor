@@ -1,10 +1,12 @@
 MAGNETIC ARCADE GUARD - STORY/NORMAL RELIABILITY BUILD
 
 Build family: Story/Normal Mode without Ring Power
-Update: 2026-08-22
+Update: 2026-08-23
 
 Includes synchronized low-overhead cinematic playback, the graphical
-seven-segment Master Emerald power meter, and Normal Mode return sounds.
+seven-segment Master Emerald power meter, and Normal Mode return sounds. This
+reliability revision adds validated serial heartbeats, fixed seven-sensor
+configuration checks, and configurable emulator names.
 
 The frozen stable release remains at:
 ..\versions\stable-pre-story-mode\

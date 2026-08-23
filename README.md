@@ -101,8 +101,10 @@ Status files are written to:
 Keep `guard-config.json` beside `MagnetArcadeGuardStoryMode.exe`.
 
 - `default_mode`: `story` or `normal`.
+- `total_emeralds`: must remain `7`; a different value disables the guard because the installed firmware and sensor assembly are fixed at seven inputs.
 - `auto_activate`: normally `false` so the operator chooses a mode after launching.
 - `serial_port`: empty for automatic detection, or a fixed value such as `COM4`.
+- `emulator_process_names`: executable names that count as active games. Add another emulator's Windows `.exe` name here if the arcade configuration expands; names are case-insensitive.
 - `normal_warning_seconds`: Normal Mode timeout; default `10.0`.
 - `story_announcement_seconds`: duration of each non-blocking theft banner.
 - `story_shutdown_seconds`: duration of the arcade-shutdown announcement.

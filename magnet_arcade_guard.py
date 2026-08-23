@@ -87,8 +87,17 @@ except ImportError:
 bootstrap_event("module imports complete")
 
 
+FIRMWARE_TOTAL_EMERALDS = 7
+DEFAULT_EMULATOR_PROCESS_NAMES = (
+    "mame.exe",
+    "mame64.exe",
+    "groovymame.exe",
+    "retroarch.exe",
+)
+
+
 DEFAULT_CONFIG = {
-    "total_emeralds": 7,
+    "total_emeralds": FIRMWARE_TOTAL_EMERALDS,
     "auto_activate": False,
     "serial_port": "",
     "big_box_ready_delay_seconds": 1.5,
@@ -118,6 +127,7 @@ DEFAULT_CONFIG = {
     "story_question_seconds": 6.0,
     "story_eggman_seconds": 3.0,
     "cinematic_fade_seconds": 0.8,
+    "emulator_process_names": list(DEFAULT_EMULATOR_PROCESS_NAMES),
     "cinematic_max_fps": 15,
     "cinematic_video_file": (
         "2015-02-19-SonictheHedgehogCD-Opening"
@@ -145,13 +155,25 @@ def load_runtime_config() -> dict:
 
 
 RUNTIME_CONFIG = load_runtime_config()
+CONFIG_VALIDATION_ERRORS = []
 try:
-    TOTAL_EMERALDS = max(
-        1,
-        min(12, int(RUNTIME_CONFIG["total_emeralds"])),
-    )
+    configured_total_value = RUNTIME_CONFIG["total_emeralds"]
+    if isinstance(configured_total_value, bool):
+        raise ValueError
+    configured_total_emeralds = int(configured_total_value)
+    if (
+        isinstance(configured_total_value, float)
+        and not configured_total_value.is_integer()
+    ):
+        raise ValueError
 except (KeyError, TypeError, ValueError):
-    TOTAL_EMERALDS = 7
+    configured_total_emeralds = None
+
+if configured_total_emeralds != FIRMWARE_TOTAL_EMERALDS:
+    CONFIG_VALIDATION_ERRORS.append(
+        "total_emeralds must be 7 to match the installed firmware and sensors"
+    )
+TOTAL_EMERALDS = FIRMWARE_TOTAL_EMERALDS
 
 
 
@@ -182,6 +204,25 @@ def config_number(
     return max(minimum, min(maximum, number))
 
 
+def config_process_names(value, defaults) -> frozenset[str]:
+    """Normalize configured Windows executable names with safe defaults."""
+    if not isinstance(value, list):
+        return frozenset(defaults)
+
+    normalized = set()
+    for candidate in value:
+        if not isinstance(candidate, str):
+            continue
+        process_name = Path(candidate.strip()).name.lower()
+        if not process_name:
+            continue
+        if "." not in process_name:
+            process_name += ".exe"
+        normalized.add(process_name)
+
+    return frozenset(normalized or defaults)
+
+
 AUTO_ACTIVATE = config_boolean(
     RUNTIME_CONFIG.get("auto_activate", False),
 )
@@ -193,17 +234,15 @@ PREFERRED_SERIAL_PORT = str(
 # MAME/GroovyMAME or RetroArch fullscreen surface can own the display mode,
 # so the guard waits for Big Box to return to its menu before appearing.
 BIG_BOX_PROCESS_NAME = "bigbox.exe"
-EMULATOR_PROCESS_NAMES = {
-    "mame.exe",
-    "mame64.exe",
-    "groovymame.exe",
-    "retroarch.exe",
-}
+EMULATOR_PROCESS_NAMES = config_process_names(
+    RUNTIME_CONFIG.get("emulator_process_names"),
+    DEFAULT_EMULATOR_PROCESS_NAMES,
+)
 
 BAUD_RATE = 115200
-# The serial reader thread timestamps raw heartbeats independently of the Tk
-# UI thread. The extra margin also tolerates a slow Windows audio/session
-# operation without declaring a healthy ESP32 disconnected.
+# The timeout margin tolerates a slow Windows audio/session operation without
+# declaring a healthy ESP32 disconnected. Only validated READY/COUNT messages
+# refresh it; malformed protocol-like traffic must not defeat fail-open.
 CONNECTION_TIMEOUT_SECONDS = 5.0
 RECONNECT_DELAY_SECONDS = 1.0
 STABLE_COUNT_SECONDS = config_number(
@@ -315,6 +354,25 @@ except (TypeError, ValueError):
 COMPLETION_FALLBACK_SECONDS = 5.0
 COMPLETION_MAX_SECONDS = 120.0
 PROTOCOL_PREFIX = "MAGNET_LOCK:"
+
+
+def parse_magnet_protocol_message(
+    message: str,
+) -> Optional[tuple[str, Optional[int]]]:
+    """Return a validated protocol event, or None for malformed traffic."""
+    if message == PROTOCOL_PREFIX + "READY":
+        return "ready", None
+
+    count_prefix = PROTOCOL_PREFIX + "COUNT:"
+    if not message.startswith(count_prefix):
+        return None
+    count_text = message[len(count_prefix):]
+    if not count_text.isdecimal():
+        return None
+    count = int(count_text)
+    if not 0 <= count <= TOTAL_EMERALDS:
+        return None
+    return "count", count
 
 BACKGROUND_IMAGE_NAME = "egg-man-robotnik.gif"
 COMPLETION_IMAGE_NAME = "sonic-sonic-the-hedgehog.gif"
@@ -4449,7 +4507,7 @@ class MagnetArcadeGuard:
                     errors="ignore",
                 ).strip()
 
-                if line.startswith(PROTOCOL_PREFIX):
+                if parse_magnet_protocol_message(line) is not None:
                     self.last_good_port = port_name
                     self.messages.put(("SERIAL", line, generation))
                     return device
@@ -4523,8 +4581,7 @@ class MagnetArcadeGuard:
                         errors="ignore",
                     ).strip()
 
-                    if line.startswith(PROTOCOL_PREFIX):
-                        self.last_serial_message_at = time.monotonic()
+                    if parse_magnet_protocol_message(line) is not None:
                         self.messages.put(
                             (
                                 "SERIAL",
@@ -4559,24 +4616,17 @@ class MagnetArcadeGuard:
         if not self.guard_active:
             return
 
-        if message == "MAGNET_LOCK:READY":
+        parsed_message = parse_magnet_protocol_message(message)
+        if parsed_message is None:
+            return
+
+        event_kind, count = parsed_message
+        if event_kind == "ready":
             self.reader_connected = True
             self.controller_lost = False
             now = time.monotonic()
             self.last_valid_message = now
             self.last_serial_message_at = now
-            return
-
-        prefix = "MAGNET_LOCK:COUNT:"
-        if not message.startswith(prefix):
-            return
-
-        try:
-            count = int(message[len(prefix):])
-        except ValueError:
-            return
-
-        if not 0 <= count <= TOTAL_EMERALDS:
             return
 
         self.reader_connected = True
@@ -4799,7 +4849,7 @@ class MagnetArcadeGuard:
     # --------------------------------------------------
 
     def guard_readiness_error(self) -> str:
-        problems = []
+        problems = list(CONFIG_VALIDATION_ERRORS)
 
         if self.guard_mode == "story":
             if not PIL_AVAILABLE:
