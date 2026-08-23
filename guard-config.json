@@ -39,6 +39,7 @@
   "ring_debounce_ms": 90,
   "ring_game_commit_seconds": 3.0,
   "ring_announcement_seconds": 5.0,
+  "ring_milestone_announcement_seconds": 10.0,
   "emulator_process_names": [
     "mame.exe",
     "mame64.exe",

@@ -16,12 +16,12 @@ Its portable ZIP is:
 
 Story Mode arms only after the guard has observed all seven emeralds in place. Starting the guard with an emerald already absent does nothing until all seven are restored and a later removal occurs.
 
-- Removing emeralds 1–6 shows a centered, briefly flashing, non-blocking theft/energy banner over a full-screen Big Box menu. Big Box remains usable and the banner does not take keyboard or joystick focus.
+- Removing emeralds 1–6 shows a centered, briefly flashing, non-blocking theft banner over a full-screen Big Box menu. Big Box remains usable and the banner does not take keyboard or joystick focus.
 - The shutdown story cards use larger monitor-aware text, while still shrinking or wrapping to stay inside the arcade display.
 - Each partial theft chooses a different sound from the configured reaction clips; the same clip is never chosen twice in a row.
 - Removing the seventh emerald starts the full takeover only after Big Box is the stable full-screen foreground. It pauses Big Box, mutes its audio, announces the shutdown, asks where a hero can be found, and plays the bundled Sonic CD opening.
 - The final theft uses the dedicated `no-he-s-got-the-last-emerald.mp3` clip. Before the cinematic, the Eggman reveal screen only says `SO EGGMAN'S BEHIND THIS, HUH?` and plays its matching voice clip.
-- After the cinematic, the Robotnik recovery screen shows the number recovered and current Chaos Energy percentage as each emerald returns.
+- After the cinematic, the Robotnik recovery screen shows the number recovered while the separate Chaos Energy meter updates as each emerald returns.
 - The final return immediately updates the text, lets the return sound finish, pauses briefly, and plays the Sonic/Super Sonic victory sequence. After the victory music finishes while Super Sonic is displayed, the bundled `i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3` clip plays.
 - Completing the full story automatically changes the running guard to Normal Mode.
 
@@ -31,7 +31,7 @@ Changes made while MAME, GroovyMAME, or RetroArch is active never try to draw ov
 
 Normal Mode reacts only to a new downward sensor transition while Big Box is the usable full-screen foreground.
 
-- It displays a non-blocking banner: `A Chaos Emerald Was Stolen!` followed by `Hey! Put that back! We already did the thing!` and the current Chaos Energy percentage. It also plays one of the randomized removal voice clips.
+- It displays a non-blocking banner: `A Chaos Emerald Was Stolen!` followed by `Hey! Put that back! We already did the thing!` and plays one of the randomized removal voice clips.
 - It returns to the normal Big Box view after 10 seconds even if the emerald is still missing.
 - It returns immediately if any emerald is put back first.
 - A missing count present when the mode starts does not trigger it, and a steady missing count does not retrigger it.
@@ -70,9 +70,10 @@ still allowing rings to be entered quickly.
   The Robotnik
   screen is then restored in Story Mode if emeralds are still missing.
 - At the first total of 50 rings, the non-blocking message `50 RINGS!` and
-  `Find Alex for your prize!` is shown when Big Box is safely visible. If a game
-  is active at that moment, the message waits until Big Box returns. That pending
-  prize message is persisted, so closing or restarting the guard cannot lose it.
+  `Find Alex for your prize!` is shown for at least 10 seconds when Big Box is
+  safely visible. If a game is active at that moment, the message remains
+  pending and is shown the next time Big Box returns. That pending prize message
+  is persisted, so closing or restarting the guard cannot lose it.
 
 ## LED energy meter
 

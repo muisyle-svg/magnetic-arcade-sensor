@@ -364,13 +364,18 @@ RING_ANNOUNCEMENT_SECONDS = config_number(
     1.0,
     30.0,
 )
+RING_MILESTONE_ANNOUNCEMENT_SECONDS = config_number(
+    RUNTIME_CONFIG.get("ring_milestone_announcement_seconds", 10.0),
+    10.0,
+    10.0,
+    60.0,
+)
 RING_MILESTONE = 50
 RING_MILESTONE_TITLE = "50 RINGS!"
 RING_MILESTONE_MESSAGE = "Find Alex for your prize!"
 RING_COUNT_TITLE = "RING COLLECTED!"
 RING_BURST_TITLE = "RING POWER!"
 RING_BURST_MESSAGE = (
-    "MASTER EMERALD ENERGY FULL!\n"
     "ONE GAME OF CHAOS POWER CHARGED!"
 )
 RING_BURST_ANNOUNCEMENT_SECONDS = 2.0
@@ -1003,6 +1008,8 @@ class MagnetArcadeGuard:
         self.ring_burst_restore_robotnik = False
         self.ring_power_announcement_visible = False
         self.ring_power_ignore_until = 0.0
+        self.joystick_press_sequence = 0
+        self.ring_power_ignore_press_sequence = 0
         self.pending_ring_milestone = False
         self.pending_ring_announcement: Optional[str] = None
         self.ring_state_warning = ""
@@ -2107,7 +2114,6 @@ class MagnetArcadeGuard:
 
         self.hide_story_announcement()
         missing_count = TOTAL_EMERALDS - present_count
-        energy_percent = round(present_count * 100 / TOTAL_EMERALDS)
         if event_kind == "removed":
             _, detail = STORY_STOLEN_TEXT.get(
                 missing_count,
@@ -2117,14 +2123,12 @@ class MagnetArcadeGuard:
                 ),
             )
             title = STORY_REMOVAL_OVERLAY_TITLE
-            detail = f"{detail}\nCHAOS ENERGY: {energy_percent}%"
             color = "#ff5555"
         elif event_kind == "normal":
             title = STORY_REMOVAL_OVERLAY_TITLE
             detail = (
                 "Hey! Put that back!\n"
-                "We already did the thing!\n"
-                f"CHAOS ENERGY: {energy_percent}%"
+                "We already did the thing!"
             )
             color = "#ffcc66"
         else:
@@ -2135,7 +2139,6 @@ class MagnetArcadeGuard:
                     "THE SHRINE IS RECLAIMING ITS POWER!",
                 ),
             )
-            detail = f"{detail}\nCHAOS ENERGY: {energy_percent}%"
             color = "#77ff99"
 
         x, y, width, height = self.overlay_monitor_bounds
@@ -2788,8 +2791,15 @@ class MagnetArcadeGuard:
                         self.ring_last_press_at[joystick_id] = now
                         self.messages.put(("RING", str(joystick_id), -1))
                     if new_buttons:
+                        self.joystick_press_sequence = (
+                            getattr(self, "joystick_press_sequence", 0) + 1
+                        )
                         self.messages.put(
-                            ("JOYSTICK_PRESS", str(joystick_id), -1)
+                            (
+                                "JOYSTICK_PRESS",
+                                str(self.joystick_press_sequence),
+                                -1,
+                            )
                         )
                     self.joystick_button_states[joystick_id] = buttons
 
@@ -3007,7 +3017,7 @@ class MagnetArcadeGuard:
                 f"{RING_MILESTONE_MESSAGE}\nTOTAL RINGS: {self.ring_count}"
             )
             color = "#ffdd55"
-            duration = RING_ANNOUNCEMENT_SECONDS
+            duration = RING_MILESTONE_ANNOUNCEMENT_SECONDS
         elif announcement_kind == "burst":
             title = RING_BURST_TITLE
             detail = f"{RING_BURST_MESSAGE}\nTOTAL RINGS: {self.ring_count}"
@@ -3036,7 +3046,14 @@ class MagnetArcadeGuard:
             self.ring_power_announcement_visible = True
             # The ring insertion that caused this announcement also produces
             # a joystick-edge event. Ignore that same scan so the new banner
-            # cannot disappear immediately.
+            # cannot disappear immediately. The sequence check is important:
+            # the message can sit in the queue while the GUI is busy restoring
+            # Big Box, so a short time-only debounce is not reliable enough.
+            self.ring_power_ignore_press_sequence = getattr(
+                self,
+                "joystick_press_sequence",
+                0,
+            )
             self.ring_power_ignore_until = time.monotonic() + 0.25
         if announcement_kind == "milestone":
             self.pending_ring_milestone = False
@@ -3052,16 +3069,107 @@ class MagnetArcadeGuard:
                 f"kind={announcement_kind} | total={self.ring_count}"
             )
 
-    def handle_joystick_press(self) -> None:
+    def handle_joystick_press(self, press_sequence=None) -> None:
         """Dismiss a persistent Ring Power banner on the next button press."""
         if not getattr(self, "ring_power_announcement_visible", False):
             return
-        if time.monotonic() < self.ring_power_ignore_until:
+
+        try:
+            event_sequence = (
+                int(press_sequence)
+                if press_sequence is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            event_sequence = None
+
+        ignored_sequence = getattr(
+            self,
+            "ring_power_ignore_press_sequence",
+            0,
+        )
+        current_sequence = getattr(
+            self,
+            "joystick_press_sequence",
+            0,
+        )
+        if event_sequence is not None:
+            if event_sequence <= ignored_sequence:
+                return
+        elif current_sequence <= ignored_sequence:
+            return
+        elif time.monotonic() < self.ring_power_ignore_until:
             return
 
-        self.hide_story_announcement()
-        self.write_status("RING POWER ANNOUNCEMENT DISMISSED | joystick")
-        self.maybe_show_pending_ring_announcement()
+        try:
+            self.hide_story_announcement()
+            self.write_status("RING POWER ANNOUNCEMENT DISMISSED | joystick")
+            self.maybe_show_pending_ring_announcement()
+        except Exception as error:
+            # A stale Tk callback must not turn a harmless banner dismissal
+            # into an application-wide guard shutdown. Ensure the banner is
+            # hidden as far as possible and leave the game path fail-open.
+            detail = str(error).replace("\n", " ")[:160]
+            self.ring_power_announcement_visible = False
+            self.write_status(
+                "RING POWER DISMISS RECOVERED | " + detail
+            )
+            try:
+                if self.announcement_window:
+                    self.announcement_window.withdraw()
+            except Exception:
+                pass
+
+    def recover_ring_ui_error(self, context: str, error: Exception) -> None:
+        """Keep a small Ring UI failure from stopping the watchdog loop."""
+        detail = str(error).replace("\n", " ")[:160]
+        self.ring_power_announcement_visible = False
+        self.write_status(
+            f"RING UI RECOVERED | {context} | {detail}"
+        )
+        try:
+            self.hide_story_announcement()
+        except Exception:
+            try:
+                if self.announcement_window:
+                    self.announcement_window.withdraw()
+            except Exception:
+                pass
+
+    def recover_ring_burst_error(self, error: Exception) -> None:
+        """Fail open after a Ring Power transition callback fails."""
+        detail = str(error).replace("\n", " ")[:160]
+        restore_robotnik = bool(
+            self.ring_burst_restore_robotnik
+            and self.guard_mode == "story"
+            and self.story_intro_completed
+        )
+        self.ring_burst_active = False
+        self.ring_burst_game_seen = False
+        self.ring_burst_game_seen_since = 0.0
+        self.ring_burst_restore_robotnik = False
+        self.ring_power_announcement_visible = False
+        self.write_status(
+            "RING BURST RECOVERED | fail-open | " + detail
+        )
+        try:
+            self.hide_story_announcement()
+        except Exception:
+            try:
+                if self.announcement_window:
+                    self.announcement_window.withdraw()
+            except Exception:
+                pass
+
+        if (
+            restore_robotnik
+            and self.guard_active
+            and self.guard_mode == "story"
+            and self.story_intro_completed
+        ):
+            self.pending_overlay_missing = (
+                TOTAL_EMERALDS - (self.accepted_count or 0)
+            )
 
     def maybe_show_pending_ring_milestone(self) -> None:
         """Compatibility wrapper retained for older tests and diagnostics."""
@@ -3081,6 +3189,12 @@ class MagnetArcadeGuard:
         self.ring_burst_game_seen_since = 0.0
         self.ring_burst_restore_robotnik = False
         self.write_status("RING BURST CONSUMED | Big Box returned")
+        # The persistent Ring Power banner belongs to the one-game access
+        # period. Never leave it above the restored Robotnik screen.
+        try:
+            self.hide_story_announcement()
+        except Exception as error:
+            self.recover_ring_ui_error("return cleanup", error)
 
         if not self.guard_active:
             return
@@ -3971,7 +4085,22 @@ class MagnetArcadeGuard:
 
     def foreground_watchdog(self) -> None:
         if self.running and self.guard_active:
-            self.handle_ring_burst_foreground()
+            if (
+                self.ring_power_announcement_visible
+                and getattr(self, "joystick_press_sequence", 0)
+                > getattr(self, "ring_power_ignore_press_sequence", 0)
+            ):
+                try:
+                    self.handle_joystick_press()
+                except Exception as error:
+                    self.recover_ring_ui_error(
+                        "joystick watchdog",
+                        error,
+                    )
+            try:
+                self.handle_ring_burst_foreground()
+            except Exception as error:
+                self.recover_ring_burst_error(error)
             # Keep the Big Box readiness timer warm even before a sensor event.
             # That makes announcements and takeovers feel immediate while still
             # retaining the settle delay after an emulator closes.
@@ -3983,7 +4112,13 @@ class MagnetArcadeGuard:
             self.maybe_show_pending_overlay()
 
         if self.running:
-            self.maybe_show_pending_ring_announcement()
+            try:
+                self.maybe_show_pending_ring_announcement()
+            except Exception as error:
+                self.recover_ring_ui_error(
+                    "announcement watchdog",
+                    error,
+                )
 
         if self.running:
             self.root.after(250, self.foreground_watchdog)
@@ -4631,7 +4766,6 @@ class MagnetArcadeGuard:
         )
 
     def story_recovery_message(self, present_count: int) -> str:
-        energy_percent = round(present_count * 100 / TOTAL_EMERALDS)
         title, detail = STORY_RETURNED_TEXT.get(
             present_count,
             (
@@ -4639,7 +4773,7 @@ class MagnetArcadeGuard:
                 "THE SHRINE IS RECLAIMING ITS POWER!",
             ),
         )
-        return f"{title}  {detail}  CHAOS ENERGY: {energy_percent}%"
+        return f"{title}  {detail}"
 
     def show_story_robotnik_screen(self) -> None:
         if not self.guard_active or self.guard_mode != "story":
@@ -5661,7 +5795,7 @@ class MagnetArcadeGuard:
                     continue
 
                 if message_type == "JOYSTICK_PRESS":
-                    self.handle_joystick_press()
+                    self.handle_joystick_press(value)
                     continue
 
                 if generation != self.activation_generation:

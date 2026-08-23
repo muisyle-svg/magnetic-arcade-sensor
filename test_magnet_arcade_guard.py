@@ -210,6 +210,8 @@ class GuardLogicTests(unittest.TestCase):
         guard = self.make_guard()
         guard.ring_power_announcement_visible = True
         guard.ring_power_ignore_until = 0.0
+        guard.joystick_press_sequence = 1
+        guard.ring_power_ignore_press_sequence = 0
         hidden = []
         pending = []
         guard.hide_story_announcement = (
@@ -224,6 +226,46 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(hidden, [True])
         self.assertEqual(pending, [True])
+
+    def test_ring_power_ignores_the_ring_trigger_edge_but_accepts_next_edge(self):
+        guard = self.make_guard()
+        guard.ring_power_announcement_visible = True
+        guard.joystick_press_sequence = 7
+        guard.ring_power_ignore_press_sequence = 7
+        guard.ring_power_ignore_until = 0.0
+        hidden = []
+        guard.hide_story_announcement = lambda: hidden.append(True)
+        guard.maybe_show_pending_ring_announcement = lambda: None
+        guard.write_status = lambda *args, **kwargs: None
+
+        guard.handle_joystick_press("7")
+        self.assertEqual(hidden, [])
+
+        guard.joystick_press_sequence = 8
+        guard.handle_joystick_press("8")
+        self.assertEqual(hidden, [True])
+
+    def test_ring_power_banner_is_hidden_when_burst_is_consumed(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_restore_robotnik = True
+        guard.ring_power_announcement_visible = True
+        guard.guard_active = False
+        hidden = []
+        guard.hide_story_announcement = lambda: hidden.append(True)
+        guard.write_status = lambda *args, **kwargs: None
+
+        guard.consume_ring_burst_on_return()
+
+        self.assertEqual(hidden, [True])
+        self.assertFalse(guard.ring_burst_active)
+
+    def test_recovery_text_leaves_energy_to_the_meter(self):
+        guard = self.make_guard()
+
+        recovery_text = guard.story_recovery_message(3)
+
+        self.assertNotIn("CHAOS ENERGY:", recovery_text)
 
     def test_milestone_is_marked_shown_only_after_successful_display(self):
         guard = self.make_guard()
@@ -247,6 +289,31 @@ class GuardLogicTests(unittest.TestCase):
             {guard_module.RING_MILESTONE},
         )
         self.assertEqual(saved, [True])
+
+    def test_milestone_announcement_stays_visible_for_at_least_ten_seconds(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.ring_count = 50
+        guard.pending_ring_milestone = True
+        guard.pending_ring_announcement = "milestone"
+        guard.ring_milestones_pending = {guard_module.RING_MILESTONE}
+        guard.ring_milestones_shown = set()
+        guard.write_status = lambda *args, **kwargs: None
+        guard.save_ring_state = lambda: None
+        shown = []
+        guard.show_plain_announcement = (
+            lambda title, detail, color, duration, **kwargs: (
+                shown.append(duration) or True
+            )
+        )
+
+        guard.maybe_show_pending_ring_announcement()
+
+        self.assertGreaterEqual(
+            shown[0],
+            guard_module.RING_MILESTONE_ANNOUNCEMENT_SECONDS,
+        )
+        self.assertGreaterEqual(shown[0], 10.0)
 
     def test_pending_milestone_survives_ring_state_reload(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
