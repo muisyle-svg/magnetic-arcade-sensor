@@ -44,7 +44,7 @@ The ESP32 independently controls the existing red and green LED legs; the blue l
 
 - The resting color moves from red through orange, amber, and yellow-green to bright green as the detected count rises from 0 to 7.
 - The pulse gradually becomes faster as Chaos Energy rises.
-- The Robotnik screen shows a dedicated `MASTER EMERALD ENERGY` meter with a short stepped increase/decrease animation whenever the count changes.
+- The Robotnik screen shows a seven-segment graphical `MASTER EMERALD POWER` meter with a short stepped increase/decrease animation whenever the count changes.
 - Removing an emerald produces two red alarm flashes.
 - Returning an emerald produces a green absorption flash followed by a temporary faster energy pulse.
 - Returning the final emerald produces the three-stage green charge effect followed by the fast green pulse.
@@ -109,6 +109,7 @@ Keep `guard-config.json` beside `MagnetArcadeGuardStoryMode.exe`.
 - `story_question_seconds`: duration of the hero prompt before the cinematic.
 - `story_eggman_seconds`: duration of the Eggman reveal before the cinematic.
 - `cinematic_fade_seconds`: black-to-video fade duration.
+- `cinematic_max_fps`: maximum cinematic display rate; default `15` to keep audio and video synchronized on the arcade PC.
 - `cinematic_video_file`: exact Sonic CD video filename used when building.
 - `big_box_ready_delay_seconds`: how long Big Box must cover its monitor and remain stable before a full takeover.
 - `sensor_stable_ms`: Windows-side sensor stabilization after the firmware debounce.

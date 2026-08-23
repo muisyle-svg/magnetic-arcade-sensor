@@ -258,24 +258,31 @@ class GuardLogicTests(unittest.TestCase):
         guard = self.make_guard()
         guard.overlay_kind = None
         warnings = []
+        returns = []
         guard.show_normal_warning = (
             lambda previous, current: warnings.append((previous, current))
         )
+        guard.play_emerald_sound = lambda: returns.append(True)
 
         guard.handle_normal_count_change(4, 5)
         guard.handle_normal_count_change(5, 4)
 
         self.assertEqual(warnings, [(5, 4)])
+        self.assertEqual(returns, [True])
 
     def test_normal_warning_ends_immediately_on_any_return(self):
         guard = self.make_guard()
         guard.overlay_kind = "normal_warning"
+        guard.normal_warning_trigger_count = 3
         finished = []
+        returns = []
         guard.finish_normal_warning = lambda: finished.append(True)
+        guard.play_emerald_sound = lambda: returns.append(True)
 
         guard.handle_normal_count_change(3, 4)
 
         self.assertEqual(finished, [True])
+        self.assertEqual(returns, [True])
 
     def test_normal_mode_removal_plays_random_voice_after_banner(self):
         guard = self.make_guard()
@@ -299,11 +306,11 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(
             guard.energy_meter_text(0),
-            "MASTER EMERALD ENERGY [------------] 0%",
+            "MASTER EMERALD POWER  0%",
         )
         self.assertEqual(
             guard.energy_meter_text(7),
-            "MASTER EMERALD ENERGY [############] 100%",
+            "MASTER EMERALD POWER  100%",
         )
 
     @unittest.skipUnless(
@@ -328,6 +335,28 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(guard.cinematic_prepare_state, "ready")
         self.assertGreater(guard.cinematic_duration, 90.0)
         self.assertGreater(len(guard.cinematic_audio_pcm), 1_000_000)
+
+    @unittest.skipUnless(
+        guard_module.AV_AVAILABLE
+        and guard_module.ORIGINAL_CINEMATIC_VIDEO_PATH.is_file(),
+        "Sonic cinematic asset or decoder is not available",
+    )
+    def test_cinematic_frame_can_be_scaled_directly_to_rgb(self):
+        with guard_module.av.open(
+            str(guard_module.ORIGINAL_CINEMATIC_VIDEO_PATH)
+        ) as container:
+            video_stream = next(
+                stream for stream in container.streams if stream.type == "video"
+            )
+            frame = next(container.decode(video_stream))
+            image = frame.reformat(
+                width=640,
+                height=480,
+                format="rgb24",
+            ).to_image()
+
+        self.assertEqual(image.mode, "RGB")
+        self.assertEqual(image.size, (640, 480))
 
     def test_resume_watchdog_honors_cancel_before_resuming(self):
         guard_module.configure_windows_runtime()

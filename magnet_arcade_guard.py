@@ -118,6 +118,7 @@ DEFAULT_CONFIG = {
     "story_question_seconds": 6.0,
     "story_eggman_seconds": 3.0,
     "cinematic_fade_seconds": 0.8,
+    "cinematic_max_fps": 15,
     "cinematic_video_file": (
         "2015-02-19-SonictheHedgehogCD-Opening"
         "(SonicBoomNAVersion).mp4.7fb0570ab57510d4a7d54beb920f6517.mp4"
@@ -287,6 +288,15 @@ CINEMATIC_FADE_SECONDS = config_number(
     0.0,
     5.0,
 )
+CINEMATIC_MAX_FPS = config_number(
+    RUNTIME_CONFIG.get("cinematic_max_fps", 15),
+    15,
+    10,
+    30,
+)
+CINEMATIC_FRAME_INTERVAL = 1.0 / CINEMATIC_MAX_FPS
+CINEMATIC_QUEUE_SIZE = 12
+CINEMATIC_PREBUFFER_FRAMES = 6
 configured_default_mode = str(
     RUNTIME_CONFIG.get("default_mode", "story")
 ).strip().lower()
@@ -412,7 +422,6 @@ STORY_QUESTION_MESSAGE = (
 )
 STORY_EGGMAN_TITLE = "SO EGGMAN'S BEHIND THIS, HUH?"
 STORY_EGGMAN_MESSAGE = ""
-ENERGY_METER_SEGMENTS = 12
 ENERGY_ANIMATION_STEP_MS = 55
 ENERGY_EMPHASIS_MS = 420
 
@@ -783,7 +792,9 @@ class MagnetArcadeGuard:
         self.cinematic_started_at = 0.0
         self.cinematic_generation = 0
         self.cinematic_cancel_event = threading.Event()
-        self.cinematic_frame_queue = queue.Queue(maxsize=4)
+        self.cinematic_frame_queue = queue.Queue(
+            maxsize=CINEMATIC_QUEUE_SIZE
+        )
         self.cinematic_pending_frame = None
         self.cinematic_worker_done = False
         self.cinematic_worker_error = ""
@@ -1042,14 +1053,13 @@ class MagnetArcadeGuard:
         self.count_label.place(anchor="center")
         self.position_counter()
 
-        self.energy_label = tk.Label(
+        self.energy_canvas = tk.Canvas(
             self.root,
-            text="",
-            font=("Arial", 16, "bold"),
-            foreground="#66ff99",
             background="#000000",
+            borderwidth=0,
+            highlightthickness=0,
         )
-        self.energy_label.place_forget()
+        self.energy_canvas.place_forget()
 
         self.messages: queue.Queue[tuple[str, str, int]] = queue.Queue()
         self.create_announcement_window()
@@ -1204,11 +1214,7 @@ class MagnetArcadeGuard:
     def energy_meter_text(self, present_count: int) -> str:
         present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
         percent = round(present_count * 100 / TOTAL_EMERALDS)
-        filled = round(
-            present_count * ENERGY_METER_SEGMENTS / TOTAL_EMERALDS
-        )
-        bar = "#" * filled + "-" * (ENERGY_METER_SEGMENTS - filled)
-        return f"MASTER EMERALD ENERGY [{bar}] {percent}%"
+        return f"MASTER EMERALD POWER  {percent}%"
 
     def energy_meter_color(self, present_count: int) -> str:
         present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
@@ -1219,11 +1225,11 @@ class MagnetArcadeGuard:
         return "#ff6666"
 
     def position_energy_meter(self) -> None:
-        if not getattr(self, "energy_label", None):
+        if not getattr(self, "energy_canvas", None):
             return
 
         _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
-        self.energy_label.update_idletasks()
+        self.energy_canvas.update_idletasks()
         self.count_label.update_idletasks()
         count_info = self.count_label.place_info()
         try:
@@ -1232,14 +1238,14 @@ class MagnetArcadeGuard:
             count_y = monitor_height * 0.8
 
         count_height = self.count_label.winfo_reqheight()
-        energy_height = self.energy_label.winfo_reqheight()
+        energy_height = self.energy_canvas.winfo_reqheight()
         gap = max(5, int(monitor_height * 0.012))
         energy_y = count_y + count_height / 2 + gap + energy_height / 2
         energy_y = min(
             energy_y,
             monitor_height - energy_height / 2 - max(4, gap),
         )
-        self.energy_label.place(
+        self.energy_canvas.place(
             x=monitor_width / 2,
             y=max(energy_height / 2, energy_y),
             anchor="center",
@@ -1252,38 +1258,73 @@ class MagnetArcadeGuard:
         emphasis: bool = False,
         visible: bool = True,
     ) -> None:
-        if not getattr(self, "energy_label", None):
+        if not getattr(self, "energy_canvas", None):
             return
 
         present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
         self.energy_display_count = present_count
         _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
         text = self.energy_meter_text(present_count)
-        base_size = max(12, min(24, int(monitor_height * 0.045)))
+        meter_width = max(240, min(520, int(monitor_width * 0.72)))
+        meter_height = max(42, min(62, int(monitor_height * 0.11)))
+        base_size = max(10, min(18, int(monitor_height * 0.034)))
         if emphasis:
-            base_size += 4
+            base_size += 2
         font_size = self.fit_font_size(
             (text,),
             max_size=base_size,
-            min_size=10,
-            available_width=monitor_width,
+            min_size=9,
+            available_width=meter_width,
         )
-        self.energy_label.configure(
+        color = self.energy_meter_color(present_count)
+        self.energy_canvas.configure(
+            width=meter_width,
+            height=meter_height,
+            background="#000000",
+        )
+        self.energy_canvas.delete("all")
+        self.energy_canvas.create_text(
+            meter_width / 2,
+            max(9, font_size * 0.65),
             text=text,
-            foreground=self.energy_meter_color(present_count),
+            fill=color,
             font=("Arial", font_size, "bold"),
         )
+
+        horizontal_margin = max(8, int(meter_width * 0.035))
+        segment_gap = max(2, int(meter_width * 0.007))
+        bar_top = max(22, int(meter_height * 0.48))
+        bar_bottom = meter_height - max(4, int(meter_height * 0.08))
+        available_width = (
+            meter_width
+            - horizontal_margin * 2
+            - segment_gap * (TOTAL_EMERALDS - 1)
+        )
+        segment_width = available_width / TOTAL_EMERALDS
+        for index in range(TOTAL_EMERALDS):
+            left = horizontal_margin + index * (segment_width + segment_gap)
+            right = left + segment_width
+            filled = index < present_count
+            self.energy_canvas.create_rectangle(
+                left,
+                bar_top,
+                right,
+                bar_bottom,
+                fill=color if filled else "#181818",
+                outline="#ffffff" if emphasis and filled else "#606060",
+                width=2 if emphasis and filled else 1,
+            )
         if visible:
             self.position_energy_meter()
         else:
-            self.energy_label.place_forget()
+            self.energy_canvas.place_forget()
 
     def animate_energy_meter(
         self,
         previous_count: int,
         current_count: int,
     ) -> None:
-        if not getattr(self, "energy_label", None):
+        if not getattr(self, "energy_canvas", None):
             return
 
         previous_count = max(
@@ -1325,8 +1366,8 @@ class MagnetArcadeGuard:
 
     def hide_energy_meter(self) -> None:
         self.cancel_energy_animation()
-        if getattr(self, "energy_label", None):
-            self.energy_label.place_forget()
+        if getattr(self, "energy_canvas", None):
+            self.energy_canvas.place_forget()
 
     def fit_font_size(
         self,
@@ -1516,6 +1557,7 @@ class MagnetArcadeGuard:
     def calculate_background_display_size(self) -> None:
         title_space = int(self.title_font_size * 1.8) + 10
         counter_space = int(self.count_font_size * 1.4) + 10
+        energy_space = max(48, int(self.screen_height * 0.12))
         vertical_gap = max(8, int(self.screen_height * 0.02))
 
         maximum_width = max(1, self.screen_width - 20)
@@ -1524,6 +1566,7 @@ class MagnetArcadeGuard:
             self.screen_height
             - title_space
             - counter_space
+            - energy_space
             - vertical_gap,
         )
 
@@ -1544,6 +1587,18 @@ class MagnetArcadeGuard:
 
     def position_counter(self) -> None:
         _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
+        self.count_label.update_idletasks()
+        count_height = self.count_label.winfo_reqheight()
+        meter_height = max(42, min(62, int(monitor_height * 0.11)))
+        bottom_margin = max(5, int(monitor_height * 0.012))
+        meter_gap = max(5, int(monitor_height * 0.012))
+        maximum_counter_y = (
+            monitor_height
+            - bottom_margin
+            - meter_height
+            - meter_gap
+            - count_height / 2
+        )
         if self.background_display_height:
             image_bottom = (
                 monitor_height / 2
@@ -1555,10 +1610,10 @@ class MagnetArcadeGuard:
             )
             counter_y = min(
                 counter_y,
-                monitor_height - int(self.count_font_size * 0.7),
+                maximum_counter_y,
             )
         else:
-            counter_y = monitor_height * 0.8
+            counter_y = min(monitor_height * 0.8, maximum_counter_y)
 
         self.count_label.place(
             x=monitor_width / 2,
@@ -1986,6 +2041,7 @@ class MagnetArcadeGuard:
                     if stream.type == "video"
                 )
                 first_timestamp = None
+                next_output_timestamp = 0.0
                 _, _, monitor_width, monitor_height = (
                     self.overlay_monitor_bounds
                 )
@@ -2006,42 +2062,24 @@ class MagnetArcadeGuard:
                         first_timestamp = timestamp
                     timestamp -= first_timestamp
 
-                    # Detach each frame from PyAV's YUV/padded buffers before
-                    # Tk displays it. A direct conversion can expose stale
-                    # stride bytes as narrow black marks on some displays.
-                    frame_image = (
-                        frame.reformat(format="rgb24")
-                        .to_image()
-                        .convert("RGB")
-                        .copy()
-                    )
-                    # Repack the final pixels into a tightly packed RGB image
-                    # before Tk receives them. This avoids occasional narrow
-                    # vertical artifacts when a frame retains decoder stride
-                    # metadata through repeated PhotoImage updates.
-                    frame_image = Image.frombytes(
-                        "RGB",
-                        frame_image.size,
-                        frame_image.tobytes(),
-                    )
+                    if timestamp + 0.0001 < next_output_timestamp:
+                        continue
+                    next_output_timestamp = timestamp + CINEMATIC_FRAME_INTERVAL
+
                     scale = min(
                         1.0,
-                        monitor_width / frame_image.width,
-                        monitor_height / frame_image.height,
+                        monitor_width / frame.width,
+                        monitor_height / frame.height,
                     )
                     target_size = (
-                        max(1, int(frame_image.width * scale)),
-                        max(1, int(frame_image.height * scale)),
+                        max(1, int(frame.width * scale)),
+                        max(1, int(frame.height * scale)),
                     )
-                    if target_size != frame_image.size:
-                        frame_image = frame_image.resize(
-                            target_size,
-                            resample=getattr(
-                                Image,
-                                "Resampling",
-                                Image,
-                            ).BILINEAR,
-                        )
+                    frame_image = frame.reformat(
+                        width=target_size[0],
+                        height=target_size[1],
+                        format="rgb24",
+                    ).to_image()
 
                     while not self.cinematic_cancel_event.is_set():
                         try:
@@ -2093,11 +2131,14 @@ class MagnetArcadeGuard:
         self.cinematic_generation += 1
         generation = self.cinematic_generation
         self.cinematic_cancel_event.clear()
-        self.cinematic_frame_queue = queue.Queue(maxsize=4)
+        self.cinematic_frame_queue = queue.Queue(
+            maxsize=CINEMATIC_QUEUE_SIZE
+        )
         self.cinematic_pending_frame = None
         self.cinematic_worker_done = False
         self.cinematic_worker_error = ""
         self.cinematic_started_at = 0.0
+        self.cinematic_photo = None
         threading.Thread(
             target=self.decode_cinematic_frames,
             args=(generation,),
@@ -2134,11 +2175,18 @@ class MagnetArcadeGuard:
             black_frame = Image.new("RGB", frame_image.size, "black")
             frame_image = Image.blend(black_frame, frame_image, alpha)
 
-        self.cinematic_photo = ImageTk.PhotoImage(frame_image.copy())
-        self.background_label.configure(
-            image=self.cinematic_photo,
-            background="black",
-        )
+        if (
+            self.cinematic_photo is None
+            or self.cinematic_photo.width() != frame_image.width
+            or self.cinematic_photo.height() != frame_image.height
+        ):
+            self.cinematic_photo = ImageTk.PhotoImage(frame_image)
+            self.background_label.configure(
+                image=self.cinematic_photo,
+                background="black",
+            )
+        else:
+            self.cinematic_photo.paste(frame_image)
 
     def poll_cinematic_playback(self) -> None:
         self.cinematic_after_id = None
@@ -2165,7 +2213,11 @@ class MagnetArcadeGuard:
                 self.cinematic_pending_frame = None
 
         if self.cinematic_started_at == 0.0:
-            if self.cinematic_pending_frame is None:
+            buffered_frames = self.cinematic_frame_queue.qsize()
+            if (
+                self.cinematic_pending_frame is None
+                or buffered_frames + 1 < CINEMATIC_PREBUFFER_FRAMES
+            ):
                 self.cinematic_after_id = self.root.after(
                     10,
                     self.poll_cinematic_playback,
@@ -2179,18 +2231,21 @@ class MagnetArcadeGuard:
                 return
 
         elapsed = time.monotonic() - self.cinematic_started_at
+        latest_due_frame = None
         while (
             self.cinematic_pending_frame is not None
             and self.cinematic_pending_frame[0] <= elapsed + 0.02
         ):
-            _, frame_image = self.cinematic_pending_frame
-            self.display_cinematic_frame(frame_image, elapsed)
+            latest_due_frame = self.cinematic_pending_frame[1]
             try:
                 self.cinematic_pending_frame = (
                     self.cinematic_frame_queue.get_nowait()
                 )
             except queue.Empty:
                 self.cinematic_pending_frame = None
+
+        if latest_due_frame is not None:
+            self.display_cinematic_frame(latest_due_frame, elapsed)
 
         playback_finished = (
             self.cinematic_worker_done
@@ -2223,6 +2278,7 @@ class MagnetArcadeGuard:
                 pass
         self.cinematic_sound = None
         self.cinematic_pending_frame = None
+        self.cinematic_photo = None
 
     def finish_story_cinematic(self) -> None:
         self.cancel_cinematic()
@@ -4653,18 +4709,25 @@ class MagnetArcadeGuard:
         if current_count == previous_count:
             return
 
+        if current_count > previous_count:
+            if (
+                self.overlay_kind == "normal_warning"
+                or getattr(self, "normal_warning_trigger_count", None)
+                is not None
+            ):
+                self.finish_normal_warning()
+            self.play_emerald_sound()
+            return
+
         if (
             self.overlay_kind == "normal_warning"
             or getattr(self, "normal_warning_trigger_count", None)
             is not None
         ):
-            if current_count > previous_count:
-                self.finish_normal_warning()
-            else:
-                # A second real removal is a new event, so keep the warning up
-                # for a full interval from the newest removal.
-                if self.show_normal_warning(previous_count, current_count):
-                    self.play_removal_sound()
+            # A second real removal is a new event, so keep the warning up
+            # for a full interval from the newest removal.
+            if self.show_normal_warning(previous_count, current_count):
+                self.play_removal_sound()
             return
 
         # Normal Mode reacts only to a downward edge observed while Big Box is
