@@ -18,7 +18,7 @@ Story Mode arms only after the guard has observed all seven emeralds in place. S
 
 - Removing emeralds 1–6 shows a centered, briefly flashing, non-blocking theft/energy banner over a full-screen Big Box menu. Big Box remains usable and the banner does not take keyboard or joystick focus.
 - The shutdown story cards use larger monitor-aware text, while still shrinking or wrapping to stay inside the arcade display.
-- Each partial theft chooses a different removal sound from the four bundled clips; the same clip is never chosen twice in a row.
+- Each partial theft chooses a different sound from the configured reaction clips; the same clip is never chosen twice in a row.
 - Removing the seventh emerald starts the full takeover only after Big Box is the stable full-screen foreground. It pauses Big Box, mutes its audio, announces the shutdown, asks where a hero can be found, and plays the bundled Sonic CD opening.
 - The final theft uses the dedicated `no-he-s-got-the-last-emerald.mp3` clip. Before the cinematic, the Eggman reveal screen only says `SO EGGMAN'S BEHIND THIS, HUH?` and plays its matching voice clip.
 - After the cinematic, the Robotnik recovery screen shows the number recovered and current Chaos Energy percentage as each emerald returns.
