@@ -389,6 +389,9 @@ CINEMATIC_MAX_FPS = config_number(
 CINEMATIC_FRAME_INTERVAL = 1.0 / CINEMATIC_MAX_FPS
 CINEMATIC_QUEUE_SIZE = 12
 CINEMATIC_PREBUFFER_FRAMES = 6
+CINEMATIC_PREPARE_TIMEOUT_SECONDS = 180.0
+CINEMATIC_START_TIMEOUT_SECONDS = 20.0
+CINEMATIC_FINISH_GRACE_SECONDS = 20.0
 configured_default_mode = str(
     RUNTIME_CONFIG.get("default_mode", "story")
 ).strip().lower()
@@ -406,6 +409,7 @@ except (TypeError, ValueError):
     BIG_BOX_READY_DELAY_SECONDS = 1.5
 COMPLETION_FALLBACK_SECONDS = 5.0
 COMPLETION_MAX_SECONDS = 120.0
+EVENT_SOUND_MAX_SECONDS = 15.0
 PROTOCOL_PREFIX = "MAGNET_LOCK:"
 
 
@@ -942,6 +946,7 @@ class MagnetArcadeGuard:
         self.completion_animation_finished = False
         self.final_completion_sound_started = False
         self.final_completion_sound_playing = False
+        self.final_completion_sound_started_at = 0.0
         self.music_mode: Optional[str] = None
         self.emerald_sound = None
         self.removal_sound = None
@@ -956,6 +961,7 @@ class MagnetArcadeGuard:
         self.last_event_sound_at = 0.0
         self.final_emerald_sound_started = False
         self.final_emerald_pause_started_at: Optional[float] = None
+        self.final_emerald_wait_started_at = 0.0
         self.counter_animation_after_id = None
         self.counter_animation_generation = 0
         self.energy_animation_after_id = None
@@ -971,6 +977,8 @@ class MagnetArcadeGuard:
         self.pending_normal_warning: Optional[tuple[int, int]] = None
         self.cinematic_prepare_state = "unavailable"
         self.cinematic_prepare_error = ""
+        self.cinematic_prepare_started_at = 0.0
+        self.cinematic_story_wait_started_at = 0.0
         self.cinematic_audio_pcm = b""
         self.cinematic_audio_rate = 44100
         self.cinematic_duration = 0.0
@@ -978,6 +986,7 @@ class MagnetArcadeGuard:
         self.cinematic_sound = None
         self.cinematic_after_id = None
         self.cinematic_started_at = 0.0
+        self.cinematic_wait_started_at = 0.0
         self.cinematic_generation = 0
         self.cinematic_cancel_event = threading.Event()
         self.cinematic_frame_queue = queue.Queue(
@@ -995,8 +1004,12 @@ class MagnetArcadeGuard:
         self.audio_mute_error_reported = False
         self.audio_last_error = ""
         self.audio_watchdog_after_id = None
+        self.audio_restore_retry_after_id = None
+        self.audio_restore_retry_attempt = 0
         self.ring_input_stop_event = threading.Event()
         self.ring_input_thread = None
+        self.ring_input_restart_after_id = None
+        self.ring_input_restart_count = 0
         self.ring_input_backend = "Windows joystick"
         self.ring_joystick_error = ""
         self.ring_joystick_signature = ()
@@ -1005,14 +1018,20 @@ class MagnetArcadeGuard:
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
-        self.ring_burst_restore_robotnik = False
+        self.ring_burst_origin: Optional[str] = None
+        self.normal_ring_lock_active = False
         self.ring_power_announcement_visible = False
         self.ring_power_ignore_until = 0.0
         self.joystick_press_sequence = 0
         self.ring_power_ignore_press_sequence = 0
         self.pending_ring_milestone = False
         self.pending_ring_announcement: Optional[str] = None
+        self.active_ring_announcement_kind: Optional[str] = None
         self.ring_state_warning = ""
+        self.service_warning = ""
+        self.serial_worker_failed = False
+        self.pending_guard_activation = False
+        self.activation_retry_after_id = None
         local_app_data = Path(
             os.environ.get(
                 "LOCALAPPDATA",
@@ -1297,6 +1316,7 @@ class MagnetArcadeGuard:
 
         if AV_AVAILABLE and self.cinematic_video_path.exists():
             self.cinematic_prepare_state = "preparing"
+            self.cinematic_prepare_started_at = time.monotonic()
             threading.Thread(
                 target=self.prepare_cinematic_audio,
                 daemon=True,
@@ -1322,20 +1342,24 @@ class MagnetArcadeGuard:
         # if the overlay temporarily loses keyboard focus.
         threading.Thread(
             target=self.worker_entry,
-            args=("keyboard shortcut", self.global_service_hotkey_worker),
+            args=(
+                "keyboard shortcut",
+                self.global_service_hotkey_worker,
+                False,
+            ),
             daemon=True,
         ).start()
 
         worker = threading.Thread(
             target=self.worker_entry,
-            args=("ESP32 serial", self.serial_worker),
+            args=("ESP32 serial", self.serial_worker, True),
             daemon=True,
         )
         worker.start()
 
         self.ring_input_thread = threading.Thread(
             target=self.worker_entry,
-            args=("ring input", self.ring_input_worker),
+            args=("ring input", self.ring_input_worker, False),
             daemon=True,
         )
         self.ring_input_thread.start()
@@ -2201,6 +2225,21 @@ class MagnetArcadeGuard:
         except (AttributeError, tk.TclError):
             pass
 
+        if not self.announcement_window_matches_bounds(
+            banner_x,
+            banner_y,
+            banner_width,
+            banner_height,
+        ):
+            try:
+                self.announcement_window.withdraw()
+            except tk.TclError:
+                pass
+            self.write_status(
+                "EMERALD ANNOUNCEMENT SKIPPED | window did not render correctly"
+            )
+            return False
+
         self.flash_story_screen()
         self.announcement_after_id = self.root.after(
             int(
@@ -2212,6 +2251,18 @@ class MagnetArcadeGuard:
         return True
 
     def hide_story_announcement(self) -> None:
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            # Only the dedicated timeout callback acknowledges delivery. Any
+            # other hide (game launch, mode switch, emerald event, shutdown)
+            # means the camper did not receive the promised ten seconds.
+            self.pending_ring_milestone = True
+            self.pending_ring_announcement = "milestone"
+            self.ring_milestones_pending.add(RING_MILESTONE)
+            self.save_ring_state()
+            self.write_status(
+                "RING MILESTONE INTERRUPTED | queued for safe menu"
+            )
+        self.active_ring_announcement_kind = None
         self.ring_power_announcement_visible = False
         if self.announcement_after_id is not None:
             try:
@@ -2363,11 +2414,22 @@ class MagnetArcadeGuard:
     def start_story_cinematic(self) -> None:
         self.story_sequence_after_id = None
         if self.cinematic_prepare_state == "preparing":
+            if self.cinematic_story_wait_started_at == 0.0:
+                self.cinematic_story_wait_started_at = time.monotonic()
+            if (
+                time.monotonic() - self.cinematic_story_wait_started_at
+                >= CINEMATIC_START_TIMEOUT_SECONDS
+            ):
+                self.fault_disable_guard(
+                    "Sonic cinematic preparation timed out"
+                )
+                return
             self.story_sequence_after_id = self.root.after(
                 100,
                 self.start_story_cinematic,
             )
             return
+        self.cinematic_story_wait_started_at = 0.0
         if self.cinematic_prepare_state != "ready":
             self.fault_disable_guard(
                 "Could not prepare Sonic cinematic: "
@@ -2397,6 +2459,7 @@ class MagnetArcadeGuard:
         self.cinematic_worker_done = False
         self.cinematic_worker_error = ""
         self.cinematic_started_at = 0.0
+        self.cinematic_wait_started_at = time.monotonic()
         self.cinematic_photo = None
         threading.Thread(
             target=self.decode_cinematic_frames,
@@ -2475,17 +2538,35 @@ class MagnetArcadeGuard:
                 self.cinematic_pending_frame = None
 
         if self.cinematic_started_at == 0.0:
+            now = time.monotonic()
             buffered_frames = self.cinematic_frame_queue.qsize()
+            start_timed_out = (
+                self.cinematic_wait_started_at > 0.0
+                and now - self.cinematic_wait_started_at
+                >= CINEMATIC_START_TIMEOUT_SECONDS
+            )
+            if self.cinematic_pending_frame is None:
+                if self.cinematic_worker_done or start_timed_out:
+                    self.fault_disable_guard(
+                        "Sonic cinematic produced no playable video frames"
+                    )
+                    return
+                self.cinematic_after_id = self.root.after(
+                    10,
+                    self.poll_cinematic_playback,
+                )
+                return
             if (
-                self.cinematic_pending_frame is None
-                or buffered_frames + 1 < CINEMATIC_PREBUFFER_FRAMES
+                buffered_frames + 1 < CINEMATIC_PREBUFFER_FRAMES
+                and not self.cinematic_worker_done
+                and not start_timed_out
             ):
                 self.cinematic_after_id = self.root.after(
                     10,
                     self.poll_cinematic_playback,
                 )
                 return
-            self.cinematic_started_at = time.monotonic()
+            self.cinematic_started_at = now
             if not self.start_cinematic_audio():
                 self.fault_disable_guard(
                     "Could not play Sonic cinematic audio"
@@ -2493,6 +2574,14 @@ class MagnetArcadeGuard:
                 return
 
         elapsed = time.monotonic() - self.cinematic_started_at
+        if elapsed >= max(
+            30.0,
+            self.cinematic_duration + CINEMATIC_FINISH_GRACE_SECONDS,
+        ):
+            self.fault_disable_guard(
+                "Sonic cinematic playback timed out"
+            )
+            return
         latest_due_frame = None
         while (
             self.cinematic_pending_frame is not None
@@ -2530,6 +2619,8 @@ class MagnetArcadeGuard:
     def cancel_cinematic(self) -> None:
         self.cinematic_generation += 1
         self.cinematic_cancel_event.set()
+        self.cinematic_wait_started_at = 0.0
+        self.cinematic_story_wait_started_at = 0.0
         if self.cinematic_after_id is not None:
             try:
                 self.root.after_cancel(self.cinematic_after_id)
@@ -2576,7 +2667,12 @@ class MagnetArcadeGuard:
         except OSError:
             pass
 
-    def worker_entry(self, worker_name: str, worker) -> None:
+    def worker_entry(
+        self,
+        worker_name: str,
+        worker,
+        fault_disables_guard: bool = True,
+    ) -> None:
         try:
             worker()
         except Exception as error:
@@ -2589,11 +2685,54 @@ class MagnetArcadeGuard:
             ).replace("\n", " ")[-800:]
             self.messages.put(
                 (
-                    "FAULT",
+                    (
+                        "CORE_SERVICE_FAULT"
+                        if fault_disables_guard
+                        else "SERVICE_FAULT"
+                    ),
                     f"{worker_name} worker stopped: {detail}",
                     self.activation_generation,
                 )
             )
+
+    def schedule_ring_input_restart(self) -> None:
+        if (
+            not self.running
+            or self.ring_input_stop_event.is_set()
+            or self.ring_input_restart_after_id is not None
+        ):
+            return
+        delay_ms = min(
+            30000,
+            1000 * (2 ** min(self.ring_input_restart_count, 5)),
+        )
+        try:
+            self.ring_input_restart_after_id = self.root.after(
+                delay_ms,
+                self.restart_ring_input_worker,
+            )
+        except (AttributeError, tk.TclError):
+            self.ring_input_restart_after_id = None
+
+    def restart_ring_input_worker(self) -> None:
+        self.ring_input_restart_after_id = None
+        if not self.running or self.ring_input_stop_event.is_set():
+            return
+        if self.ring_input_thread and self.ring_input_thread.is_alive():
+            return
+        self.ring_input_restart_count += 1
+        self.joystick_button_states.clear()
+        self.ring_last_press_at.clear()
+        self.ring_input_thread = threading.Thread(
+            target=self.worker_entry,
+            args=("ring input", self.ring_input_worker, False),
+            daemon=True,
+        )
+        self.ring_input_thread.start()
+        self.write_status(
+            "RING INPUT RESTARTED | "
+            f"attempt={self.ring_input_restart_count}"
+        )
 
     def write_status(self, message: str, event: bool = True) -> None:
         try:
@@ -2789,13 +2928,6 @@ class MagnetArcadeGuard:
                         joystick_id,
                         0.0,
                     )
-                    if (
-                        ring_pressed
-                        and not was_ring_pressed
-                        and now - last_press_at >= RING_DEBOUNCE_SECONDS
-                    ):
-                        self.ring_last_press_at[joystick_id] = now
-                        self.messages.put(("RING", str(joystick_id), -1))
                     if new_buttons:
                         self.joystick_press_sequence = (
                             getattr(self, "joystick_press_sequence", 0) + 1
@@ -2807,6 +2939,16 @@ class MagnetArcadeGuard:
                                 -1,
                             )
                         )
+                    if (
+                        ring_pressed
+                        and not was_ring_pressed
+                        and now - last_press_at >= RING_DEBOUNCE_SECONDS
+                    ):
+                        # Queue the generic press first. This guarantees the
+                        # coin edge cannot race with and immediately dismiss
+                        # the Ring Power banner that the same scan creates.
+                        self.ring_last_press_at[joystick_id] = now
+                        self.messages.put(("RING", str(joystick_id), -1))
                     self.joystick_button_states[joystick_id] = buttons
 
                 for state_key in tuple(self.joystick_button_states):
@@ -2818,6 +2960,9 @@ class MagnetArcadeGuard:
                     sorted(live_keys)
                 )
                 self.ring_joystick_error = ""
+                self.ring_input_restart_count = 0
+                if self.service_warning.startswith("ring input"):
+                    self.service_warning = ""
             except Exception as error:
                 self.ring_joystick_error = str(error)[:120]
                 self.joystick_button_states.clear()
@@ -2828,14 +2973,32 @@ class MagnetArcadeGuard:
             if self.ring_input_stop_event.wait(0.01):
                 break
 
-    def ring_burst_is_eligible(self) -> bool:
+    def current_ring_burst_origin(self) -> Optional[str]:
         if not self.guard_active:
-            return False
+            return None
         if self.overlay_kind == "robotnik":
-            return True
+            if self.guard_mode == "normal":
+                return "normal_all_missing"
+            return "story_robotnik"
         if self.guard_mode == "normal" and self.accepted_count == 0:
-            return self.can_show_story_announcement()
-        return False
+            if self.can_show_story_announcement():
+                return "normal_all_missing"
+        return None
+
+    def ring_burst_is_eligible(self) -> bool:
+        return self.current_ring_burst_origin() is not None
+
+    def reset_ring_burst_state(
+        self,
+        clear_normal_lock: bool = False,
+    ) -> None:
+        self.ring_burst_active = False
+        self.ring_burst_game_seen = False
+        self.ring_burst_game_seen_since = 0.0
+        self.ring_burst_origin = None
+        self.ring_power_announcement_visible = False
+        if clear_normal_lock:
+            self.normal_ring_lock_active = False
 
     def handle_ring_entry(self) -> None:
         previous_total = self.ring_count
@@ -2855,18 +3018,21 @@ class MagnetArcadeGuard:
         )
 
         burst_started = False
-        if not self.ring_burst_active and self.ring_burst_is_eligible():
+        burst_origin = None
+        if not self.ring_burst_active:
+            burst_origin = self.current_ring_burst_origin()
+        if burst_origin is not None:
             burst_started = True
-            self.ring_burst_restore_robotnik = bool(
-                self.guard_mode == "story"
-                and self.story_intro_completed
-                and self.overlay_visible
-                and self.overlay_kind == "robotnik"
-            )
+            self.ring_burst_origin = burst_origin
+            if burst_origin == "normal_all_missing":
+                self.normal_ring_lock_active = True
             self.ring_burst_active = True
             self.ring_burst_game_seen = False
             self.ring_burst_game_seen_since = 0.0
-            self.write_status("RING BURST ACTIVE | waiting for a game")
+            self.write_status(
+                "RING BURST ACTIVE | waiting for a game | "
+                f"origin={burst_origin}"
+            )
 
             if self.overlay_visible:
                 self.hide_overlay()
@@ -2884,6 +3050,20 @@ class MagnetArcadeGuard:
 
     def reset_ring_count(self) -> None:
         previous_total = self.ring_count
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            # A reset invalidates the in-flight milestone transaction. Cancel
+            # its timeout without re-queuing or acknowledging the old total.
+            self.active_ring_announcement_kind = None
+            if self.announcement_after_id is not None:
+                try:
+                    self.root.after_cancel(self.announcement_after_id)
+                except (AttributeError, tk.TclError):
+                    pass
+                self.announcement_after_id = None
+            try:
+                self.announcement_window.withdraw()
+            except (AttributeError, tk.TclError):
+                pass
         self.ring_count = 0
         self.ring_milestones_shown.clear()
         self.ring_milestones_pending.clear()
@@ -2919,6 +3099,7 @@ class MagnetArcadeGuard:
         color: str,
         duration_seconds: Optional[float],
         allow_guard_overlay: bool = False,
+        timeout_callback=None,
     ) -> bool:
         guard_overlay_is_safe = (
             allow_guard_overlay
@@ -2984,13 +3165,56 @@ class MagnetArcadeGuard:
         except (AttributeError, tk.TclError):
             pass
 
+        if not self.announcement_window_matches_bounds(
+            banner_x,
+            banner_y,
+            banner_width,
+            banner_height,
+        ):
+            try:
+                self.announcement_window.withdraw()
+            except tk.TclError:
+                pass
+            self.write_status(
+                "RING ANNOUNCEMENT DEFERRED | window did not render correctly"
+            )
+            return False
+
         self.announcement_after_id = None
         if duration_seconds is not None:
             self.announcement_after_id = self.root.after(
                 int(duration_seconds * 1000),
-                self.hide_story_announcement,
+                timeout_callback or self.hide_story_announcement,
             )
         return True
+
+    def announcement_window_matches_bounds(
+        self,
+        expected_x: int,
+        expected_y: int,
+        expected_width: int,
+        expected_height: int,
+    ) -> bool:
+        try:
+            self.announcement_window.update_idletasks()
+            window_handle = self.announcement_window.winfo_id()
+            if not ctypes.windll.user32.IsWindowVisible(window_handle):
+                return False
+            window_rect = self.get_window_rect(window_handle)
+        except (AttributeError, tk.TclError):
+            return False
+        if window_rect is None:
+            return False
+        actual_left, actual_top, actual_right, actual_bottom = window_rect
+        actual_width = actual_right - actual_left
+        actual_height = actual_bottom - actual_top
+        tolerance = 4
+        return (
+            abs(actual_left - expected_x) <= tolerance
+            and abs(actual_top - expected_y) <= tolerance
+            and abs(actual_width - expected_width) <= tolerance
+            and abs(actual_height - expected_height) <= tolerance
+        )
 
     def request_ring_announcement(self, announcement_kind: str) -> None:
         priorities = {"count": 1, "burst": 2, "milestone": 3}
@@ -3014,6 +3238,8 @@ class MagnetArcadeGuard:
             getattr(self, "ring_power_announcement_visible", False)
             and not self.pending_ring_milestone
         ):
+            return
+        if getattr(self, "active_ring_announcement_kind", None) is not None:
             return
         if self.pending_ring_milestone:
             announcement_kind = "milestone"
@@ -3063,10 +3289,16 @@ class MagnetArcadeGuard:
             color,
             duration,
             allow_guard_overlay=True,
+            timeout_callback=(
+                self.complete_ring_milestone_announcement
+                if announcement_kind == "milestone"
+                else None
+            ),
         ):
             return
 
         self.pending_ring_announcement = None
+        self.active_ring_announcement_kind = announcement_kind
         if announcement_kind == "burst":
             self.ring_power_announcement_visible = True
             # The ring insertion that caused this announcement also produces
@@ -3081,18 +3313,34 @@ class MagnetArcadeGuard:
             )
             self.ring_power_ignore_until = time.monotonic() + 0.25
         if announcement_kind == "milestone":
-            self.pending_ring_milestone = False
-            self.ring_milestones_pending.discard(RING_MILESTONE)
-            self.ring_milestones_shown.add(RING_MILESTONE)
-            self.save_ring_state()
             self.write_status(
-                f"RING MILESTONE DISPLAYED | total={self.ring_count}"
+                f"RING MILESTONE DISPLAY STARTED | total={self.ring_count}"
             )
         else:
             self.write_status(
                 "RING COUNT DISPLAYED | "
                 f"kind={announcement_kind} | total={self.ring_count}"
             )
+
+    def complete_ring_milestone_announcement(self) -> None:
+        if self.active_ring_announcement_kind != "milestone":
+            return
+        self.active_ring_announcement_kind = None
+        self.pending_ring_milestone = False
+        self.pending_ring_announcement = None
+        self.ring_milestones_pending.discard(RING_MILESTONE)
+        self.ring_milestones_shown.add(RING_MILESTONE)
+        self.save_ring_state()
+        self.write_status(
+            f"RING MILESTONE DISPLAYED | total={self.ring_count}"
+        )
+        if getattr(self, "ring_burst_active", False):
+            # If the 50th ring also bought a one-game pass, the prize message
+            # gets its full uninterrupted display first, then the persistent
+            # Ring Power instructions take over.
+            self.pending_ring_announcement = "burst"
+        self.hide_story_announcement()
+        self.maybe_show_pending_ring_announcement()
 
     def handle_joystick_press(self, press_sequence=None) -> None:
         """Dismiss a persistent Ring Power banner on the next button press."""
@@ -3164,16 +3412,7 @@ class MagnetArcadeGuard:
     def recover_ring_burst_error(self, error: Exception) -> None:
         """Fail open after a Ring Power transition callback fails."""
         detail = str(error).replace("\n", " ")[:160]
-        restore_robotnik = bool(
-            self.ring_burst_restore_robotnik
-            and self.guard_mode == "story"
-            and self.story_intro_completed
-        )
-        self.ring_burst_active = False
-        self.ring_burst_game_seen = False
-        self.ring_burst_game_seen_since = 0.0
-        self.ring_burst_restore_robotnik = False
-        self.ring_power_announcement_visible = False
+        self.reset_ring_burst_state(clear_normal_lock=True)
         self.write_status(
             "RING BURST RECOVERED | fail-open | " + detail
         )
@@ -3186,14 +3425,16 @@ class MagnetArcadeGuard:
             except Exception:
                 pass
 
-        if (
-            restore_robotnik
-            and self.guard_active
-            and self.guard_mode == "story"
-            and self.story_intro_completed
+        # A Ring Power transition controls the release and later restoration
+        # of Big Box. If that state machine itself fails, do not guess which
+        # screen should be restored. Disable the guard and release the arcade.
+        if self.guard_active or getattr(
+            self,
+            "suspended_process_handle",
+            None,
         ):
-            self.pending_overlay_missing = (
-                TOTAL_EMERALDS - (self.accepted_count or 0)
+            self.fault_disable_guard(
+                "Ring Power transition failed: " + detail
             )
 
     def maybe_show_pending_ring_milestone(self) -> None:
@@ -3204,15 +3445,8 @@ class MagnetArcadeGuard:
         if not self.ring_burst_active:
             return
 
-        restore_robotnik = getattr(
-            self,
-            "ring_burst_restore_robotnik",
-            False,
-        )
-        self.ring_burst_active = False
-        self.ring_burst_game_seen = False
-        self.ring_burst_game_seen_since = 0.0
-        self.ring_burst_restore_robotnik = False
+        burst_origin = getattr(self, "ring_burst_origin", None)
+        self.reset_ring_burst_state()
         self.write_status("RING BURST CONSUMED | Big Box returned")
         # The persistent Ring Power banner belongs to the one-game access
         # period. Never leave it above the restored Robotnik screen.
@@ -3224,16 +3458,24 @@ class MagnetArcadeGuard:
         if not self.guard_active:
             return
 
-        if (
-            restore_robotnik
-            and self.guard_mode == "story"
-            and self.story_intro_completed
-        ):
+        if burst_origin == "story_robotnik" and self.guard_mode == "story":
             if self.accepted_count == TOTAL_EMERALDS:
                 self.show_missing_overlay(0)
                 if self.guard_active and self.overlay_kind == "robotnik":
                     self.begin_final_emerald_transition()
                 return
+            self.pending_overlay_missing = (
+                TOTAL_EMERALDS - (self.accepted_count or 0)
+            )
+            self.maybe_show_pending_overlay()
+            return
+
+        if burst_origin == "normal_all_missing" and self.guard_mode == "normal":
+            if self.accepted_count == TOTAL_EMERALDS:
+                self.normal_ring_lock_active = False
+                self.pending_overlay_missing = None
+                return
+            self.normal_ring_lock_active = True
             self.pending_overlay_missing = (
                 TOTAL_EMERALDS - (self.accepted_count or 0)
             )
@@ -3246,6 +3488,23 @@ class MagnetArcadeGuard:
         self.update_overlay_gate()
         now = time.monotonic()
         if self.foreground_process_name in EMULATOR_PROCESS_NAMES:
+            # No small topmost window is ever allowed to survive into a game,
+            # even if the joystick edge that normally dismisses Ring Power was
+            # missed by Windows or by a fast coin-switch pulse.
+            if (
+                getattr(self, "ring_power_announcement_visible", False)
+                or getattr(self, "announcement_after_id", None) is not None
+            ):
+                try:
+                    self.hide_story_announcement()
+                    self.write_status(
+                        "RING ANNOUNCEMENT HIDDEN | emulator foreground"
+                    )
+                except Exception as error:
+                    self.recover_ring_ui_error(
+                        "emulator transition",
+                        error,
+                    )
             if self.ring_burst_game_seen_since == 0.0:
                 self.ring_burst_game_seen_since = now
                 self.write_status("RING BURST GAME LAUNCH DETECTED")
@@ -3264,8 +3523,6 @@ class MagnetArcadeGuard:
         )
         if (
             big_box_ready
-            and self.guard_mode == "story"
-            and self.story_intro_completed
             and self.accepted_count == TOTAL_EMERALDS
         ):
             self.consume_ring_burst_on_return()
@@ -3302,16 +3559,20 @@ class MagnetArcadeGuard:
         ).replace("\n", " ")[-1000:]
         self.write_status("UNHANDLED APP ERROR | " + detail)
 
-        if self.guard_active or self.suspended_process_handle:
+        # Fail open only when an exception can strand the arcade behind our
+        # window or while Big Box is suspended. A panel or small-banner error
+        # must not stop otherwise healthy sensor monitoring.
+        if self.overlay_visible or self.suspended_process_handle:
             self.fault_disable_guard(
                 "Application error: " + detail[-140:]
             )
         else:
-            self.last_fault = (
-                "Application error — guard remains disabled: "
-                + detail[-120:]
+            self.service_warning = (
+                "Noncritical application error: " + detail[-120:]
             )
-            self.overlay_gate_state = "DISABLED_ERROR"
+            self.write_status(
+                "NONCRITICAL APP ERROR | monitoring continues"
+            )
 
     def create_control_panel(self) -> None:
         self.control_window = tk.Toplevel(self.root)
@@ -3460,10 +3721,20 @@ class MagnetArcadeGuard:
 
     def get_control_state(self) -> tuple[str, str]:
         mode_name = "STORY" if self.guard_mode == "story" else "NORMAL"
+        if self.pending_guard_activation:
+            return (
+                f"{mode_name} MODE — WAITING FOR SAFE CLEANUP",
+                "#ffcc66",
+            )
         if not self.guard_active:
             if self.last_fault:
                 return "DISABLED — " + self.last_fault, "#ff9966"
             return f"{mode_name} MODE SELECTED — GUARD OFF", "#9e9e9e"
+
+        if self.ring_burst_active:
+            if self.ring_burst_game_seen_since:
+                return "RING POWER — GAME ACCESS IN USE", "#66ff99"
+            return "RING POWER — ONE GAME READY", "#66ff99"
 
         if self.completion_in_progress:
             return "SONIC VICTORY SCREEN", "#66ccff"
@@ -3539,6 +3810,7 @@ class MagnetArcadeGuard:
             if self.ring_state_warning
             else "primary + backup OK"
         )
+        service_text = self.service_warning or "none"
         details_text = (
             f"Reader: {reader_text}    "
             f"Foreground: {self.foreground_process_name}\n"
@@ -3546,6 +3818,7 @@ class MagnetArcadeGuard:
             f"Input: {input_text}\n"
             f"Rings entered: {self.ring_count}    "
             f"Ring data: {ring_data_text}\n"
+            f"Service warning: {service_text}\n"
             f"Ring input: {ring_input_text}\n"
             "Return SFX: ready    Removal SFX: "
             + ("ready" if self.removal_sound is not None else "not installed")
@@ -3558,7 +3831,11 @@ class MagnetArcadeGuard:
         self.control_details_var.set(details_text)
         self.control_state_label.configure(foreground=state_color)
         self.control_deactivate_button.configure(
-            state=tk.NORMAL if self.guard_active else tk.DISABLED
+            state=(
+                tk.NORMAL
+                if self.guard_active or self.pending_guard_activation
+                else tk.DISABLED
+            )
         )
         story_selected = self.guard_mode == "story"
         self.control_story_button.configure(
@@ -3620,7 +3897,11 @@ class MagnetArcadeGuard:
             f"input_blocked_pid={self.suspended_process_id or 'none'} | "
             f"foreground={self.foreground_process_name} | "
             f"gate={self.overlay_gate_state} | "
-            f"pending_missing={self.pending_overlay_missing}",
+            f"pending_missing={self.pending_overlay_missing} | "
+            f"ring_burst={self.ring_burst_active} | "
+            f"ring_origin={self.ring_burst_origin or 'none'} | "
+            f"normal_ring_lock={self.normal_ring_lock_active} | "
+            f"pending_prize={self.pending_ring_milestone}",
             event=False,
         )
 
@@ -3634,22 +3915,6 @@ class MagnetArcadeGuard:
         try:
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
-
-            # Ring Power resumes Big Box so it can launch an emulator. Once an
-            # emulator owns the foreground, a delayed focus retry must never
-            # pull focus back to Big Box or interfere with the display-mode
-            # transition.
-            if self.ring_burst_active:
-                foreground_window = user32.GetForegroundWindow()
-                foreground_process = self.get_window_process_name(
-                    foreground_window
-                )
-                if foreground_process in EMULATOR_PROCESS_NAMES:
-                    self.return_window_handle = 0
-                    self.write_status(
-                        "FOCUS RESTORE ENDED | emulator owns foreground"
-                    )
-                    return
             user32.GetWindowThreadProcessId.argtypes = [
                 ctypes.c_void_p,
                 ctypes.POINTER(ctypes.c_ulong),
@@ -4169,8 +4434,14 @@ class MagnetArcadeGuard:
             )
             if self.ring_burst_active:
                 self.recover_ring_burst_error(error)
-            elif self.guard_active:
+            elif self.overlay_visible or self.suspended_process_handle:
                 self.fault_disable_guard("Application error")
+            else:
+                self.service_warning = (
+                    "Foreground monitor recovered: "
+                    + detail[-120:]
+                )
+                self.reset_big_box_readiness()
 
         if self.running:
             self.root.after(250, self.foreground_watchdog)
@@ -4401,6 +4672,25 @@ class MagnetArcadeGuard:
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
 
+            # Ring Power resumes Big Box so it can launch an emulator. Once an
+            # emulator owns the foreground, a delayed focus retry must never
+            # pull focus back to Big Box or interfere with the display-mode
+            # transition. Keep this check here instead of process-name lookup;
+            # putting it there recursively called get_window_process_name().
+            if self.ring_burst_active:
+                foreground_window = user32.GetForegroundWindow()
+                if (
+                    foreground_window
+                    and foreground_window != window_handle
+                    and self.get_window_process_name(foreground_window)
+                    in EMULATOR_PROCESS_NAMES
+                ):
+                    self.return_window_handle = 0
+                    self.write_status(
+                        "FOCUS RESTORE ENDED | emulator owns foreground"
+                    )
+                    return
+
             if not user32.IsWindow(window_handle):
                 self.return_window_handle = 0
                 self.write_status(
@@ -4453,11 +4743,13 @@ class MagnetArcadeGuard:
                     + self.describe_window(window_handle)
                 )
                 self.return_window_handle = 0
-            elif attempt < (3 if self.ring_burst_active else 20):
+            elif attempt < 20:
                 # Windows may reject the first foreground request when the
                 # overlay has just closed. Retry while retaining the original
                 # handle instead of falling back to whichever window happens
-                # to be active on another monitor.
+                # to be active on another monitor. Ring Power retries are safe
+                # too because the emulator-foreground check above ends them
+                # before they can pull focus away from a launched game.
                 if self.running:
                     self.root.after(
                         100,
@@ -4951,72 +5243,140 @@ class MagnetArcadeGuard:
             return
 
     def hide_overlay(self, stop_music: bool = True) -> None:
-        self.hide_story_announcement()
+        cleanup_warnings = []
         self.overlay_visible = False
         self.overlay_kind = None
-        self.cancel_audio_watchdog()
-        self.hide_energy_meter()
-        self.set_control_panel_visible(False)
-        self.reset_counter_style()
 
+        cleanup_steps = [
+            ("announcement", self.hide_story_announcement),
+            ("audio watchdog", self.cancel_audio_watchdog),
+            ("energy meter", self.hide_energy_meter),
+            ("control panel", lambda: self.set_control_panel_visible(False)),
+            ("counter style", self.reset_counter_style),
+        ]
         if stop_music:
-            self.stop_music()
-            self.stop_event_sound()
+            cleanup_steps.extend(
+                [
+                    ("music", self.stop_music),
+                    ("event sound", self.stop_event_sound),
+                ]
+            )
+
+        for cleanup_name, cleanup_action in cleanup_steps:
+            try:
+                cleanup_action()
+            except Exception as error:
+                cleanup_warnings.append(
+                    f"{cleanup_name}: "
+                    + str(error).replace("\n", " ")[:100]
+                )
 
         try:
             self.root.attributes("-topmost", False)
-        except tk.TclError:
+        except (AttributeError, tk.TclError):
             pass
 
-        self.set_overlay_z_order(False)
+        try:
+            self.set_overlay_z_order(False)
+        except Exception as error:
+            cleanup_warnings.append(
+                "z-order: " + str(error).replace("\n", " ")[:100]
+            )
         try:
             self.root.withdraw()
-        except tk.TclError:
+        except (AttributeError, tk.TclError):
             pass
-        # Big Box is still suspended while an ordinary takeover is being
-        # closed. Ring Power is the one transition that immediately hands the
-        # menu back for a game, so resume it before restoring its audio
-        # session; otherwise Windows can reject the volume/mute restoration
-        # and unnecessarily disable the guard.
-        if self.ring_burst_active:
-            self.resume_return_process()
+
+        # Input access is the highest-priority invariant. Always resume Big
+        # Box before touching its audio session, regardless of why the overlay
+        # is closing. Windows can reject session restoration while the target
+        # process is suspended, and an audio problem must never keep controls
+        # blocked.
+        try:
+            self.resume_and_restore_return_window()
+        except Exception as error:
+            cleanup_warnings.append(
+                "input release: " + str(error).replace("\n", " ")[:100]
+            )
+            self.write_status(
+                "FATAL CLEANUP ERROR | resume helper remains armed"
+            )
+            self.last_fault = "Could not release Big Box controls"
+            if self.running:
+                try:
+                    self.root.after(0, self.exit_program)
+                except (AttributeError, tk.TclError):
+                    pass
 
         audio_restored = self.restore_other_audio_with_retries()
         if not audio_restored:
-            if self.ring_burst_active:
-                self.write_status(
-                    "RING BURST AUDIO RESTORE DEFERRED | retrying"
-                )
-                if self.running:
-                    self.root.after(
-                        250,
-                        self.retry_ring_burst_audio_restore,
-                    )
-            else:
+            self.schedule_audio_restore_retry()
+            if not self.ring_burst_active:
                 if not self.last_fault:
                     self.last_fault = "Could not restore background audio"
+                if self.guard_active:
+                    self.activation_generation += 1
                 self.guard_active = False
+                self.reader_connected = False
                 self.overlay_gate_state = "DISABLED_ERROR"
                 self.write_status(
                     "GUARD DISABLED | could not restore background audio"
                 )
-        self.resume_and_restore_return_window()
+            else:
+                self.write_status(
+                    "RING BURST AUDIO RESTORE DEFERRED | retrying"
+                )
 
-    def retry_ring_burst_audio_restore(self, attempt: int = 0) -> None:
-        if not self.running or not self.ring_burst_active:
-            return
-        if self.restore_other_audio_with_retries():
-            self.write_status("RING BURST AUDIO RESTORED")
-            return
-        if attempt < 12:
-            self.root.after(
-                250,
-                lambda: self.retry_ring_burst_audio_restore(attempt + 1),
+        if cleanup_warnings:
+            self.write_status(
+                "OVERLAY CLEANUP RECOVERED | "
+                + " | ".join(cleanup_warnings)[:500]
             )
+
+    def schedule_audio_restore_retry(self) -> None:
+        if not self.running or self.audio_restore_retry_after_id is not None:
             return
-        self.write_status(
-            "RING BURST AUDIO RESTORE STILL PENDING | continuing safely"
+        try:
+            self.audio_restore_retry_after_id = self.root.after(
+                250,
+                self.retry_pending_audio_restore,
+            )
+        except (AttributeError, tk.TclError):
+            self.audio_restore_retry_after_id = None
+            self.write_status(
+                "DEFERRED AUDIO RESTORE COULD NOT BE SCHEDULED"
+            )
+
+    def retry_pending_audio_restore(self) -> None:
+        self.audio_restore_retry_after_id = None
+        if not self.running:
+            return
+        if not self.audio_muted or self.restore_other_audio_with_retries():
+            self.audio_restore_retry_attempt = 0
+            self.write_status("DEFERRED AUDIO RESTORE COMPLETE")
+            self.complete_pending_activation()
+            return
+
+        self.audio_restore_retry_attempt += 1
+        if self.audio_restore_retry_attempt in {1, 10, 30}:
+            self.write_status(
+                "DEFERRED AUDIO RESTORE RETRY | "
+                f"attempt={self.audio_restore_retry_attempt}"
+            )
+        retry_delay = min(
+            5000,
+            250 * (1 + self.audio_restore_retry_attempt // 4),
         )
+        try:
+            self.audio_restore_retry_after_id = self.root.after(
+                retry_delay,
+                self.retry_pending_audio_restore,
+            )
+        except (AttributeError, tk.TclError):
+            self.audio_restore_retry_after_id = None
+            self.write_status(
+                "DEFERRED AUDIO RESTORE STOPPED | callback unavailable"
+            )
 
     def show_completion_message(self) -> None:
         if self.completion_in_progress:
@@ -5027,6 +5387,7 @@ class MagnetArcadeGuard:
         self.completion_animation_finished = False
         self.final_completion_sound_started = False
         self.final_completion_sound_playing = False
+        self.final_completion_sound_started_at = 0.0
         self.reset_counter_style()
         self.hide_energy_meter()
 
@@ -5281,6 +5642,7 @@ class MagnetArcadeGuard:
 
         self.final_emerald_sound_started = False
         self.final_emerald_pause_started_at = None
+        self.final_emerald_wait_started_at = 0.0
 
     def begin_final_emerald_transition(self) -> None:
         self.cancel_final_emerald_transition()
@@ -5295,6 +5657,7 @@ class MagnetArcadeGuard:
             final=True
         )
         self.final_emerald_pause_started_at = None
+        self.final_emerald_wait_started_at = time.monotonic()
         self.final_emerald_after_id = self.root.after(
             50,
             self.wait_for_final_emerald_transition,
@@ -5312,11 +5675,19 @@ class MagnetArcadeGuard:
             return
 
         if self.final_emerald_sound_started and self.event_channel_busy():
-            self.final_emerald_after_id = self.root.after(
-                50,
-                self.wait_for_final_emerald_transition,
+            if (
+                time.monotonic() - self.final_emerald_wait_started_at
+                < EVENT_SOUND_MAX_SECONDS
+            ):
+                self.final_emerald_after_id = self.root.after(
+                    50,
+                    self.wait_for_final_emerald_transition,
+                )
+                return
+            self.write_status(
+                "FINAL EMERALD SOUND TIMED OUT | continuing victory"
             )
-            return
+            self.stop_event_sound()
 
         now = time.monotonic()
         if self.final_emerald_pause_started_at is None:
@@ -5381,9 +5752,18 @@ class MagnetArcadeGuard:
             )
             or elapsed >= COMPLETION_MAX_SECONDS
         )
+        if (
+            elapsed >= COMPLETION_MAX_SECONDS
+            and not self.completion_animation_finished
+        ):
+            self.write_status(
+                "VICTORY ANIMATION TIMED OUT | continuing safely"
+            )
+            self.start_supersonic_animation()
         if victory_audio_done and self.completion_animation_finished:
             if not self.final_completion_sound_started:
                 self.final_completion_sound_started = True
+                self.final_completion_sound_started_at = time.monotonic()
                 self.final_completion_sound_playing = (
                     self.play_event_sound(
                         self.final_completion_sound,
@@ -5395,11 +5775,20 @@ class MagnetArcadeGuard:
 
             if self.final_completion_sound_playing:
                 if self.event_channel_busy():
-                    self.completion_after_id = self.root.after(
-                        100,
-                        self.wait_for_completion_audio,
+                    if (
+                        time.monotonic()
+                        - self.final_completion_sound_started_at
+                        < EVENT_SOUND_MAX_SECONDS
+                    ):
+                        self.completion_after_id = self.root.after(
+                            100,
+                            self.wait_for_completion_audio,
+                        )
+                        return
+                    self.write_status(
+                        "FINAL VICTORY SOUND TIMED OUT | closing safely"
                     )
-                    return
+                    self.stop_event_sound()
                 self.final_completion_sound_playing = False
 
             self.finish_completion()
@@ -5425,6 +5814,7 @@ class MagnetArcadeGuard:
             self.completion_in_progress = False
             self.final_completion_sound_started = False
             self.final_completion_sound_playing = False
+            self.final_completion_sound_started_at = 0.0
             self.hide_overlay()
             if completed_story:
                 self.guard_mode = "normal"
@@ -5457,6 +5847,7 @@ class MagnetArcadeGuard:
             self.stop_event_sound()
         self.final_completion_sound_started = False
         self.final_completion_sound_playing = False
+        self.final_completion_sound_started_at = 0.0
 
     def keep_window_on_top(self) -> None:
         if self.running and self.overlay_visible:
@@ -5789,6 +6180,40 @@ class MagnetArcadeGuard:
         if current_count == previous_count:
             return
 
+        # A Normal Mode Ring Power pass creates a real all-missing lock that
+        # must return after the one permitted game. Sensor updates still get
+        # accepted during the pass, but presentation waits until Big Box is
+        # safely back. Returning all seven cancels the lock entirely.
+        if (
+            getattr(self, "ring_burst_active", False)
+            and getattr(self, "ring_burst_origin", None)
+            == "normal_all_missing"
+        ):
+            return
+
+        if getattr(self, "normal_ring_lock_active", False):
+            if current_count == TOTAL_EMERALDS:
+                self.normal_ring_lock_active = False
+                self.pending_overlay_missing = None
+                if self.overlay_kind == "robotnik":
+                    self.hide_overlay()
+                self.play_emerald_sound()
+                return
+
+            self.request_missing_overlay(
+                TOTAL_EMERALDS - current_count
+            )
+            if not self.guard_active:
+                return
+            self.animate_energy_meter(previous_count, current_count)
+            if current_count > previous_count:
+                self.play_emerald_sound()
+                self.animate_counter("returned")
+            else:
+                self.play_removal_sound()
+                self.animate_counter("removed")
+            return
+
         if current_count > previous_count:
             if (
                 self.overlay_kind == "normal_warning"
@@ -5828,10 +6253,13 @@ class MagnetArcadeGuard:
         self.fault_disable_guard(reason or "ESP32 disconnected")
 
     def process_messages(self) -> None:
-        try:
-            while True:
+        while True:
+            try:
                 message_type, value, generation = self.messages.get_nowait()
+            except queue.Empty:
+                break
 
+            try:
                 if message_type == "CONTROL":
                     if value == "EXIT":
                         self.exit_program()
@@ -5852,6 +6280,22 @@ class MagnetArcadeGuard:
                     self.handle_joystick_press(value)
                     continue
 
+                if message_type == "SERVICE_FAULT":
+                    self.service_warning = value[:160]
+                    if value.startswith("ring input"):
+                        self.ring_joystick_error = value[:120]
+                        self.schedule_ring_input_restart()
+                    self.write_status(
+                        "NONCRITICAL SERVICE ERROR | " + value[:500]
+                    )
+                    continue
+
+                if message_type == "CORE_SERVICE_FAULT":
+                    self.serial_worker_failed = True
+                    self.service_warning = value[:160]
+                    self.fault_disable_guard(value)
+                    continue
+
                 if generation != self.activation_generation:
                     continue
 
@@ -5863,18 +6307,23 @@ class MagnetArcadeGuard:
 
                 elif message_type == "FAULT":
                     self.fault_disable_guard(value)
-
-        except queue.Empty:
-            pass
-        except Exception as error:
-            detail = str(error).replace("\n", " ")[:160]
-            self.write_status(
-                "MESSAGE LOOP RECOVERED | " + detail
-            )
-            if self.ring_burst_active:
-                self.recover_ring_burst_error(error)
-            elif self.guard_active:
-                self.fault_disable_guard("Application error")
+            except Exception as error:
+                detail = str(error).replace("\n", " ")[:160]
+                self.write_status(
+                    f"MESSAGE RECOVERED | type={message_type} | {detail}"
+                )
+                if message_type in {"RING", "JOYSTICK_PRESS"}:
+                    if self.ring_burst_active:
+                        self.recover_ring_burst_error(error)
+                    else:
+                        self.recover_ring_ui_error(
+                            message_type.lower(),
+                            error,
+                        )
+                elif self.guard_active or self.suspended_process_handle:
+                    self.fault_disable_guard(
+                        f"{message_type} processing failed: {detail}"
+                    )
 
         try:
             self.accept_stable_count()
@@ -5908,6 +6357,11 @@ class MagnetArcadeGuard:
     def guard_readiness_error(self) -> str:
         problems = list(CONFIG_VALIDATION_ERRORS)
 
+        if getattr(self, "serial_worker_failed", False):
+            problems.append(
+                "ESP32 serial service stopped; restart the guard application"
+            )
+
         if self.guard_mode == "story":
             if not PIL_AVAILABLE:
                 problems.append("Pillow image support unavailable")
@@ -5937,6 +6391,13 @@ class MagnetArcadeGuard:
                     "cinematic preparation failed: "
                     + (self.cinematic_prepare_error or "unknown error")
                 )
+            elif (
+                self.cinematic_prepare_state == "preparing"
+                and self.cinematic_prepare_started_at
+                and time.monotonic() - self.cinematic_prepare_started_at
+                >= CINEMATIC_PREPARE_TIMEOUT_SECONDS
+            ):
+                problems.append("cinematic preparation timed out")
 
         if not PYCAW_AVAILABLE:
             problems.append("background-audio muting unavailable")
@@ -5952,16 +6413,77 @@ class MagnetArcadeGuard:
     def select_guard_mode(self, mode: str) -> None:
         if mode not in {"story", "normal"} or not self.running:
             return
-        if self.guard_active:
+        if mode == self.guard_mode and self.guard_active:
+            self.write_status(f"MODE ALREADY ACTIVE | {mode.upper()}")
+            return
+        if (
+            self.guard_active
+            or self.overlay_visible
+            or self.suspended_process_handle
+        ):
             self._deactivate_guard(None)
         self.guard_mode = mode
         self.last_fault = ""
         self.write_status(f"MODE SELECTED | {mode.upper()}")
+        self.pending_guard_activation = True
+        self.activate_guard()
+
+    def cancel_pending_activation(self) -> None:
+        self.pending_guard_activation = False
+        if self.activation_retry_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.activation_retry_after_id)
+        except (AttributeError, tk.TclError):
+            pass
+        self.activation_retry_after_id = None
+
+    def schedule_pending_activation(self) -> None:
+        if (
+            not self.running
+            or not self.pending_guard_activation
+            or self.activation_retry_after_id is not None
+        ):
+            return
+        try:
+            self.activation_retry_after_id = self.root.after(
+                100,
+                self.complete_pending_activation,
+            )
+        except (AttributeError, tk.TclError):
+            self.activation_retry_after_id = None
+            self.last_fault = "Could not schedule safe guard activation"
+            self.pending_guard_activation = False
+            self.overlay_gate_state = "DISABLED_ERROR"
+            self.write_status("GUARD DISABLED | " + self.last_fault)
+
+    def complete_pending_activation(self) -> None:
+        self.activation_retry_after_id = None
+        if not self.running or not self.pending_guard_activation:
+            return
+        if self.guard_active:
+            self.pending_guard_activation = False
+            return
+        if self.suspended_process_handle or self.audio_muted:
+            self.schedule_pending_activation()
+            return
+        self.pending_guard_activation = False
         self.activate_guard()
 
     def activate_guard(self) -> None:
         if self.guard_active or not self.running:
             return
+
+        if self.suspended_process_handle or self.audio_muted:
+            self.pending_guard_activation = True
+            self.overlay_gate_state = "WAITING_FOR_CLEANUP"
+            self.write_status(
+                "ACTIVATION WAITING | releasing prior overlay side effects"
+            )
+            self.schedule_pending_activation()
+            return
+
+        self.cancel_pending_activation()
 
         self.activation_generation += 1
         readiness_error = self.guard_readiness_error()
@@ -5981,10 +6503,7 @@ class MagnetArcadeGuard:
         self.story_armed = False
         self.story_cycle_started = False
         self.story_intro_completed = False
-        self.ring_burst_active = False
-        self.ring_burst_game_seen = False
-        self.ring_burst_game_seen_since = 0.0
-        self.ring_burst_restore_robotnik = False
+        self.reset_ring_burst_state(clear_normal_lock=True)
         self.controller_lost = True
         self.reader_connected = False
         self.overlay_gate_state = "WAITING_FOR_SENSOR"
@@ -5995,6 +6514,7 @@ class MagnetArcadeGuard:
         if not self.running:
             return "break"
 
+        self.cancel_pending_activation()
         self._deactivate_guard(None)
         return "break"
 
@@ -6006,6 +6526,7 @@ class MagnetArcadeGuard:
         self._deactivate_guard(clean_reason)
 
     def _deactivate_guard(self, fault_reason: Optional[str]) -> None:
+        self.cancel_pending_activation()
         self.activation_generation += 1
         if fault_reason:
             self.last_fault = fault_reason
@@ -6021,23 +6542,55 @@ class MagnetArcadeGuard:
         self.accepted_count = None
         self.pending_overlay_missing = None
         self.pending_normal_warning = None
-        self.hide_story_announcement()
-        self.cancel_story_sequence()
-        self.cancel_normal_warning()
         self.story_armed = False
         self.story_cycle_started = False
         self.story_intro_completed = False
-        self.ring_burst_active = False
-        self.ring_burst_game_seen = False
-        self.ring_burst_game_seen_since = 0.0
-        self.ring_burst_restore_robotnik = False
-        self.cancel_completion()
+        self.reset_ring_burst_state(clear_normal_lock=True)
         self.completion_in_progress = False
         self.reset_big_box_readiness()
         self.overlay_gate_state = (
             "DISABLED_ERROR" if fault_reason else "DORMANT"
         )
-        self.hide_overlay()
+
+        for cleanup_name, cleanup_action in (
+            ("announcement", self.hide_story_announcement),
+            ("story sequence", self.cancel_story_sequence),
+            ("normal warning", self.cancel_normal_warning),
+            ("completion", self.cancel_completion),
+        ):
+            try:
+                cleanup_action()
+            except Exception as error:
+                self.write_status(
+                    "DEACTIVATION CLEANUP RECOVERED | "
+                    f"{cleanup_name} | "
+                    + str(error).replace("\n", " ")[:120]
+                )
+
+        try:
+            self.hide_overlay()
+        except Exception as error:
+            # No cleanup exception may strand Big Box. The independently
+            # launched resume watchdog remains armed until resume succeeds.
+            self.write_status(
+                "DEACTIVATION EMERGENCY RELEASE | "
+                + str(error).replace("\n", " ")[:160]
+            )
+            self.overlay_visible = False
+            self.overlay_kind = None
+            try:
+                self.root.withdraw()
+            except (AttributeError, tk.TclError):
+                pass
+            try:
+                self.resume_and_restore_return_window()
+            except Exception:
+                pass
+            try:
+                if not self.restore_other_audio_with_retries():
+                    self.schedule_audio_restore_retry()
+            except Exception:
+                pass
 
     def global_service_hotkey_worker(self) -> None:
         try:
@@ -6074,11 +6627,16 @@ class MagnetArcadeGuard:
             exit_pressed = keyboard_combo_pressed
             deactivate_pressed = (
                 ctrl_alt_f11_pressed
-                and self.guard_active
+                and (
+                    self.guard_active
+                    or self.pending_guard_activation
+                )
             )
             story_mode_pressed = ctrl_alt_f10_pressed
             activate_pressed = (
-                ctrl_alt_f12_pressed and not self.guard_active
+                ctrl_alt_f12_pressed
+                and not self.guard_active
+                and not self.pending_guard_activation
             )
 
             if exit_pressed and not was_exit_pressed:
@@ -6130,6 +6688,8 @@ class MagnetArcadeGuard:
         self.guard_active = False
         self.activation_generation += 1
         self.overlay_visible = False
+        self.pending_guard_activation = False
+        self.reset_ring_burst_state(clear_normal_lock=True)
 
         try:
             self.hide_story_announcement()
@@ -6150,11 +6710,6 @@ class MagnetArcadeGuard:
             self.root.withdraw()
         except (AttributeError, tk.TclError):
             pass
-
-        if not self.restore_other_audio_with_retries(attempts=10):
-            self.write_status(
-                "CLEANUP WARNING | background audio restore failed"
-            )
 
         resumed = False
         for attempt in range(10):
@@ -6181,6 +6736,13 @@ class MagnetArcadeGuard:
                     pass
                 self.suspended_process_handle = None
                 self.suspended_process_id = 0
+
+        # Resume input first. Audio APIs are less reliable against a suspended
+        # target process, and playable controls take priority over sound.
+        if not self.restore_other_audio_with_retries(attempts=10):
+            self.write_status(
+                "CLEANUP WARNING | background audio restore failed"
+            )
 
         if self.audio_ready:
             try:

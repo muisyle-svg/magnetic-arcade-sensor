@@ -61,21 +61,25 @@ still allowing rings to be entered quickly.
   emulator.
 - When the Robotnik screen is active, one ring hides the takeover and gives a
   one-game Ring Power burst. The Ring Power banner remains visible until the
-  next joystick button press; rings inserted during that game are counted but
-  never extend the burst.
+  next joystick button press, or is removed automatically as soon as an
+  emulator takes the foreground; rings inserted during that game are counted
+  but never extend the burst.
 - In Normal Mode, the same burst is available when all seven emeralds are
-  missing.
+  missing. After the permitted game returns to Big Box, the Robotnik lock
+  screen is restored in either mode while any emeralds are still absent. In
+  Normal Mode it closes immediately once all seven are returned.
 - The burst remains available while the menu is idle. It becomes consumed after
   an emulator has actually become foreground and Big Box has safely returned;
   even a very brief game launch is treated as using the burst. A launch that
   never reaches an emulator remains available for another attempt.
-  The Robotnik
-  screen is then restored in Story Mode if emeralds are still missing.
+  The Robotnik screen is then restored if emeralds are still missing.
 - At the first total of 50 rings, the non-blocking message `50 RINGS!` and
   `Find Alex for your prize!` is shown for at least 10 seconds when Big Box is
   safely visible. If a game is active at that moment, the message remains
-  pending and is shown the next time Big Box returns. That pending prize message
-  is persisted, so closing or restarting the guard cannot lose it.
+  pending and is shown the next time Big Box returns. If its ten-second display
+  is interrupted by a game, mode switch, emerald event, or shutdown, it is
+  re-queued instead of being marked delivered. That pending prize message is
+  persisted, so closing or restarting the guard cannot lose it.
 
 ## LED energy meter
 
@@ -114,7 +118,21 @@ Upload `magnet_test\magnet_test.ino` with Arduino IDE set to `XIAO_ESP32C3` and 
 
 ## Fail-open behavior
 
-The guard favors access to the arcade over lockout. An ESP32 disconnect, heartbeat timeout, media/decoder failure, overlay failure, audio failure, or internal callback failure disables the guard, restores Big Box input/audio, and leaves the guard off until an operator activates it again. A helper process also resumes Big Box if the main process crashes while Big Box is paused.
+The guard favors access to the arcade over lockout. An ESP32 disconnect,
+heartbeat timeout, takeover/media failure, incorrectly rendered full-screen
+window, or failure inside a Ring Power handoff disables the guard, restores Big
+Box input before attempting audio cleanup, and leaves the guard off until an
+operator activates it again. Cinematic startup, cinematic playback, final
+emerald audio, and victory callbacks have explicit deadlines so no damaged
+media or stuck audio channel can hold the arcade forever. A helper process also
+resumes Big Box if the main process crashes while Big Box is paused.
+
+Noncritical failures are isolated. A ring-count banner or operator-panel error
+does not disable healthy emerald monitoring, and a failed ring-input worker is
+automatically restarted with bounded backoff. If the core serial worker itself
+stops, reactivation is blocked with a visible restart-app message instead of
+waiting forever for sensor data that cannot arrive. Mode selection waits for
+any previous input/audio cleanup to finish before reactivating.
 
 Only one guard instance can run at a time.
 
@@ -165,7 +183,8 @@ Keep `guard-config.json` beside `MagnetArcadeGuardRings.exe`.
 - `ring_joystick_button`: human-numbered joystick button used for rings; default `10`.
 - `ring_debounce_ms`: short anti-bounce interval; default `90` ms.
 - `ring_game_commit_seconds`: how long an emulator must remain active before one Ring Power use is committed; default `3.0` seconds. Returning to Big Box restores the Robotnik screen if it granted the burst.
-- `ring_announcement_seconds`: how long the 50-ring message remains visible; default `5.0`.
+- `ring_announcement_seconds`: how long ordinary ring-count messages remain visible; default `5.0`.
+- `ring_milestone_announcement_seconds`: how long the 50-ring prize message must remain visible before it is acknowledged; minimum and default `10.0`.
 - `cinematic_max_fps`: maximum cinematic display rate; default `15` to keep audio and video synchronized on the arcade PC.
 
 Other GIF, MP3, and MP4 files beside the EXE also override their bundled copies when their configured filenames match.

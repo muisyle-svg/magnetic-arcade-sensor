@@ -12,5 +12,13 @@ adds validated serial heartbeats, fixed seven-sensor configuration checks,
 configurable emulator names, ring-counter backup recovery, and durable pending
 50-ring prize announcements.
 
+The bulletproofing pass fixes Ring Power foreground recursion, restores the
+Normal Mode all-missing lock after a paid game, removes every small overlay as
+soon as an emulator appears, resumes Big Box before audio cleanup, defers mode
+activation until prior cleanup is complete, re-queues interrupted prize
+messages, supervises ring input, makes serial-worker death explicit, and adds
+deadlines for cinematic and victory callbacks that could otherwise wait
+forever.
+
 The frozen stable release remains at:
 ..\versions\stable-pre-story-mode\

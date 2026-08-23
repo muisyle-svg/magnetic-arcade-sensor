@@ -4,7 +4,7 @@ import queue
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 import magnet_arcade_guard as guard_module
@@ -229,7 +229,8 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(shown[0][0], guard_module.RING_MILESTONE_TITLE)
         self.assertIn("CHAOS ENERGY: 100%", shown[0][1])
-        self.assertFalse(guard.pending_ring_milestone)
+        self.assertTrue(guard.pending_ring_milestone)
+        self.assertEqual(guard.active_ring_announcement_kind, "milestone")
 
     def test_ring_power_announcement_waits_for_a_joystick_press(self):
         guard = self.make_guard()
@@ -294,7 +295,7 @@ class GuardLogicTests(unittest.TestCase):
     def test_ring_power_banner_is_hidden_when_burst_is_consumed(self):
         guard = self.make_guard()
         guard.ring_burst_active = True
-        guard.ring_burst_restore_robotnik = True
+        guard.ring_burst_origin = "story_robotnik"
         guard.ring_power_announcement_visible = True
         guard.guard_active = False
         hidden = []
@@ -325,8 +326,20 @@ class GuardLogicTests(unittest.TestCase):
         saved = []
         guard.save_ring_state = lambda: saved.append(True)
         guard.show_plain_announcement = lambda *args, **kwargs: True
+        guard.hide_story_announcement = lambda: None
 
         guard.maybe_show_pending_ring_announcement()
+
+        self.assertTrue(guard.pending_ring_milestone)
+        self.assertEqual(
+            guard.ring_milestones_pending,
+            {guard_module.RING_MILESTONE},
+        )
+        self.assertEqual(guard.ring_milestones_shown, set())
+        self.assertEqual(saved, [])
+
+        guard.maybe_show_pending_ring_announcement = lambda: None
+        guard.complete_ring_milestone_announcement()
 
         self.assertFalse(guard.pending_ring_milestone)
         self.assertEqual(guard.ring_milestones_pending, set())
@@ -360,6 +373,27 @@ class GuardLogicTests(unittest.TestCase):
             guard_module.RING_MILESTONE_ANNOUNCEMENT_SECONDS,
         )
         self.assertGreaterEqual(shown[0], 10.0)
+
+    def test_fiftieth_ring_shows_ring_power_after_full_prize_message(self):
+        guard = self.make_guard()
+        guard.active_ring_announcement_kind = "milestone"
+        guard.pending_ring_milestone = True
+        guard.pending_ring_announcement = None
+        guard.ring_milestones_pending = {guard_module.RING_MILESTONE}
+        guard.ring_milestones_shown = set()
+        guard.ring_burst_active = True
+        guard.ring_count = 50
+        guard.save_ring_state = lambda: None
+        guard.write_status = lambda *args, **kwargs: None
+        guard.hide_story_announcement = lambda: None
+        queued = []
+        guard.maybe_show_pending_ring_announcement = (
+            lambda: queued.append(guard.pending_ring_announcement)
+        )
+
+        guard.complete_ring_milestone_announcement()
+
+        self.assertEqual(queued, ["burst"])
 
     def test_pending_milestone_survives_ring_state_reload(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -485,7 +519,7 @@ class GuardLogicTests(unittest.TestCase):
         guard.accepted_count = 2
         guard.guard_mode = "story"
         guard.story_intro_completed = True
-        guard.ring_burst_restore_robotnik = True
+        guard.ring_burst_origin = "story_robotnik"
         pending = []
         guard.write_status = lambda *args, **kwargs: None
         guard.maybe_show_pending_overlay = lambda: pending.append(True)
@@ -528,6 +562,7 @@ class GuardLogicTests(unittest.TestCase):
         guard.foreground_process_name = guard_module.BIG_BOX_PROCESS_NAME
         guard.overlay_gate_state = "BIGBOX_READY"
         guard.guard_mode = "normal"
+        guard.accepted_count = 3
         consumed = []
         statuses = []
         guard.update_overlay_gate = lambda: True
@@ -550,7 +585,7 @@ class GuardLogicTests(unittest.TestCase):
         guard.accepted_count = guard_module.TOTAL_EMERALDS
         guard.guard_mode = "story"
         guard.story_intro_completed = True
-        guard.ring_burst_restore_robotnik = True
+        guard.ring_burst_origin = "story_robotnik"
         guard.overlay_kind = None
         events = []
         guard.write_status = lambda *args, **kwargs: None
@@ -567,6 +602,360 @@ class GuardLogicTests(unittest.TestCase):
         guard.consume_ring_burst_on_return()
 
         self.assertEqual(events, [("overlay", 0), ("victory", None)])
+
+    def test_normal_ring_burst_restores_lock_after_game(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_game_seen = True
+        guard.ring_burst_game_seen_since = 1.0
+        guard.ring_burst_origin = "normal_all_missing"
+        guard.ring_power_announcement_visible = True
+        guard.guard_active = True
+        guard.guard_mode = "normal"
+        guard.accepted_count = 2
+        guard.normal_ring_lock_active = True
+        guard.write_status = lambda *args, **kwargs: None
+        guard.hide_story_announcement = lambda: None
+        pending = []
+        guard.maybe_show_pending_overlay = lambda: pending.append(True)
+
+        guard.consume_ring_burst_on_return()
+
+        self.assertFalse(guard.ring_burst_active)
+        self.assertTrue(guard.normal_ring_lock_active)
+        self.assertEqual(
+            guard.pending_overlay_missing,
+            guard_module.TOTAL_EMERALDS - 2,
+        )
+        self.assertEqual(pending, [True])
+
+    def test_normal_ring_burst_does_not_restore_lock_if_all_are_back(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_game_seen = True
+        guard.ring_burst_game_seen_since = 1.0
+        guard.ring_burst_origin = "normal_all_missing"
+        guard.ring_power_announcement_visible = True
+        guard.guard_active = True
+        guard.guard_mode = "normal"
+        guard.accepted_count = guard_module.TOTAL_EMERALDS
+        guard.normal_ring_lock_active = True
+        guard.pending_overlay_missing = 7
+        guard.write_status = lambda *args, **kwargs: None
+        guard.hide_story_announcement = lambda: None
+
+        guard.consume_ring_burst_on_return()
+
+        self.assertFalse(guard.normal_ring_lock_active)
+        self.assertIsNone(guard.pending_overlay_missing)
+
+    def test_normal_ring_lock_releases_immediately_when_all_are_returned(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = False
+        guard.normal_ring_lock_active = True
+        guard.overlay_kind = "robotnik"
+        guard.pending_overlay_missing = 2
+        events = []
+        guard.hide_overlay = lambda: events.append("hide")
+        guard.play_emerald_sound = lambda: events.append("sound")
+
+        guard.handle_normal_count_change(6, 7)
+
+        self.assertFalse(guard.normal_ring_lock_active)
+        self.assertIsNone(guard.pending_overlay_missing)
+        self.assertEqual(events, ["hide", "sound"])
+
+    def test_emulator_foreground_always_hides_ring_power_banner(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_game_seen = False
+        guard.ring_burst_game_seen_since = 0.0
+        guard.ring_power_announcement_visible = True
+        guard.announcement_after_id = None
+        guard.guard_active = True
+        guard.foreground_process_name = "retroarch.exe"
+        guard.update_overlay_gate = lambda: False
+        events = []
+        guard.hide_story_announcement = lambda: events.append("hide")
+        guard.write_status = lambda message: events.append(message)
+
+        with patch.object(time, "monotonic", return_value=100.0):
+            guard.handle_ring_burst_foreground()
+
+        self.assertEqual(events[0], "hide")
+        self.assertEqual(guard.ring_burst_game_seen_since, 100.0)
+
+    def test_focus_retry_stops_when_ring_power_game_has_foreground(self):
+        guard = self.make_guard()
+        guard.return_window_handle = 100
+        guard.ring_burst_active = True
+        guard.write_status = lambda *args, **kwargs: None
+        guard.get_window_process_name = lambda handle: "retroarch.exe"
+        user32 = MagicMock()
+        user32.GetForegroundWindow.return_value = 200
+        fake_windll = MagicMock()
+        fake_windll.user32 = user32
+        fake_windll.kernel32 = MagicMock()
+
+        with patch.object(guard_module.ctypes, "windll", fake_windll):
+            guard.restore_return_window()
+
+        self.assertEqual(guard.return_window_handle, 0)
+        user32.BringWindowToTop.assert_not_called()
+
+    def test_interrupted_milestone_is_requeued_instead_of_acknowledged(self):
+        guard = self.make_guard()
+        guard.active_ring_announcement_kind = "milestone"
+        guard.pending_ring_milestone = True
+        guard.pending_ring_announcement = None
+        guard.ring_milestones_pending = {guard_module.RING_MILESTONE}
+        guard.ring_milestones_shown = set()
+        guard.ring_power_announcement_visible = False
+        guard.announcement_after_id = "timer"
+        guard.root = MagicMock()
+        guard.announcement_window = MagicMock()
+        guard.hide_announcement_flash = lambda: None
+        guard.save_ring_state = lambda: None
+        guard.write_status = lambda *args, **kwargs: None
+
+        guard.hide_story_announcement()
+
+        self.assertTrue(guard.pending_ring_milestone)
+        self.assertEqual(guard.pending_ring_announcement, "milestone")
+        self.assertNotIn(
+            guard_module.RING_MILESTONE,
+            guard.ring_milestones_shown,
+        )
+
+    def test_noncritical_ring_worker_failure_does_not_become_guard_fault(self):
+        guard = self.make_guard()
+        guard.messages = queue.Queue()
+        guard.activation_generation = 4
+
+        def broken_worker():
+            raise RuntimeError("joystick unavailable")
+
+        guard.worker_entry("ring input", broken_worker, False)
+
+        message_type, message, generation = guard.messages.get_nowait()
+        self.assertEqual(message_type, "SERVICE_FAULT")
+        self.assertIn("joystick unavailable", message)
+        self.assertEqual(generation, 4)
+
+    def test_serial_worker_death_is_not_discarded_as_stale(self):
+        guard = self.make_guard()
+        guard.messages = queue.Queue()
+        guard.messages.put(
+            ("CORE_SERVICE_FAULT", "ESP32 serial worker stopped", 1)
+        )
+        guard.activation_generation = 9
+        guard.serial_worker_failed = False
+        guard.service_warning = ""
+        guard.running = True
+        guard.root = MagicMock()
+        failures = []
+        guard.fault_disable_guard = failures.append
+        guard.accept_stable_count = lambda: None
+
+        guard.process_messages()
+
+        self.assertTrue(guard.serial_worker_failed)
+        self.assertEqual(failures, ["ESP32 serial worker stopped"])
+
+    def test_dead_ring_input_service_is_scheduled_for_restart(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.ring_input_stop_event = MagicMock()
+        guard.ring_input_stop_event.is_set.return_value = False
+        guard.ring_input_restart_after_id = None
+        guard.ring_input_restart_count = 0
+        guard.root = MagicMock()
+        guard.root.after.return_value = "ring-restart"
+
+        guard.schedule_ring_input_restart()
+
+        self.assertEqual(guard.ring_input_restart_after_id, "ring-restart")
+
+    def test_ring_message_error_does_not_disable_uncovered_guard(self):
+        guard = self.make_guard()
+        guard.messages = queue.Queue()
+        guard.messages.put(("RING", "0", -1))
+        guard.activation_generation = 2
+        guard.guard_active = True
+        guard.ring_burst_active = False
+        guard.suspended_process_handle = None
+        guard.running = True
+        guard.root = MagicMock()
+        guard.handle_ring_entry = lambda: (_ for _ in ()).throw(
+            RuntimeError("ring banner failed")
+        )
+        recovered = []
+        guard.recover_ring_ui_error = (
+            lambda context, error: recovered.append((context, str(error)))
+        )
+        guard.write_status = lambda *args, **kwargs: None
+        guard.accept_stable_count = lambda: None
+
+        guard.process_messages()
+
+        self.assertTrue(guard.guard_active)
+        self.assertEqual(recovered, [("ring", "ring banner failed")])
+
+    def test_activation_waits_until_old_overlay_side_effects_are_released(self):
+        guard = self.make_guard()
+        guard.guard_active = False
+        guard.running = True
+        guard.suspended_process_handle = 123
+        guard.audio_muted = False
+        guard.pending_guard_activation = False
+        guard.activation_retry_after_id = None
+        guard.overlay_gate_state = "DORMANT"
+        guard.root = MagicMock()
+        guard.root.after.return_value = "activation-retry"
+        guard.write_status = lambda *args, **kwargs: None
+
+        guard.activate_guard()
+
+        self.assertFalse(guard.guard_active)
+        self.assertTrue(guard.pending_guard_activation)
+        self.assertEqual(guard.overlay_gate_state, "WAITING_FOR_CLEANUP")
+        self.assertEqual(
+            guard.activation_retry_after_id,
+            "activation-retry",
+        )
+
+    def test_selecting_already_active_mode_does_not_reset_sensor_state(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.guard_active = True
+        guard.guard_mode = "normal"
+        guard.accepted_count = 4
+        guard.write_status = lambda *args, **kwargs: None
+        guard._deactivate_guard = lambda reason: self.fail(
+            "active mode should not restart"
+        )
+
+        guard.select_guard_mode("normal")
+
+        self.assertEqual(guard.accepted_count, 4)
+
+    def test_nonblocking_tk_error_keeps_sensor_guard_active(self):
+        guard = self.make_guard()
+        guard.guard_active = True
+        guard.overlay_visible = False
+        guard.suspended_process_handle = None
+        guard.service_warning = ""
+        guard.write_status = lambda *args, **kwargs: None
+        guard.fault_disable_guard = lambda reason: self.fail(reason)
+
+        error = RuntimeError("panel refresh failed")
+        guard.handle_tk_exception(RuntimeError, error, error.__traceback__)
+
+        self.assertTrue(guard.guard_active)
+        self.assertIn("panel refresh failed", guard.service_warning)
+
+    def test_overlay_cleanup_resumes_input_before_restoring_audio(self):
+        guard = self.make_guard()
+        guard.overlay_visible = True
+        guard.overlay_kind = "robotnik"
+        guard.running = True
+        guard.guard_active = False
+        guard.ring_burst_active = False
+        guard.last_fault = ""
+        guard.reader_connected = False
+        guard.audio_restore_retry_after_id = None
+        guard.audio_restore_retry_attempt = 0
+        guard.root = MagicMock()
+        order = []
+        guard.hide_story_announcement = lambda: None
+        guard.cancel_audio_watchdog = lambda: None
+        guard.hide_energy_meter = lambda: None
+        guard.set_control_panel_visible = lambda visible: None
+        guard.reset_counter_style = lambda: None
+        guard.stop_music = lambda: None
+        guard.stop_event_sound = lambda: None
+        guard.set_overlay_z_order = lambda topmost: None
+        guard.resume_and_restore_return_window = lambda: order.append("resume")
+        guard.restore_other_audio_with_retries = (
+            lambda: order.append("audio") or True
+        )
+
+        guard.hide_overlay()
+
+        self.assertEqual(order, ["resume", "audio"])
+
+    def test_cinematic_with_no_frames_fails_open_instead_of_waiting_forever(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.guard_active = True
+        guard.overlay_visible = True
+        guard.overlay_kind = "cinematic"
+        guard.cinematic_worker_error = ""
+        guard.cinematic_pending_frame = None
+        guard.cinematic_frame_queue = queue.Queue()
+        guard.cinematic_started_at = 0.0
+        guard.cinematic_wait_started_at = time.monotonic()
+        guard.cinematic_worker_done = True
+        guard.cinematic_after_id = None
+        failures = []
+        guard.fault_disable_guard = failures.append
+
+        guard.poll_cinematic_playback()
+
+        self.assertEqual(
+            failures,
+            ["Sonic cinematic produced no playable video frames"],
+        )
+
+    def test_final_emerald_sound_timeout_does_not_hold_victory_forever(self):
+        guard = self.make_guard()
+        guard.final_emerald_after_id = None
+        guard.guard_active = True
+        guard.overlay_visible = True
+        guard.accepted_count = guard_module.TOTAL_EMERALDS
+        guard.controller_lost = False
+        guard.final_emerald_sound_started = True
+        guard.final_emerald_wait_started_at = 10.0
+        guard.final_emerald_pause_started_at = None
+        guard.event_channel_busy = lambda: True
+        guard.root = MagicMock()
+        events = []
+        guard.stop_event_sound = lambda: events.append("stopped")
+        guard.write_status = lambda *args, **kwargs: None
+
+        with patch.object(time, "monotonic", return_value=100.0):
+            guard.wait_for_final_emerald_transition()
+
+        self.assertEqual(events, ["stopped"])
+
+    def test_victory_animation_timeout_forces_completion_progress(self):
+        guard = self.make_guard()
+        guard.completion_after_id = None
+        guard.completion_in_progress = True
+        guard.completion_started_at = 0.0
+        guard.completion_audio_playing = False
+        guard.completion_animation_finished = False
+        guard.final_completion_sound_started = False
+        guard.final_completion_sound_playing = False
+        guard.final_completion_sound = None
+        guard.write_status = lambda *args, **kwargs: None
+        guard.start_supersonic_animation = lambda: setattr(
+            guard,
+            "completion_animation_finished",
+            True,
+        )
+        guard.play_event_sound = lambda *args, **kwargs: False
+        completed = []
+        guard.finish_completion = lambda: completed.append(True)
+
+        with patch.object(
+            time,
+            "monotonic",
+            return_value=guard_module.COMPLETION_MAX_SECONDS + 1,
+        ):
+            guard.wait_for_completion_audio()
+
+        self.assertEqual(completed, [True])
 
     def test_missing_text_uses_singular_emerald(self):
         guard = self.make_guard()
