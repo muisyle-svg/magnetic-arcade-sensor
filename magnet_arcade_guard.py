@@ -118,8 +118,11 @@ DEFAULT_CONFIG = {
     "story_question_seconds": 6.0,
     "story_eggman_seconds": 3.0,
     "cinematic_fade_seconds": 0.8,
-    "ring_joystick_button": 12,
+    "ring_joystick_button": 10,
+    "ring_debounce_ms": 90,
+    "ring_game_commit_seconds": 3.0,
     "ring_announcement_seconds": 5.0,
+    "cinematic_max_fps": 15,
     "cinematic_video_file": (
         "2015-02-19-SonictheHedgehogCD-Opening"
         "(SonicBoomNAVersion).mp4.7fb0570ab57510d4a7d54beb920f6517.mp4"
@@ -183,9 +186,9 @@ def config_number(
     return max(minimum, min(maximum, number))
 
 
-def pygame_button_index(human_button_number: int) -> int:
-    """Convert the arcade encoder's 1-based button number to pygame's index."""
-    return max(0, int(human_button_number) - 1)
+def joystick_button_mask(human_button_number: int) -> int:
+    """Convert a 1-based Windows joystick button number to its bit mask."""
+    return 1 << max(0, int(human_button_number) - 1)
 
 
 AUTO_ACTIVATE = config_boolean(
@@ -296,11 +299,23 @@ CINEMATIC_FADE_SECONDS = config_number(
 )
 RING_JOYSTICK_BUTTON = int(
     config_number(
-        RUNTIME_CONFIG.get("ring_joystick_button", 12),
-        12,
+        RUNTIME_CONFIG.get("ring_joystick_button", 10),
+        10,
         1,
         32,
     )
+)
+RING_DEBOUNCE_SECONDS = config_number(
+    RUNTIME_CONFIG.get("ring_debounce_ms", 90),
+    90,
+    30,
+    500,
+) / 1000.0
+RING_GAME_COMMIT_SECONDS = config_number(
+    RUNTIME_CONFIG.get("ring_game_commit_seconds", 3.0),
+    3.0,
+    1.0,
+    15.0,
 )
 RING_ANNOUNCEMENT_SECONDS = config_number(
     RUNTIME_CONFIG.get("ring_announcement_seconds", 5.0),
@@ -317,6 +332,15 @@ RING_BURST_MESSAGE = (
     "ONE GAME OF CHAOS POWER CHARGED!"
 )
 RING_BURST_ANNOUNCEMENT_SECONDS = 2.0
+CINEMATIC_MAX_FPS = config_number(
+    RUNTIME_CONFIG.get("cinematic_max_fps", 15),
+    15,
+    10,
+    30,
+)
+CINEMATIC_FRAME_INTERVAL = 1.0 / CINEMATIC_MAX_FPS
+CINEMATIC_QUEUE_SIZE = 12
+CINEMATIC_PREBUFFER_FRAMES = 6
 configured_default_mode = str(
     RUNTIME_CONFIG.get("default_mode", "story")
 ).strip().lower()
@@ -442,7 +466,6 @@ STORY_QUESTION_MESSAGE = (
 )
 STORY_EGGMAN_TITLE = "SO EGGMAN'S BEHIND THIS, HUH?"
 STORY_EGGMAN_MESSAGE = ""
-ENERGY_METER_SEGMENTS = 12
 ENERGY_ANIMATION_STEP_MS = 55
 ENERGY_EMPHASIS_MS = 420
 
@@ -523,6 +546,8 @@ INFINITE = 0xFFFFFFFF
 ERROR_ALREADY_EXISTS = 183
 CREATE_NO_WINDOW = 0x08000000
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MagnetArcadeGuard.SingleInstance"
+JOYERR_NOERROR = 0
+JOY_RETURNBUTTONS = 0x00000080
 
 
 class Win32Rect(ctypes.Structure):
@@ -540,6 +565,24 @@ class Win32MonitorInfo(ctypes.Structure):
         ("rcMonitor", Win32Rect),
         ("rcWork", Win32Rect),
         ("dwFlags", ctypes.c_ulong),
+    ]
+
+
+class Win32JoyInfoEx(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("dwXpos", ctypes.c_ulong),
+        ("dwYpos", ctypes.c_ulong),
+        ("dwZpos", ctypes.c_ulong),
+        ("dwRpos", ctypes.c_ulong),
+        ("dwUpos", ctypes.c_ulong),
+        ("dwVpos", ctypes.c_ulong),
+        ("dwButtons", ctypes.c_ulong),
+        ("dwButtonNumber", ctypes.c_ulong),
+        ("dwPOV", ctypes.c_ulong),
+        ("dwReserved1", ctypes.c_ulong),
+        ("dwReserved2", ctypes.c_ulong),
     ]
 
 
@@ -668,6 +711,15 @@ def configure_windows_runtime() -> None:
         ctypes.POINTER(ctypes.c_ulong),
     ]
     kernel32.QueryFullProcessImageNameW.restype = ctypes.c_bool
+
+    winmm = ctypes.windll.winmm
+    winmm.joyGetNumDevs.argtypes = []
+    winmm.joyGetNumDevs.restype = ctypes.c_uint
+    winmm.joyGetPosEx.argtypes = [
+        ctypes.c_uint,
+        ctypes.POINTER(Win32JoyInfoEx),
+    ]
+    winmm.joyGetPosEx.restype = ctypes.c_uint
 
 
 def run_resume_watchdog(
@@ -813,7 +865,9 @@ class MagnetArcadeGuard:
         self.cinematic_started_at = 0.0
         self.cinematic_generation = 0
         self.cinematic_cancel_event = threading.Event()
-        self.cinematic_frame_queue = queue.Queue(maxsize=4)
+        self.cinematic_frame_queue = queue.Queue(
+            maxsize=CINEMATIC_QUEUE_SIZE
+        )
         self.cinematic_pending_frame = None
         self.cinematic_worker_done = False
         self.cinematic_worker_error = ""
@@ -828,16 +882,15 @@ class MagnetArcadeGuard:
         self.audio_watchdog_after_id = None
         self.ring_input_stop_event = threading.Event()
         self.ring_input_thread = None
-        self.ring_joystick_initialized = False
-        self.ring_pygame_video_initialized = False
+        self.ring_input_backend = "Windows joystick"
         self.ring_joystick_error = ""
         self.ring_joystick_signature = ()
         self.ring_button_states = {}
+        self.ring_last_press_at = {}
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
-        self.ring_burst_restore_pending = False
+        self.ring_burst_game_seen_since = 0.0
         self.pending_ring_milestone = False
-        self.ring_milestone_after_id = None
         local_app_data = Path(
             os.environ.get(
                 "LOCALAPPDATA",
@@ -1070,18 +1123,6 @@ class MagnetArcadeGuard:
                 self.audio_ready = False
         bootstrap_event("audio mixer initialization complete")
 
-        if PYGAME_AVAILABLE:
-            try:
-                # pygame.event.pump() requires SDL's video subsystem even
-                # though the visible application window is Tk. Initializing
-                # the subsystem alone creates no visible pygame window.
-                pygame.display.init()
-                self.ring_pygame_video_initialized = True
-                pygame.joystick.init()
-                self.ring_joystick_initialized = True
-            except pygame.error as error:
-                self.ring_joystick_error = str(error)
-        
         self.title_label = tk.Label(
             self.root,
             text=LOCK_MESSAGE,
@@ -1104,14 +1145,13 @@ class MagnetArcadeGuard:
         self.count_label.place(anchor="center")
         self.position_counter()
 
-        self.energy_label = tk.Label(
+        self.energy_canvas = tk.Canvas(
             self.root,
-            text="",
-            font=("Arial", 16, "bold"),
-            foreground="#66ff99",
             background="#000000",
+            borderwidth=0,
+            highlightthickness=0,
         )
-        self.energy_label.place_forget()
+        self.energy_canvas.place_forget()
 
         self.messages: queue.Queue[tuple[str, str, int]] = queue.Queue()
         self.create_announcement_window()
@@ -1273,11 +1313,7 @@ class MagnetArcadeGuard:
     def energy_meter_text(self, present_count: int) -> str:
         present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
         percent = round(present_count * 100 / TOTAL_EMERALDS)
-        filled = round(
-            present_count * ENERGY_METER_SEGMENTS / TOTAL_EMERALDS
-        )
-        bar = "#" * filled + "-" * (ENERGY_METER_SEGMENTS - filled)
-        return f"MASTER EMERALD ENERGY [{bar}] {percent}%"
+        return f"MASTER EMERALD POWER  {percent}%"
 
     def energy_meter_color(self, present_count: int) -> str:
         present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
@@ -1288,11 +1324,11 @@ class MagnetArcadeGuard:
         return "#ff6666"
 
     def position_energy_meter(self) -> None:
-        if not getattr(self, "energy_label", None):
+        if not getattr(self, "energy_canvas", None):
             return
 
         _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
-        self.energy_label.update_idletasks()
+        self.energy_canvas.update_idletasks()
         self.count_label.update_idletasks()
         count_info = self.count_label.place_info()
         try:
@@ -1301,14 +1337,14 @@ class MagnetArcadeGuard:
             count_y = monitor_height * 0.8
 
         count_height = self.count_label.winfo_reqheight()
-        energy_height = self.energy_label.winfo_reqheight()
+        energy_height = self.energy_canvas.winfo_reqheight()
         gap = max(5, int(monitor_height * 0.012))
         energy_y = count_y + count_height / 2 + gap + energy_height / 2
         energy_y = min(
             energy_y,
             monitor_height - energy_height / 2 - max(4, gap),
         )
-        self.energy_label.place(
+        self.energy_canvas.place(
             x=monitor_width / 2,
             y=max(energy_height / 2, energy_y),
             anchor="center",
@@ -1321,38 +1357,73 @@ class MagnetArcadeGuard:
         emphasis: bool = False,
         visible: bool = True,
     ) -> None:
-        if not getattr(self, "energy_label", None):
+        if not getattr(self, "energy_canvas", None):
             return
 
         present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
         self.energy_display_count = present_count
         _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
         text = self.energy_meter_text(present_count)
-        base_size = max(12, min(24, int(monitor_height * 0.045)))
+        meter_width = max(240, min(520, int(monitor_width * 0.72)))
+        meter_height = max(42, min(62, int(monitor_height * 0.11)))
+        base_size = max(10, min(18, int(monitor_height * 0.034)))
         if emphasis:
-            base_size += 4
+            base_size += 2
         font_size = self.fit_font_size(
             (text,),
             max_size=base_size,
-            min_size=10,
-            available_width=monitor_width,
+            min_size=9,
+            available_width=meter_width,
         )
-        self.energy_label.configure(
+        color = self.energy_meter_color(present_count)
+        self.energy_canvas.configure(
+            width=meter_width,
+            height=meter_height,
+            background="#000000",
+        )
+        self.energy_canvas.delete("all")
+        self.energy_canvas.create_text(
+            meter_width / 2,
+            max(9, font_size * 0.65),
             text=text,
-            foreground=self.energy_meter_color(present_count),
+            fill=color,
             font=("Arial", font_size, "bold"),
         )
+
+        horizontal_margin = max(8, int(meter_width * 0.035))
+        segment_gap = max(2, int(meter_width * 0.007))
+        bar_top = max(22, int(meter_height * 0.48))
+        bar_bottom = meter_height - max(4, int(meter_height * 0.08))
+        available_width = (
+            meter_width
+            - horizontal_margin * 2
+            - segment_gap * (TOTAL_EMERALDS - 1)
+        )
+        segment_width = available_width / TOTAL_EMERALDS
+        for index in range(TOTAL_EMERALDS):
+            left = horizontal_margin + index * (segment_width + segment_gap)
+            right = left + segment_width
+            filled = index < present_count
+            self.energy_canvas.create_rectangle(
+                left,
+                bar_top,
+                right,
+                bar_bottom,
+                fill=color if filled else "#181818",
+                outline="#ffffff" if emphasis and filled else "#606060",
+                width=2 if emphasis and filled else 1,
+            )
         if visible:
             self.position_energy_meter()
         else:
-            self.energy_label.place_forget()
+            self.energy_canvas.place_forget()
 
     def animate_energy_meter(
         self,
         previous_count: int,
         current_count: int,
     ) -> None:
-        if not getattr(self, "energy_label", None):
+        if not getattr(self, "energy_canvas", None):
             return
 
         previous_count = max(
@@ -1394,8 +1465,8 @@ class MagnetArcadeGuard:
 
     def hide_energy_meter(self) -> None:
         self.cancel_energy_animation()
-        if getattr(self, "energy_label", None):
-            self.energy_label.place_forget()
+        if getattr(self, "energy_canvas", None):
+            self.energy_canvas.place_forget()
 
     def fit_font_size(
         self,
@@ -1585,6 +1656,7 @@ class MagnetArcadeGuard:
     def calculate_background_display_size(self) -> None:
         title_space = int(self.title_font_size * 1.8) + 10
         counter_space = int(self.count_font_size * 1.4) + 10
+        energy_space = max(48, int(self.screen_height * 0.12))
         vertical_gap = max(8, int(self.screen_height * 0.02))
 
         maximum_width = max(1, self.screen_width - 20)
@@ -1593,6 +1665,7 @@ class MagnetArcadeGuard:
             self.screen_height
             - title_space
             - counter_space
+            - energy_space
             - vertical_gap,
         )
 
@@ -1613,6 +1686,18 @@ class MagnetArcadeGuard:
 
     def position_counter(self) -> None:
         _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
+        self.count_label.update_idletasks()
+        count_height = self.count_label.winfo_reqheight()
+        meter_height = max(42, min(62, int(monitor_height * 0.11)))
+        bottom_margin = max(5, int(monitor_height * 0.012))
+        meter_gap = max(5, int(monitor_height * 0.012))
+        maximum_counter_y = (
+            monitor_height
+            - bottom_margin
+            - meter_height
+            - meter_gap
+            - count_height / 2
+        )
         if self.background_display_height:
             image_bottom = (
                 monitor_height / 2
@@ -1624,10 +1709,10 @@ class MagnetArcadeGuard:
             )
             counter_y = min(
                 counter_y,
-                monitor_height - int(self.count_font_size * 0.7),
+                maximum_counter_y,
             )
         else:
-            counter_y = monitor_height * 0.8
+            counter_y = min(monitor_height * 0.8, maximum_counter_y)
 
         self.count_label.place(
             x=monitor_width / 2,
@@ -2055,6 +2140,7 @@ class MagnetArcadeGuard:
                     if stream.type == "video"
                 )
                 first_timestamp = None
+                next_output_timestamp = 0.0
                 _, _, monitor_width, monitor_height = (
                     self.overlay_monitor_bounds
                 )
@@ -2075,42 +2161,31 @@ class MagnetArcadeGuard:
                         first_timestamp = timestamp
                     timestamp -= first_timestamp
 
-                    # Detach each frame from PyAV's YUV/padded buffers before
-                    # Tk displays it. A direct conversion can expose stale
-                    # stride bytes as narrow black marks on some displays.
-                    frame_image = (
-                        frame.reformat(format="rgb24")
-                        .to_image()
-                        .convert("RGB")
-                        .copy()
-                    )
-                    # Repack the final pixels into a tightly packed RGB image
-                    # before Tk receives them. This avoids occasional narrow
-                    # vertical artifacts when a frame retains decoder stride
-                    # metadata through repeated PhotoImage updates.
-                    frame_image = Image.frombytes(
-                        "RGB",
-                        frame_image.size,
-                        frame_image.tobytes(),
-                    )
+                    # The arcade PC cannot reliably convert and upload all 30
+                    # source frames every second. Keep timestamps tied to the
+                    # original video but decode at a bounded display rate.
+                    if timestamp + 0.0001 < next_output_timestamp:
+                        continue
+                    next_output_timestamp = timestamp + CINEMATIC_FRAME_INTERVAL
+
                     scale = min(
                         1.0,
-                        monitor_width / frame_image.width,
-                        monitor_height / frame_image.height,
+                        monitor_width / frame.width,
+                        monitor_height / frame.height,
                     )
                     target_size = (
-                        max(1, int(frame_image.width * scale)),
-                        max(1, int(frame_image.height * scale)),
+                        max(1, int(frame.width * scale)),
+                        max(1, int(frame.height * scale)),
                     )
-                    if target_size != frame_image.size:
-                        frame_image = frame_image.resize(
-                            target_size,
-                            resample=getattr(
-                                Image,
-                                "Resampling",
-                                Image,
-                            ).BILINEAR,
-                        )
+                    # Let FFmpeg/PyAV scale directly into a tightly packed RGB
+                    # frame. This avoids the padded-buffer artifacts seen as
+                    # vertical black dashes and is much cheaper than a second
+                    # full-frame Pillow resize.
+                    frame_image = frame.reformat(
+                        width=target_size[0],
+                        height=target_size[1],
+                        format="rgb24",
+                    ).to_image()
 
                     while not self.cinematic_cancel_event.is_set():
                         try:
@@ -2162,11 +2237,14 @@ class MagnetArcadeGuard:
         self.cinematic_generation += 1
         generation = self.cinematic_generation
         self.cinematic_cancel_event.clear()
-        self.cinematic_frame_queue = queue.Queue(maxsize=4)
+        self.cinematic_frame_queue = queue.Queue(
+            maxsize=CINEMATIC_QUEUE_SIZE
+        )
         self.cinematic_pending_frame = None
         self.cinematic_worker_done = False
         self.cinematic_worker_error = ""
         self.cinematic_started_at = 0.0
+        self.cinematic_photo = None
         threading.Thread(
             target=self.decode_cinematic_frames,
             args=(generation,),
@@ -2203,11 +2281,21 @@ class MagnetArcadeGuard:
             black_frame = Image.new("RGB", frame_image.size, "black")
             frame_image = Image.blend(black_frame, frame_image, alpha)
 
-        self.cinematic_photo = ImageTk.PhotoImage(frame_image.copy())
-        self.background_label.configure(
-            image=self.cinematic_photo,
-            background="black",
-        )
+        if (
+            self.cinematic_photo is None
+            or self.cinematic_photo.width() != frame_image.width
+            or self.cinematic_photo.height() != frame_image.height
+        ):
+            self.cinematic_photo = ImageTk.PhotoImage(frame_image)
+            self.background_label.configure(
+                image=self.cinematic_photo,
+                background="black",
+            )
+        else:
+            # Reuse one Tcl image instead of allocating and destroying a new
+            # display object for every frame. This is faster and prevents stale
+            # image fragments from surviving a frame swap on the CRT PC.
+            self.cinematic_photo.paste(frame_image)
 
     def poll_cinematic_playback(self) -> None:
         self.cinematic_after_id = None
@@ -2234,7 +2322,11 @@ class MagnetArcadeGuard:
                 self.cinematic_pending_frame = None
 
         if self.cinematic_started_at == 0.0:
-            if self.cinematic_pending_frame is None:
+            buffered_frames = self.cinematic_frame_queue.qsize()
+            if (
+                self.cinematic_pending_frame is None
+                or buffered_frames + 1 < CINEMATIC_PREBUFFER_FRAMES
+            ):
                 self.cinematic_after_id = self.root.after(
                     10,
                     self.poll_cinematic_playback,
@@ -2248,18 +2340,24 @@ class MagnetArcadeGuard:
                 return
 
         elapsed = time.monotonic() - self.cinematic_started_at
+        latest_due_frame = None
         while (
             self.cinematic_pending_frame is not None
             and self.cinematic_pending_frame[0] <= elapsed + 0.02
         ):
-            _, frame_image = self.cinematic_pending_frame
-            self.display_cinematic_frame(frame_image, elapsed)
+            latest_due_frame = self.cinematic_pending_frame[1]
             try:
                 self.cinematic_pending_frame = (
                     self.cinematic_frame_queue.get_nowait()
                 )
             except queue.Empty:
                 self.cinematic_pending_frame = None
+
+        # If Tk ever falls behind, display only the newest due frame. Drawing
+        # every stale frame creates a feedback loop where video slows down
+        # while independently playing audio continues at full speed.
+        if latest_due_frame is not None:
+            self.display_cinematic_frame(latest_due_frame, elapsed)
 
         playback_finished = (
             self.cinematic_worker_done
@@ -2292,6 +2390,7 @@ class MagnetArcadeGuard:
                 pass
         self.cinematic_sound = None
         self.cinematic_pending_frame = None
+        self.cinematic_photo = None
 
     def finish_story_cinematic(self) -> None:
         self.cancel_cinematic()
@@ -2407,60 +2506,64 @@ class MagnetArcadeGuard:
             )
 
     def ring_input_worker(self) -> None:
-        """Watch every connected encoder for its human-numbered button 12."""
-        if not self.ring_joystick_initialized:
-            while self.running and not self.ring_input_stop_event.wait(1.0):
-                pass
+        """Watch every Windows joystick encoder for the configured coin input."""
+        try:
+            winmm = ctypes.windll.winmm
+            joystick_slots = max(1, int(winmm.joyGetNumDevs()))
+        except (AttributeError, OSError, ValueError) as error:
+            self.ring_joystick_error = str(error).replace("\n", " ")[:120]
             return
 
-        button_index = pygame_button_index(RING_JOYSTICK_BUTTON)
+        button_mask = joystick_button_mask(RING_JOYSTICK_BUTTON)
         while self.running and not self.ring_input_stop_event.is_set():
             try:
-                if self.ring_pygame_video_initialized:
-                    pygame.event.pump()
-                joystick_count = pygame.joystick.get_count()
+                now = time.monotonic()
                 live_keys = set()
 
-                for joystick_index in range(joystick_count):
-                    joystick = pygame.joystick.Joystick(joystick_index)
-                    if not joystick.get_init():
-                        joystick.init()
-
-                    try:
-                        instance_id = joystick.get_instance_id()
-                    except AttributeError:
-                        instance_id = joystick_index
-                    state_key = (instance_id, joystick_index)
-                    live_keys.add(state_key)
-
-                    pressed = False
-                    if joystick.get_numbuttons() > button_index:
-                        pressed = bool(joystick.get_button(button_index))
-
-                    was_pressed = self.ring_button_states.get(
-                        state_key,
-                        False,
+                for joystick_id in range(joystick_slots):
+                    joystick_state = Win32JoyInfoEx()
+                    joystick_state.dwSize = ctypes.sizeof(Win32JoyInfoEx)
+                    joystick_state.dwFlags = JOY_RETURNBUTTONS
+                    result = winmm.joyGetPosEx(
+                        joystick_id,
+                        ctypes.byref(joystick_state),
                     )
-                    if pressed and not was_pressed:
-                        self.messages.put(("RING", "", -1))
-                    self.ring_button_states[state_key] = pressed
+                    if result != JOYERR_NOERROR:
+                        continue
+
+                    live_keys.add(joystick_id)
+                    pressed = bool(joystick_state.dwButtons & button_mask)
+                    was_pressed = self.ring_button_states.get(joystick_id)
+                    last_press_at = self.ring_last_press_at.get(
+                        joystick_id,
+                        0.0,
+                    )
+                    if (
+                        pressed
+                        and was_pressed is False
+                        and now - last_press_at >= RING_DEBOUNCE_SECONDS
+                    ):
+                        self.ring_last_press_at[joystick_id] = now
+                        self.messages.put(("RING", str(joystick_id), -1))
+                    self.ring_button_states[joystick_id] = pressed
 
                 for state_key in tuple(self.ring_button_states):
                     if state_key not in live_keys:
                         del self.ring_button_states[state_key]
+                        self.ring_last_press_at.pop(state_key, None)
 
                 self.ring_joystick_signature = tuple(
                     sorted(live_keys)
                 )
                 self.ring_joystick_error = ""
-            except (AttributeError, OSError, pygame.error) as error:
+            except (AttributeError, OSError, ValueError) as error:
                 self.ring_joystick_error = str(error)[:120]
                 self.ring_button_states.clear()
                 if self.ring_input_stop_event.wait(0.5):
                     break
                 continue
 
-            if self.ring_input_stop_event.wait(0.02):
+            if self.ring_input_stop_event.wait(0.01):
                 break
 
     def ring_burst_is_eligible(self) -> bool:
@@ -2494,7 +2597,7 @@ class MagnetArcadeGuard:
 
         self.ring_burst_active = True
         self.ring_burst_game_seen = False
-        self.ring_burst_restore_pending = False
+        self.ring_burst_game_seen_since = 0.0
         self.write_status("RING BURST ACTIVE | waiting for a game")
 
         if self.overlay_visible:
@@ -2600,13 +2703,18 @@ class MagnetArcadeGuard:
 
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
-        self.ring_burst_restore_pending = False
+        self.ring_burst_game_seen_since = 0.0
         self.write_status("RING BURST CONSUMED | Big Box returned")
 
-        if not self.guard_active or self.accepted_count == TOTAL_EMERALDS:
+        if not self.guard_active:
             return
 
         if self.guard_mode == "story" and self.story_intro_completed:
+            if self.accepted_count == TOTAL_EMERALDS:
+                self.show_missing_overlay(0)
+                if self.guard_active and self.overlay_kind == "robotnik":
+                    self.begin_final_emerald_transition()
+                return
             self.pending_overlay_missing = (
                 TOTAL_EMERALDS - (self.accepted_count or 0)
             )
@@ -2617,16 +2725,46 @@ class MagnetArcadeGuard:
             return
 
         self.update_overlay_gate()
+        now = time.monotonic()
         if self.foreground_process_name in EMULATOR_PROCESS_NAMES:
-            if not self.ring_burst_game_seen:
+            if self.ring_burst_game_seen_since == 0.0:
+                self.ring_burst_game_seen_since = now
+                self.write_status("RING BURST GAME LAUNCH DETECTED")
+            if (
+                not self.ring_burst_game_seen
+                and now - self.ring_burst_game_seen_since
+                >= RING_GAME_COMMIT_SECONDS
+            ):
                 self.ring_burst_game_seen = True
-                self.write_status("RING BURST GAME DETECTED")
+                self.write_status("RING BURST GAME COMMITTED")
+            return
+
+        big_box_ready = (
+            self.foreground_process_name == BIG_BOX_PROCESS_NAME
+            and self.overlay_gate_state == "BIGBOX_READY"
+        )
+        if (
+            big_box_ready
+            and self.guard_mode == "story"
+            and self.story_intro_completed
+            and self.accepted_count == TOTAL_EMERALDS
+        ):
+            self.consume_ring_burst_on_return()
             return
 
         if (
+            big_box_ready
+            and not self.ring_burst_game_seen
+            and self.ring_burst_game_seen_since != 0.0
+        ):
+            self.ring_burst_game_seen_since = 0.0
+            self.write_status(
+                "RING BURST GAME LAUNCH ABORTED | burst remains available"
+            )
+
+        if (
             self.ring_burst_game_seen
-            and self.foreground_process_name == BIG_BOX_PROCESS_NAME
-            and self.overlay_gate_state == "BIGBOX_READY"
+            and big_box_ready
         ):
             self.consume_ring_burst_on_return()
 
@@ -2835,14 +2973,22 @@ class MagnetArcadeGuard:
             if self.suspended_process_id
             else "normal"
         )
+        if self.ring_joystick_error:
+            ring_input_text = "ERROR: " + self.ring_joystick_error
+        else:
+            joystick_count = len(self.ring_joystick_signature)
+            joystick_word = "joystick" if joystick_count == 1 else "joysticks"
+            ring_input_text = (
+                f"{joystick_count} {joystick_word}, button "
+                f"{RING_JOYSTICK_BUTTON}, {round(RING_DEBOUNCE_SECONDS * 1000)}ms debounce"
+            )
         details_text = (
             f"Reader: {reader_text}    "
             f"Foreground: {self.foreground_process_name}\n"
             f"Gate: {self.overlay_gate_state}    "
             f"Input: {input_text}\n"
             f"Rings entered: {self.ring_count}    "
-            "Ring input: joystick button "
-            f"{RING_JOYSTICK_BUTTON}\n"
+            f"Ring input: {ring_input_text}\n"
             "Return SFX: ready    Removal SFX: "
             + ("ready" if self.removal_sound is not None else "not installed")
             + "    Cinematic: "
@@ -2930,6 +3076,22 @@ class MagnetArcadeGuard:
         try:
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
+
+            # Ring Power resumes Big Box so it can launch an emulator. Once an
+            # emulator owns the foreground, a delayed focus retry must never
+            # pull focus back to Big Box or interfere with the display-mode
+            # transition.
+            if self.ring_burst_active:
+                foreground_window = user32.GetForegroundWindow()
+                foreground_process = self.get_window_process_name(
+                    foreground_window
+                )
+                if foreground_process in EMULATOR_PROCESS_NAMES:
+                    self.return_window_handle = 0
+                    self.write_status(
+                        "FOCUS RESTORE ENDED | emulator owns foreground"
+                    )
+                    return
             user32.GetWindowThreadProcessId.argtypes = [
                 ctypes.c_void_p,
                 ctypes.POINTER(ctypes.c_ulong),
@@ -3695,7 +3857,7 @@ class MagnetArcadeGuard:
                     + self.describe_window(window_handle)
                 )
                 self.return_window_handle = 0
-            elif attempt < 20:
+            elif attempt < (3 if self.ring_burst_active else 20):
                 # Windows may reject the first foreground request when the
                 # overlay has just closed. Retry while retaining the original
                 # handle instead of falling back to whichever window happens
@@ -3714,13 +3876,13 @@ class MagnetArcadeGuard:
                     + self.describe_window(window_handle)
                 )
                 self.return_window_handle = 0
-                if self.guard_active:
+                if self.guard_active and not self.ring_burst_active:
                     self.fault_disable_guard(
                         "Could not restore Big Box keyboard focus"
                     )
         except (AttributeError, OSError, ValueError):
             self.return_window_handle = 0
-            if self.guard_active:
+            if self.guard_active and not self.ring_burst_active:
                 self.fault_disable_guard(
                     "Could not restore Big Box keyboard focus"
                 )
@@ -4916,6 +5078,12 @@ class MagnetArcadeGuard:
         if current_count == previous_count:
             return
 
+        # Ring Power intentionally hides the blocking screen while a game is
+        # launched. Keep accepting sensor counts, but defer all Story Mode UI
+        # and sounds until Big Box safely returns.
+        if self.story_intro_completed and self.ring_burst_active:
+            return
+
         # Once the intro has finished, every recovery update belongs on the
         # blocking Robotnik screen. Removing one again during the victory
         # sequence safely cancels that sequence and returns to Robotnik.
@@ -4997,18 +5165,25 @@ class MagnetArcadeGuard:
         if current_count == previous_count:
             return
 
+        if current_count > previous_count:
+            if (
+                self.overlay_kind == "normal_warning"
+                or getattr(self, "normal_warning_trigger_count", None)
+                is not None
+            ):
+                self.finish_normal_warning()
+            self.play_emerald_sound()
+            return
+
         if (
             self.overlay_kind == "normal_warning"
             or getattr(self, "normal_warning_trigger_count", None)
             is not None
         ):
-            if current_count > previous_count:
-                self.finish_normal_warning()
-            else:
-                # A second real removal is a new event, so keep the warning up
-                # for a full interval from the newest removal.
-                if self.show_normal_warning(previous_count, current_count):
-                    self.play_removal_sound()
+            # A second real removal is a new event, so keep the warning up
+            # for a full interval from the newest removal.
+            if self.show_normal_warning(previous_count, current_count):
+                self.play_removal_sound()
             return
 
         # Normal Mode reacts only to a downward edge observed while Big Box is
@@ -5161,7 +5336,7 @@ class MagnetArcadeGuard:
         self.story_intro_completed = False
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
-        self.ring_burst_restore_pending = False
+        self.ring_burst_game_seen_since = 0.0
         self.controller_lost = True
         self.reader_connected = False
         self.overlay_gate_state = "WAITING_FOR_SENSOR"
@@ -5206,7 +5381,7 @@ class MagnetArcadeGuard:
         self.story_intro_completed = False
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
-        self.ring_burst_restore_pending = False
+        self.ring_burst_game_seen_since = 0.0
         self.cancel_completion()
         self.completion_in_progress = False
         self.reset_big_box_readiness()
@@ -5361,18 +5536,6 @@ class MagnetArcadeGuard:
         if self.audio_ready:
             try:
                 pygame.mixer.quit()
-            except pygame.error:
-                pass
-
-        if self.ring_joystick_initialized:
-            try:
-                pygame.joystick.quit()
-            except pygame.error:
-                pass
-
-        if self.ring_pygame_video_initialized:
-            try:
-                pygame.display.quit()
             except pygame.error:
                 pass
 

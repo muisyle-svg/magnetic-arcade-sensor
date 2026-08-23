@@ -1,9 +1,11 @@
-MAGNETIC ARCADE GUARD — STORY/NORMAL MODE DEVELOPMENT VERSION
+MAGNETIC ARCADE GUARD - RING RELIABILITY BUILD
 
-This project is intentionally separate from the stable pre-Story-Mode
-release. Its build output must remain inside this StoryModeVersion folder and
-must use a distinct executable name so it cannot overwrite the stable build.
+Build family: Ring-enabled Story/Normal Mode
+Update: 2026-08-22
 
-The frozen stable release is located at:
+Includes Windows-native ring input on joystick button 10, synchronized
+low-overhead cinematic playback, the graphical seven-segment Master Emerald
+power meter, Normal Mode return sounds, and safer Ring Power game handoff.
+
+The frozen stable release remains at:
 ..\versions\stable-pre-story-mode\
-

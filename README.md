@@ -41,9 +41,11 @@ Select either mode from the regular Windows operator panel. Selecting a mode act
 ## Ring input and one-game energy burst
 
 This build watches all connected USB joystick encoders independently of guard
-activation. Human-numbered joystick button 12 is treated as the coin/ring
-input; pygame reads that as button index 11. A press is edge-detected, so a
-held coin button counts once rather than repeatedly.
+activation. Human-numbered joystick button 10 is treated as the coin/ring
+input. The guard reads it through the Windows joystick API, so it does not
+need focus and does not compete with cinematic playback. A short 90 ms
+anti-bounce interval prevents one coin-switch pulse from counting twice while
+still allowing rings to be entered quickly.
 
 - Every ring is counted, including while the guard is dormant or deactivated.
 - The persistent total is stored in `%LOCALAPPDATA%\MagnetArcadeGuard\ring-counter.json`.
@@ -52,7 +54,9 @@ held coin button counts once rather than repeatedly.
 - In Normal Mode, the same burst is available when all seven emeralds are
   missing.
 - The burst remains available while the menu is idle. It becomes consumed only
-  after an emulator is detected and Big Box has safely returned. The Robotnik
+  after an emulator remains active for at least three seconds and Big Box has
+  safely returned. A failed or aborted game launch does not consume the burst.
+  The Robotnik
   screen is then restored in Story Mode if emeralds are still missing.
 - At the first total of 50 rings, the non-blocking message `50 RINGS!` and
   `Find Alex for your prize!` is shown when Big Box is safely visible. If a game
@@ -64,7 +68,7 @@ The ESP32 independently controls the existing red and green LED legs; the blue l
 
 - The resting color moves from red through orange, amber, and yellow-green to bright green as the detected count rises from 0 to 7.
 - The pulse gradually becomes faster as Chaos Energy rises.
-- The Robotnik screen shows a dedicated `MASTER EMERALD ENERGY` meter with a short stepped increase/decrease animation whenever the count changes.
+- The Robotnik screen shows a seven-segment graphical `MASTER EMERALD POWER` meter with a short stepped increase/decrease animation whenever the count changes.
 - Removing an emerald produces two red alarm flashes.
 - Returning an emerald produces a green absorption flash followed by a temporary faster energy pulse.
 - Returning the final emerald produces the three-stage green charge effect followed by the fast green pulse.
@@ -119,7 +123,7 @@ Status files are written to:
 
 ## Configuration
 
-Keep `guard-config.json` beside `MagnetArcadeGuardStoryMode.exe`.
+Keep `guard-config.json` beside `MagnetArcadeGuardRings.exe`.
 
 - `default_mode`: `story` or `normal`.
 - `auto_activate`: normally `false` so the operator chooses a mode after launching.
@@ -138,8 +142,11 @@ Keep `guard-config.json` beside `MagnetArcadeGuardStoryMode.exe`.
 - `removal_sound_files`: list of partial-theft sounds; the guard randomly chooses without repeating the previous clip.
 - `last_emerald_removal_sound_file`: dedicated sound for the seventh and final theft.
 - `final_completion_sound_file`: sound played after the victory music and Super Sonic animation.
-- `ring_joystick_button`: human-numbered joystick button used for rings; default `12`.
+- `ring_joystick_button`: human-numbered joystick button used for rings; default `10`.
+- `ring_debounce_ms`: short anti-bounce interval; default `90` ms.
+- `ring_game_commit_seconds`: how long an emulator must remain active before one Ring Power use is committed; default `3.0` seconds.
 - `ring_announcement_seconds`: how long the 50-ring message remains visible; default `5.0`.
+- `cinematic_max_fps`: maximum cinematic display rate; default `15` to keep audio and video synchronized on the arcade PC.
 
 Other GIF, MP3, and MP4 files beside the EXE also override their bundled copies when their configured filenames match.
 
