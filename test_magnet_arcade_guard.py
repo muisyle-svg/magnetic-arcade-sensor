@@ -95,6 +95,25 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(guard.ring_count, 5)
         self.assertEqual(announcements, ["count"])
 
+    def test_ring_entry_during_active_burst_does_not_rearm_the_burst(self):
+        guard = self.make_guard()
+        guard.ring_count = 8
+        guard.ring_milestones_shown = set()
+        guard.ring_milestones_pending = set()
+        guard.ring_burst_active = True
+        guard.pending_ring_milestone = False
+        guard.pending_ring_announcement = None
+        guard.save_ring_state = lambda: None
+        guard.write_status = lambda *args, **kwargs: None
+        announcements = []
+        guard.request_ring_announcement = announcements.append
+
+        guard.handle_ring_entry()
+
+        self.assertEqual(guard.ring_count, 9)
+        self.assertTrue(guard.ring_burst_active)
+        self.assertEqual(announcements, ["count"])
+
     def test_fiftieth_ring_queues_milestone_once(self):
         guard = self.make_guard()
         guard.ring_count = 49
@@ -165,6 +184,46 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(shown[0][0], guard_module.RING_COUNT_TITLE)
         self.assertIn("TOTAL RINGS: 12", shown[0][1])
         self.assertIsNone(guard.pending_ring_announcement)
+
+    def test_ring_power_announcement_waits_for_a_joystick_press(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.ring_count = 9
+        guard.pending_ring_milestone = False
+        guard.pending_ring_announcement = "burst"
+        guard.ring_power_announcement_visible = False
+        guard.write_status = lambda *args, **kwargs: None
+        shown = []
+        guard.show_plain_announcement = (
+            lambda title, detail, color, duration, **kwargs: (
+                shown.append((title, detail, color, duration)) or True
+            )
+        )
+
+        guard.maybe_show_pending_ring_announcement()
+
+        self.assertEqual(shown[0][0], guard_module.RING_BURST_TITLE)
+        self.assertIsNone(shown[0][3])
+        self.assertTrue(guard.ring_power_announcement_visible)
+
+    def test_joystick_press_dismisses_ring_power_and_reveals_pending_count(self):
+        guard = self.make_guard()
+        guard.ring_power_announcement_visible = True
+        guard.ring_power_ignore_until = 0.0
+        hidden = []
+        pending = []
+        guard.hide_story_announcement = (
+            lambda: hidden.append(True)
+        )
+        guard.maybe_show_pending_ring_announcement = (
+            lambda: pending.append(True)
+        )
+        guard.write_status = lambda *args, **kwargs: None
+
+        guard.handle_joystick_press()
+
+        self.assertEqual(hidden, [True])
+        self.assertEqual(pending, [True])
 
     def test_milestone_is_marked_shown_only_after_successful_display(self):
         guard = self.make_guard()
@@ -313,6 +372,7 @@ class GuardLogicTests(unittest.TestCase):
         guard.accepted_count = 2
         guard.guard_mode = "story"
         guard.story_intro_completed = True
+        guard.ring_burst_restore_robotnik = True
         pending = []
         guard.write_status = lambda *args, **kwargs: None
         guard.maybe_show_pending_overlay = lambda: pending.append(True)
@@ -355,6 +415,7 @@ class GuardLogicTests(unittest.TestCase):
         guard.accepted_count = guard_module.TOTAL_EMERALDS
         guard.guard_mode = "story"
         guard.story_intro_completed = True
+        guard.ring_burst_restore_robotnik = True
         guard.overlay_kind = None
         events = []
         guard.write_status = lambda *args, **kwargs: None

@@ -59,7 +59,9 @@ still allowing rings to be entered quickly.
   safely visible. The guard never creates a ring-count window over a running
   emulator.
 - When the Robotnik screen is active, one ring hides the takeover and gives a
-  one-game Ring Power burst.
+  one-game Ring Power burst. The Ring Power banner remains visible until the
+  next joystick button press; rings inserted during that game are counted but
+  never extend the burst.
 - In Normal Mode, the same burst is available when all seven emeralds are
   missing.
 - The burst remains available while the menu is idle. It becomes consumed only
@@ -159,7 +161,7 @@ Keep `guard-config.json` beside `MagnetArcadeGuardRings.exe`.
 - `final_completion_sound_file`: sound played after the victory music and Super Sonic animation.
 - `ring_joystick_button`: human-numbered joystick button used for rings; default `10`.
 - `ring_debounce_ms`: short anti-bounce interval; default `90` ms.
-- `ring_game_commit_seconds`: how long an emulator must remain active before one Ring Power use is committed; default `3.0` seconds.
+- `ring_game_commit_seconds`: how long an emulator must remain active before one Ring Power use is committed; default `3.0` seconds. Returning to Big Box restores the Robotnik screen if it granted the burst.
 - `ring_announcement_seconds`: how long the 50-ring message remains visible; default `5.0`.
 - `cinematic_max_fps`: maximum cinematic display rate; default `15` to keep audio and video synchronized on the arcade PC.
 

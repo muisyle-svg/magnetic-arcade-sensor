@@ -995,11 +995,14 @@ class MagnetArcadeGuard:
         self.ring_input_backend = "Windows joystick"
         self.ring_joystick_error = ""
         self.ring_joystick_signature = ()
-        self.ring_button_states = {}
+        self.joystick_button_states = {}
         self.ring_last_press_at = {}
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
+        self.ring_burst_restore_robotnik = False
+        self.ring_power_announcement_visible = False
+        self.ring_power_ignore_until = 0.0
         self.pending_ring_milestone = False
         self.pending_ring_announcement: Optional[str] = None
         self.ring_state_warning = ""
@@ -2200,6 +2203,7 @@ class MagnetArcadeGuard:
         return True
 
     def hide_story_announcement(self) -> None:
+        self.ring_power_announcement_visible = False
         if self.announcement_after_id is not None:
             try:
                 self.root.after_cancel(self.announcement_after_id)
@@ -2738,16 +2742,11 @@ class MagnetArcadeGuard:
 
     def ring_input_worker(self) -> None:
         """Watch every Windows joystick encoder for the configured coin input."""
-        try:
-            winmm = ctypes.windll.winmm
-            joystick_slots = max(1, int(winmm.joyGetNumDevs()))
-        except (AttributeError, OSError, ValueError) as error:
-            self.ring_joystick_error = str(error).replace("\n", " ")[:120]
-            return
-
-        button_mask = joystick_button_mask(RING_JOYSTICK_BUTTON)
         while self.running and not self.ring_input_stop_event.is_set():
             try:
+                winmm = ctypes.windll.winmm
+                joystick_slots = max(1, int(winmm.joyGetNumDevs()))
+                button_mask = joystick_button_mask(RING_JOYSTICK_BUTTON)
                 now = time.monotonic()
                 live_keys = set()
 
@@ -2763,33 +2762,49 @@ class MagnetArcadeGuard:
                         continue
 
                     live_keys.add(joystick_id)
-                    pressed = bool(joystick_state.dwButtons & button_mask)
-                    was_pressed = self.ring_button_states.get(joystick_id)
+                    buttons = int(joystick_state.dwButtons)
+                    previous_buttons = self.joystick_button_states.get(
+                        joystick_id
+                    )
+                    new_buttons = (
+                        buttons & ~previous_buttons
+                        if previous_buttons is not None
+                        else 0
+                    )
+                    ring_pressed = bool(buttons & button_mask)
+                    was_ring_pressed = bool(
+                        previous_buttons is not None
+                        and previous_buttons & button_mask
+                    )
                     last_press_at = self.ring_last_press_at.get(
                         joystick_id,
                         0.0,
                     )
                     if (
-                        pressed
-                        and was_pressed is False
+                        ring_pressed
+                        and not was_ring_pressed
                         and now - last_press_at >= RING_DEBOUNCE_SECONDS
                     ):
                         self.ring_last_press_at[joystick_id] = now
                         self.messages.put(("RING", str(joystick_id), -1))
-                    self.ring_button_states[joystick_id] = pressed
+                    if new_buttons:
+                        self.messages.put(
+                            ("JOYSTICK_PRESS", str(joystick_id), -1)
+                        )
+                    self.joystick_button_states[joystick_id] = buttons
 
-                for state_key in tuple(self.ring_button_states):
+                for state_key in tuple(self.joystick_button_states):
                     if state_key not in live_keys:
-                        del self.ring_button_states[state_key]
+                        del self.joystick_button_states[state_key]
                         self.ring_last_press_at.pop(state_key, None)
 
                 self.ring_joystick_signature = tuple(
                     sorted(live_keys)
                 )
                 self.ring_joystick_error = ""
-            except (AttributeError, OSError, ValueError) as error:
+            except Exception as error:
                 self.ring_joystick_error = str(error)[:120]
-                self.ring_button_states.clear()
+                self.joystick_button_states.clear()
                 if self.ring_input_stop_event.wait(0.5):
                     break
                 continue
@@ -2826,6 +2841,12 @@ class MagnetArcadeGuard:
         burst_started = False
         if not self.ring_burst_active and self.ring_burst_is_eligible():
             burst_started = True
+            self.ring_burst_restore_robotnik = bool(
+                self.guard_mode == "story"
+                and self.story_intro_completed
+                and self.overlay_visible
+                and self.overlay_kind == "robotnik"
+            )
             self.ring_burst_active = True
             self.ring_burst_game_seen = False
             self.ring_burst_game_seen_since = 0.0
@@ -2880,7 +2901,7 @@ class MagnetArcadeGuard:
         title: str,
         detail: str,
         color: str,
-        duration_seconds: float,
+        duration_seconds: Optional[float],
         allow_guard_overlay: bool = False,
     ) -> bool:
         guard_overlay_is_safe = (
@@ -2947,10 +2968,12 @@ class MagnetArcadeGuard:
         except (AttributeError, tk.TclError):
             pass
 
-        self.announcement_after_id = self.root.after(
-            int(duration_seconds * 1000),
-            self.hide_story_announcement,
-        )
+        self.announcement_after_id = None
+        if duration_seconds is not None:
+            self.announcement_after_id = self.root.after(
+                int(duration_seconds * 1000),
+                self.hide_story_announcement,
+            )
         return True
 
     def request_ring_announcement(self, announcement_kind: str) -> None:
@@ -2958,6 +2981,8 @@ class MagnetArcadeGuard:
         current = getattr(self, "pending_ring_announcement", None)
         if priorities.get(announcement_kind, 0) >= priorities.get(current, 0):
             self.pending_ring_announcement = announcement_kind
+        if getattr(self, "ring_power_announcement_visible", False):
+            return
         self.maybe_show_pending_ring_announcement()
 
     def maybe_show_pending_ring_announcement(self) -> None:
@@ -2969,6 +2994,8 @@ class MagnetArcadeGuard:
             "pending_ring_announcement",
             None,
         )
+        if getattr(self, "ring_power_announcement_visible", False):
+            return
         if self.pending_ring_milestone:
             announcement_kind = "milestone"
         if announcement_kind is None:
@@ -2985,7 +3012,7 @@ class MagnetArcadeGuard:
             title = RING_BURST_TITLE
             detail = f"{RING_BURST_MESSAGE}\nTOTAL RINGS: {self.ring_count}"
             color = "#66ff99"
-            duration = RING_BURST_ANNOUNCEMENT_SECONDS
+            duration = None
         else:
             title = RING_COUNT_TITLE
             detail = f"TOTAL RINGS: {self.ring_count}"
@@ -3005,6 +3032,12 @@ class MagnetArcadeGuard:
             return
 
         self.pending_ring_announcement = None
+        if announcement_kind == "burst":
+            self.ring_power_announcement_visible = True
+            # The ring insertion that caused this announcement also produces
+            # a joystick-edge event. Ignore that same scan so the new banner
+            # cannot disappear immediately.
+            self.ring_power_ignore_until = time.monotonic() + 0.25
         if announcement_kind == "milestone":
             self.pending_ring_milestone = False
             self.ring_milestones_pending.discard(RING_MILESTONE)
@@ -3019,6 +3052,17 @@ class MagnetArcadeGuard:
                 f"kind={announcement_kind} | total={self.ring_count}"
             )
 
+    def handle_joystick_press(self) -> None:
+        """Dismiss a persistent Ring Power banner on the next button press."""
+        if not getattr(self, "ring_power_announcement_visible", False):
+            return
+        if time.monotonic() < self.ring_power_ignore_until:
+            return
+
+        self.hide_story_announcement()
+        self.write_status("RING POWER ANNOUNCEMENT DISMISSED | joystick")
+        self.maybe_show_pending_ring_announcement()
+
     def maybe_show_pending_ring_milestone(self) -> None:
         """Compatibility wrapper retained for older tests and diagnostics."""
         self.maybe_show_pending_ring_announcement()
@@ -3027,15 +3071,25 @@ class MagnetArcadeGuard:
         if not self.ring_burst_active:
             return
 
+        restore_robotnik = getattr(
+            self,
+            "ring_burst_restore_robotnik",
+            False,
+        )
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
+        self.ring_burst_restore_robotnik = False
         self.write_status("RING BURST CONSUMED | Big Box returned")
 
         if not self.guard_active:
             return
 
-        if self.guard_mode == "story" and self.story_intro_completed:
+        if (
+            restore_robotnik
+            and self.guard_mode == "story"
+            and self.story_intro_completed
+        ):
             if self.accepted_count == TOTAL_EMERALDS:
                 self.show_missing_overlay(0)
                 if self.guard_active and self.overlay_kind == "robotnik":
@@ -4731,15 +4785,50 @@ class MagnetArcadeGuard:
             self.root.withdraw()
         except tk.TclError:
             pass
-        if not self.restore_other_audio_with_retries():
-            if not self.last_fault:
-                self.last_fault = "Could not restore background audio"
-            self.guard_active = False
-            self.overlay_gate_state = "DISABLED_ERROR"
-            self.write_status(
-                "GUARD DISABLED | could not restore background audio"
-            )
+        # Big Box is still suspended while an ordinary takeover is being
+        # closed. Ring Power is the one transition that immediately hands the
+        # menu back for a game, so resume it before restoring its audio
+        # session; otherwise Windows can reject the volume/mute restoration
+        # and unnecessarily disable the guard.
+        if self.ring_burst_active:
+            self.resume_return_process()
+
+        audio_restored = self.restore_other_audio_with_retries()
+        if not audio_restored:
+            if self.ring_burst_active:
+                self.write_status(
+                    "RING BURST AUDIO RESTORE DEFERRED | retrying"
+                )
+                if self.running:
+                    self.root.after(
+                        250,
+                        self.retry_ring_burst_audio_restore,
+                    )
+            else:
+                if not self.last_fault:
+                    self.last_fault = "Could not restore background audio"
+                self.guard_active = False
+                self.overlay_gate_state = "DISABLED_ERROR"
+                self.write_status(
+                    "GUARD DISABLED | could not restore background audio"
+                )
         self.resume_and_restore_return_window()
+
+    def retry_ring_burst_audio_restore(self, attempt: int = 0) -> None:
+        if not self.running or not self.ring_burst_active:
+            return
+        if self.restore_other_audio_with_retries():
+            self.write_status("RING BURST AUDIO RESTORED")
+            return
+        if attempt < 12:
+            self.root.after(
+                250,
+                lambda: self.retry_ring_burst_audio_restore(attempt + 1),
+            )
+            return
+        self.write_status(
+            "RING BURST AUDIO RESTORE STILL PENDING | continuing safely"
+        )
 
     def show_completion_message(self) -> None:
         if self.completion_in_progress:
@@ -5571,6 +5660,10 @@ class MagnetArcadeGuard:
                     self.handle_ring_entry()
                     continue
 
+                if message_type == "JOYSTICK_PRESS":
+                    self.handle_joystick_press()
+                    continue
+
                 if generation != self.activation_generation:
                     continue
 
@@ -5684,6 +5777,7 @@ class MagnetArcadeGuard:
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
+        self.ring_burst_restore_robotnik = False
         self.controller_lost = True
         self.reader_connected = False
         self.overlay_gate_state = "WAITING_FOR_SENSOR"
@@ -5729,6 +5823,7 @@ class MagnetArcadeGuard:
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
+        self.ring_burst_restore_robotnik = False
         self.cancel_completion()
         self.completion_in_progress = False
         self.reset_big_box_readiness()
