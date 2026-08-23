@@ -1,13 +1,16 @@
 MAGNETIC ARCADE GUARD - RING COUNTER BUILD
 
 Build family: Ring-enabled Story/Normal Mode
-Update: 2026-08-22
+Update: 2026-08-23
 
 Includes Windows-native ring input on joystick button 10, synchronized
 low-overhead cinematic playback, the graphical seven-segment Master Emerald
 power meter, Normal Mode return sounds, safer Ring Power game handoff, a
 confirmed ring-count reset, and safe ring-total announcements over Big Box or
-the guard screen, never over a running emulator.
+the guard screen, never over a running emulator. This reliability revision
+adds validated serial heartbeats, fixed seven-sensor configuration checks,
+configurable emulator names, ring-counter backup recovery, and durable pending
+50-ring prize announcements.
 
 The frozen stable release remains at:
 ..\versions\stable-pre-story-mode\

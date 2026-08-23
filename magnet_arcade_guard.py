@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import random
+import shutil
 import subprocess
 import sys
 import threading
@@ -88,8 +89,17 @@ except ImportError:
 bootstrap_event("module imports complete")
 
 
+FIRMWARE_TOTAL_EMERALDS = 7
+DEFAULT_EMULATOR_PROCESS_NAMES = (
+    "mame.exe",
+    "mame64.exe",
+    "groovymame.exe",
+    "retroarch.exe",
+)
+
+
 DEFAULT_CONFIG = {
-    "total_emeralds": 7,
+    "total_emeralds": FIRMWARE_TOTAL_EMERALDS,
     "auto_activate": False,
     "serial_port": "",
     "big_box_ready_delay_seconds": 1.5,
@@ -123,6 +133,7 @@ DEFAULT_CONFIG = {
     "ring_debounce_ms": 90,
     "ring_game_commit_seconds": 3.0,
     "ring_announcement_seconds": 5.0,
+    "emulator_process_names": list(DEFAULT_EMULATOR_PROCESS_NAMES),
     "cinematic_max_fps": 15,
     "cinematic_video_file": (
         "2015-02-19-SonictheHedgehogCD-Opening"
@@ -150,13 +161,25 @@ def load_runtime_config() -> dict:
 
 
 RUNTIME_CONFIG = load_runtime_config()
+CONFIG_VALIDATION_ERRORS = []
 try:
-    TOTAL_EMERALDS = max(
-        1,
-        min(12, int(RUNTIME_CONFIG["total_emeralds"])),
-    )
+    configured_total_value = RUNTIME_CONFIG["total_emeralds"]
+    if isinstance(configured_total_value, bool):
+        raise ValueError
+    configured_total_emeralds = int(configured_total_value)
+    if (
+        isinstance(configured_total_value, float)
+        and not configured_total_value.is_integer()
+    ):
+        raise ValueError
 except (KeyError, TypeError, ValueError):
-    TOTAL_EMERALDS = 7
+    configured_total_emeralds = None
+
+if configured_total_emeralds != FIRMWARE_TOTAL_EMERALDS:
+    CONFIG_VALIDATION_ERRORS.append(
+        "total_emeralds must be 7 to match the installed firmware and sensors"
+    )
+TOTAL_EMERALDS = FIRMWARE_TOTAL_EMERALDS
 
 
 
@@ -187,6 +210,25 @@ def config_number(
     return max(minimum, min(maximum, number))
 
 
+def config_process_names(value, defaults) -> frozenset[str]:
+    """Normalize configured Windows executable names with safe defaults."""
+    if not isinstance(value, list):
+        return frozenset(defaults)
+
+    normalized = set()
+    for candidate in value:
+        if not isinstance(candidate, str):
+            continue
+        process_name = Path(candidate.strip()).name.lower()
+        if not process_name:
+            continue
+        if "." not in process_name:
+            process_name += ".exe"
+        normalized.add(process_name)
+
+    return frozenset(normalized or defaults)
+
+
 def joystick_button_mask(human_button_number: int) -> int:
     """Convert a 1-based Windows joystick button number to its bit mask."""
     return 1 << max(0, int(human_button_number) - 1)
@@ -203,17 +245,15 @@ PREFERRED_SERIAL_PORT = str(
 # MAME/GroovyMAME or RetroArch fullscreen surface can own the display mode,
 # so the guard waits for Big Box to return to its menu before appearing.
 BIG_BOX_PROCESS_NAME = "bigbox.exe"
-EMULATOR_PROCESS_NAMES = {
-    "mame.exe",
-    "mame64.exe",
-    "groovymame.exe",
-    "retroarch.exe",
-}
+EMULATOR_PROCESS_NAMES = config_process_names(
+    RUNTIME_CONFIG.get("emulator_process_names"),
+    DEFAULT_EMULATOR_PROCESS_NAMES,
+)
 
 BAUD_RATE = 115200
-# The serial reader thread timestamps raw heartbeats independently of the Tk
-# UI thread. The extra margin also tolerates a slow Windows audio/session
-# operation without declaring a healthy ESP32 disconnected.
+# The timeout margin tolerates a slow Windows audio/session operation without
+# declaring a healthy ESP32 disconnected. Only validated READY/COUNT messages
+# refresh it; malformed protocol-like traffic must not defeat fail-open.
 CONNECTION_TIMEOUT_SECONDS = 5.0
 RECONNECT_DELAY_SECONDS = 1.0
 STABLE_COUNT_SECONDS = config_number(
@@ -334,6 +374,7 @@ RING_BURST_MESSAGE = (
     "ONE GAME OF CHAOS POWER CHARGED!"
 )
 RING_BURST_ANNOUNCEMENT_SECONDS = 2.0
+RING_STATE_VERSION = 2
 CINEMATIC_MAX_FPS = config_number(
     RUNTIME_CONFIG.get("cinematic_max_fps", 15),
     15,
@@ -361,6 +402,73 @@ except (TypeError, ValueError):
 COMPLETION_FALLBACK_SECONDS = 5.0
 COMPLETION_MAX_SECONDS = 120.0
 PROTOCOL_PREFIX = "MAGNET_LOCK:"
+
+
+def parse_magnet_protocol_message(
+    message: str,
+) -> Optional[tuple[str, Optional[int]]]:
+    """Return a validated protocol event, or None for malformed traffic."""
+    if message == PROTOCOL_PREFIX + "READY":
+        return "ready", None
+
+    count_prefix = PROTOCOL_PREFIX + "COUNT:"
+    if not message.startswith(count_prefix):
+        return None
+    count_text = message[len(count_prefix):]
+    if not count_text.isdecimal():
+        return None
+    count = int(count_text)
+    if not 0 <= count <= TOTAL_EMERALDS:
+        return None
+    return "count", count
+
+
+def parse_ring_state_payload(payload) -> tuple[int, set[int], set[int]]:
+    """Validate both current and legacy persistent ring-counter payloads."""
+    if not isinstance(payload, dict):
+        raise ValueError("ring state must be a JSON object")
+
+    total_value = payload.get("total_rings", 0)
+    if isinstance(total_value, bool):
+        raise ValueError("total_rings must be a non-negative integer")
+    if isinstance(total_value, float) and not total_value.is_integer():
+        raise ValueError("total_rings must be a non-negative integer")
+    try:
+        total = int(total_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "total_rings must be a non-negative integer"
+        ) from error
+    if total < 0:
+        raise ValueError("total_rings must be a non-negative integer")
+
+    def milestone_values(field_name: str) -> set[int]:
+        raw_values = payload.get(field_name, [])
+        if not isinstance(raw_values, list):
+            raise ValueError(f"{field_name} must be a list")
+        result = set()
+        for raw_value in raw_values:
+            if isinstance(raw_value, bool):
+                raise ValueError(f"{field_name} contains an invalid value")
+            if isinstance(raw_value, float) and not raw_value.is_integer():
+                raise ValueError(f"{field_name} contains an invalid value")
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{field_name} contains an invalid value"
+                ) from error
+            if value <= 0:
+                raise ValueError(
+                    f"{field_name} contains an invalid value"
+                )
+            result.add(value)
+        return result
+
+    shown = milestone_values("milestones_shown")
+    pending = milestone_values("milestones_pending")
+    pending.difference_update(shown)
+    return total, shown, pending
 
 BACKGROUND_IMAGE_NAME = "egg-man-robotnik.gif"
 COMPLETION_IMAGE_NAME = "sonic-sonic-the-hedgehog.gif"
@@ -894,6 +1002,7 @@ class MagnetArcadeGuard:
         self.ring_burst_game_seen_since = 0.0
         self.pending_ring_milestone = False
         self.pending_ring_announcement: Optional[str] = None
+        self.ring_state_warning = ""
         local_app_data = Path(
             os.environ.get(
                 "LOCALAPPDATA",
@@ -915,9 +1024,25 @@ class MagnetArcadeGuard:
             / "MagnetArcadeGuard"
             / "ring-counter.json"
         )
-        self.ring_count, self.ring_milestones_shown = (
-            self.load_ring_state()
+        self.ring_counter_backup_path = (
+            local_app_data
+            / "MagnetArcadeGuard"
+            / "ring-counter.backup.json"
         )
+        (
+            self.ring_count,
+            self.ring_milestones_shown,
+            self.ring_milestones_pending,
+        ) = self.load_ring_state()
+        self.pending_ring_milestone = (
+            RING_MILESTONE in self.ring_milestones_pending
+        )
+        if self.pending_ring_milestone:
+            self.pending_ring_announcement = "milestone"
+        if self.ring_state_warning:
+            self.write_status(
+                "RING COUNTER WARNING | " + self.ring_state_warning
+            )
         self.reader_connected = False
         self.last_good_port = PREFERRED_SERIAL_PORT
         self.last_valid_message = 0.0
@@ -2476,49 +2601,140 @@ class MagnetArcadeGuard:
         except OSError:
             pass
 
-    def load_ring_state(self) -> tuple[int, set[int]]:
-        """Load the persistent ring total without making startup fragile."""
-        try:
-            loaded = json.loads(
-                self.ring_counter_path.read_text(encoding="utf-8")
+    def preserve_corrupt_ring_state(self, source_path: Path) -> Optional[Path]:
+        """Keep an inspectable copy instead of silently discarding bad data."""
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        for suffix in range(100):
+            suffix_text = "" if suffix == 0 else f"-{suffix + 1}"
+            preserved_path = source_path.with_name(
+                f"{source_path.stem}.corrupt-{timestamp}{suffix_text}"
+                f"{source_path.suffix}"
             )
-            total = max(0, int(loaded.get("total_rings", 0)))
-            milestones = {
-                int(value)
-                for value in loaded.get("milestones_shown", [])
-                if int(value) > 0
-            }
-            return total, milestones
-        except (AttributeError, FileNotFoundError, OSError, TypeError, ValueError):
-            return 0, set()
+            if preserved_path.exists():
+                continue
+            try:
+                shutil.copy2(source_path, preserved_path)
+                return preserved_path
+            except OSError:
+                return None
+        return None
+
+    def read_ring_state_file(
+        self,
+        state_path: Path,
+    ) -> tuple[int, set[int], set[int]]:
+        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+        return parse_ring_state_payload(loaded)
+
+    def load_ring_state(self) -> tuple[int, set[int], set[int]]:
+        """Load the primary counter, recovering visibly from its backup."""
+        self.ring_state_warning = ""
+        primary_exists = self.ring_counter_path.exists()
+        if primary_exists:
+            try:
+                return self.read_ring_state_file(self.ring_counter_path)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                preserved = self.preserve_corrupt_ring_state(
+                    self.ring_counter_path
+                )
+                preservation_text = (
+                    f" preserved as {preserved.name}." if preserved else ""
+                )
+                self.ring_state_warning = (
+                    "Primary ring counter was unreadable;" + preservation_text
+                )
+
+        backup_exists = self.ring_counter_backup_path.exists()
+        if backup_exists:
+            try:
+                recovered = self.read_ring_state_file(
+                    self.ring_counter_backup_path
+                )
+                reason = (
+                    "primary was unreadable"
+                    if primary_exists
+                    else "primary was missing"
+                )
+                self.ring_state_warning += (
+                    f" Recovered from backup because the {reason}."
+                )
+                recovered_total, recovered_shown, recovered_pending = (
+                    recovered
+                )
+                recovered_payload = {
+                    "version": RING_STATE_VERSION,
+                    "total_rings": recovered_total,
+                    "milestones_shown": sorted(recovered_shown),
+                    "milestones_pending": sorted(recovered_pending),
+                }
+                try:
+                    self.write_ring_state_file(
+                        self.ring_counter_path,
+                        recovered_payload,
+                    )
+                    self.ring_state_warning += " Primary file repaired."
+                except OSError:
+                    self.ring_state_warning += (
+                        " Primary file could not be repaired."
+                    )
+                return recovered
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                self.preserve_corrupt_ring_state(
+                    self.ring_counter_backup_path
+                )
+                self.ring_state_warning += (
+                    " Backup ring counter was also unreadable."
+                )
+
+        if primary_exists or backup_exists:
+            self.ring_state_warning += " Ring total started at 0."
+        return 0, set(), set()
+
+    def write_ring_state_file(self, destination: Path, payload: dict) -> None:
+        temporary_path = destination.with_name(destination.name + ".tmp")
+        temporary_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(destination)
 
     def save_ring_state(self) -> None:
+        payload = {
+            "version": RING_STATE_VERSION,
+            "total_rings": self.ring_count,
+            "milestones_shown": sorted(self.ring_milestones_shown),
+            "milestones_pending": sorted(self.ring_milestones_pending),
+        }
         try:
             self.ring_counter_path.parent.mkdir(
                 parents=True,
                 exist_ok=True,
             )
-            temporary_path = self.ring_counter_path.with_suffix(".tmp")
-            temporary_path.write_text(
-                json.dumps(
-                    {
-                        "total_rings": self.ring_count,
-                        "milestones_shown": sorted(
-                            self.ring_milestones_shown
-                        ),
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            temporary_path.replace(self.ring_counter_path)
+            self.write_ring_state_file(self.ring_counter_path, payload)
         except OSError:
+            self.ring_state_warning = "Primary ring-counter save failed."
             self.write_status(
                 "RING COUNTER SAVE FAILED | total="
                 + str(self.ring_count),
                 event=False,
             )
+            return
+
+        try:
+            self.write_ring_state_file(
+                self.ring_counter_backup_path,
+                payload,
+            )
+        except OSError:
+            self.ring_state_warning = "Ring-counter backup save failed."
+            self.write_status(
+                "RING COUNTER BACKUP FAILED | total="
+                + str(self.ring_count),
+                event=False,
+            )
+            return
+
+        self.ring_state_warning = ""
 
     def ring_input_worker(self) -> None:
         """Watch every Windows joystick encoder for the configured coin input."""
@@ -2593,18 +2809,19 @@ class MagnetArcadeGuard:
     def handle_ring_entry(self) -> None:
         previous_total = self.ring_count
         self.ring_count += 1
-        self.save_ring_state()
-        self.write_status(
-            f"RING ENTERED | total={self.ring_count}",
-        )
 
         if (
             previous_total < RING_MILESTONE <= self.ring_count
             and RING_MILESTONE not in self.ring_milestones_shown
+            and RING_MILESTONE not in self.ring_milestones_pending
         ):
-            self.ring_milestones_shown.add(RING_MILESTONE)
-            self.save_ring_state()
+            self.ring_milestones_pending.add(RING_MILESTONE)
             self.pending_ring_milestone = True
+
+        self.save_ring_state()
+        self.write_status(
+            f"RING ENTERED | total={self.ring_count}",
+        )
 
         burst_started = False
         if not self.ring_burst_active and self.ring_burst_is_eligible():
@@ -2632,6 +2849,7 @@ class MagnetArcadeGuard:
         previous_total = self.ring_count
         self.ring_count = 0
         self.ring_milestones_shown.clear()
+        self.ring_milestones_pending.clear()
         self.pending_ring_milestone = False
         self.pending_ring_announcement = None
         self.save_ring_state()
@@ -2789,6 +3007,9 @@ class MagnetArcadeGuard:
         self.pending_ring_announcement = None
         if announcement_kind == "milestone":
             self.pending_ring_milestone = False
+            self.ring_milestones_pending.discard(RING_MILESTONE)
+            self.ring_milestones_shown.add(RING_MILESTONE)
+            self.save_ring_state()
             self.write_status(
                 f"RING MILESTONE DISPLAYED | total={self.ring_count}"
             )
@@ -3110,12 +3331,18 @@ class MagnetArcadeGuard:
                 f"{joystick_count} {joystick_word}, button "
                 f"{RING_JOYSTICK_BUTTON}, {round(RING_DEBOUNCE_SECONDS * 1000)}ms debounce"
             )
+        ring_data_text = (
+            "WARNING - check guard-events.log"
+            if self.ring_state_warning
+            else "primary + backup OK"
+        )
         details_text = (
             f"Reader: {reader_text}    "
             f"Foreground: {self.foreground_process_name}\n"
             f"Gate: {self.overlay_gate_state}    "
             f"Input: {input_text}\n"
             f"Rings entered: {self.ring_count}    "
+            f"Ring data: {ring_data_text}\n"
             f"Ring input: {ring_input_text}\n"
             "Return SFX: ready    Removal SFX: "
             + ("ready" if self.removal_sound is not None else "not installed")
@@ -5027,7 +5254,7 @@ class MagnetArcadeGuard:
                     errors="ignore",
                 ).strip()
 
-                if line.startswith(PROTOCOL_PREFIX):
+                if parse_magnet_protocol_message(line) is not None:
                     self.last_good_port = port_name
                     self.messages.put(("SERIAL", line, generation))
                     return device
@@ -5101,8 +5328,7 @@ class MagnetArcadeGuard:
                         errors="ignore",
                     ).strip()
 
-                    if line.startswith(PROTOCOL_PREFIX):
-                        self.last_serial_message_at = time.monotonic()
+                    if parse_magnet_protocol_message(line) is not None:
                         self.messages.put(
                             (
                                 "SERIAL",
@@ -5137,24 +5363,17 @@ class MagnetArcadeGuard:
         if not self.guard_active:
             return
 
-        if message == "MAGNET_LOCK:READY":
+        parsed_message = parse_magnet_protocol_message(message)
+        if parsed_message is None:
+            return
+
+        event_kind, count = parsed_message
+        if event_kind == "ready":
             self.reader_connected = True
             self.controller_lost = False
             now = time.monotonic()
             self.last_valid_message = now
             self.last_serial_message_at = now
-            return
-
-        prefix = "MAGNET_LOCK:COUNT:"
-        if not message.startswith(prefix):
-            return
-
-        try:
-            count = int(message[len(prefix):])
-        except ValueError:
-            return
-
-        if not 0 <= count <= TOTAL_EMERALDS:
             return
 
         self.reader_connected = True
@@ -5387,7 +5606,7 @@ class MagnetArcadeGuard:
     # --------------------------------------------------
 
     def guard_readiness_error(self) -> str:
-        problems = []
+        problems = list(CONFIG_VALIDATION_ERRORS)
 
         if self.guard_mode == "story":
             if not PIL_AVAILABLE:

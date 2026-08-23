@@ -1,3 +1,4 @@
+import json
 import os
 import queue
 import tempfile
@@ -33,6 +34,44 @@ class GuardLogicTests(unittest.TestCase):
             100,
         )
 
+    def test_emulator_process_names_are_normalized_and_configurable(self):
+        self.assertEqual(
+            guard_module.config_process_names(
+                [" MAME.EXE ", r"C:\\Arcade\\new-emulator", ""],
+                ("fallback.exe",),
+            ),
+            frozenset({"mame.exe", "new-emulator.exe"}),
+        )
+        self.assertEqual(
+            guard_module.config_process_names([], ("fallback.exe",)),
+            frozenset({"fallback.exe"}),
+        )
+
+    def test_protocol_parser_rejects_malformed_heartbeat_traffic(self):
+        self.assertEqual(
+            guard_module.parse_magnet_protocol_message(
+                "MAGNET_LOCK:READY"
+            ),
+            ("ready", None),
+        )
+        self.assertEqual(
+            guard_module.parse_magnet_protocol_message(
+                "MAGNET_LOCK:COUNT:7"
+            ),
+            ("count", 7),
+        )
+        for malformed in (
+            "MAGNET_LOCK:",
+            "MAGNET_LOCK:COUNT:nope",
+            "MAGNET_LOCK:COUNT:+7",
+            "MAGNET_LOCK:COUNT: 7",
+            "MAGNET_LOCK:COUNT:8",
+            "MAGNET_LOCK:UNKNOWN",
+        ):
+            self.assertIsNone(
+                guard_module.parse_magnet_protocol_message(malformed)
+            )
+
     def test_ring_button_number_maps_to_windows_button_mask(self):
         self.assertEqual(guard_module.joystick_button_mask(10), 1 << 9)
         self.assertEqual(guard_module.joystick_button_mask(1), 1)
@@ -41,6 +80,7 @@ class GuardLogicTests(unittest.TestCase):
         guard = self.make_guard()
         guard.ring_count = 4
         guard.ring_milestones_shown = set()
+        guard.ring_milestones_pending = set()
         guard.ring_burst_active = False
         guard.pending_ring_milestone = False
         guard.save_ring_state = lambda: None
@@ -59,6 +99,7 @@ class GuardLogicTests(unittest.TestCase):
         guard = self.make_guard()
         guard.ring_count = 49
         guard.ring_milestones_shown = set()
+        guard.ring_milestones_pending = set()
         guard.ring_burst_active = False
         guard.pending_ring_milestone = False
         guard.save_ring_state = lambda: None
@@ -73,12 +114,20 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(guard.ring_count, 50)
         self.assertTrue(guard.pending_ring_milestone)
         self.assertEqual(announcements, ["milestone"])
-        self.assertIn(guard_module.RING_MILESTONE, guard.ring_milestones_shown)
+        self.assertNotIn(
+            guard_module.RING_MILESTONE,
+            guard.ring_milestones_shown,
+        )
+        self.assertIn(
+            guard_module.RING_MILESTONE,
+            guard.ring_milestones_pending,
+        )
 
     def test_reset_ring_count_clears_total_and_rearms_milestone(self):
         guard = self.make_guard()
         guard.ring_count = 57
         guard.ring_milestones_shown = {guard_module.RING_MILESTONE}
+        guard.ring_milestones_pending = {100}
         guard.pending_ring_milestone = True
         guard.pending_ring_announcement = "milestone"
         saved = []
@@ -91,6 +140,7 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(guard.ring_count, 0)
         self.assertEqual(guard.ring_milestones_shown, set())
+        self.assertEqual(guard.ring_milestones_pending, set())
         self.assertFalse(guard.pending_ring_milestone)
         self.assertIsNone(guard.pending_ring_announcement)
         self.assertEqual(saved, [True])
@@ -115,6 +165,92 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(shown[0][0], guard_module.RING_COUNT_TITLE)
         self.assertIn("TOTAL RINGS: 12", shown[0][1])
         self.assertIsNone(guard.pending_ring_announcement)
+
+    def test_milestone_is_marked_shown_only_after_successful_display(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.ring_count = 50
+        guard.ring_milestones_shown = set()
+        guard.ring_milestones_pending = {guard_module.RING_MILESTONE}
+        guard.pending_ring_milestone = True
+        guard.pending_ring_announcement = "milestone"
+        guard.write_status = lambda *args, **kwargs: None
+        saved = []
+        guard.save_ring_state = lambda: saved.append(True)
+        guard.show_plain_announcement = lambda *args, **kwargs: True
+
+        guard.maybe_show_pending_ring_announcement()
+
+        self.assertFalse(guard.pending_ring_milestone)
+        self.assertEqual(guard.ring_milestones_pending, set())
+        self.assertEqual(
+            guard.ring_milestones_shown,
+            {guard_module.RING_MILESTONE},
+        )
+        self.assertEqual(saved, [True])
+
+    def test_pending_milestone_survives_ring_state_reload(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_directory = Path(temporary_directory)
+            guard = self.make_guard()
+            guard.ring_counter_path = state_directory / "ring-counter.json"
+            guard.ring_counter_backup_path = (
+                state_directory / "ring-counter.backup.json"
+            )
+            guard.ring_count = 50
+            guard.ring_milestones_shown = set()
+            guard.ring_milestones_pending = {
+                guard_module.RING_MILESTONE
+            }
+            guard.ring_state_warning = ""
+            guard.write_status = lambda *args, **kwargs: None
+
+            guard.save_ring_state()
+
+            reloaded = self.make_guard()
+            reloaded.ring_counter_path = guard.ring_counter_path
+            reloaded.ring_counter_backup_path = (
+                guard.ring_counter_backup_path
+            )
+            total, shown, pending = reloaded.load_ring_state()
+            self.assertEqual(total, 50)
+            self.assertEqual(shown, set())
+            self.assertEqual(
+                pending,
+                {guard_module.RING_MILESTONE},
+            )
+
+    def test_ring_state_rejects_fractional_totals(self):
+        with self.assertRaises(ValueError):
+            guard_module.parse_ring_state_payload(
+                {"total_rings": 49.5, "milestones_shown": []}
+            )
+
+    def test_corrupt_primary_ring_state_recovers_from_backup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_directory = Path(temporary_directory)
+            primary = state_directory / "ring-counter.json"
+            backup = state_directory / "ring-counter.backup.json"
+            primary.write_text("{not valid json", encoding="utf-8")
+            backup.write_text(
+                '{"total_rings": 37, "milestones_shown": []}\n',
+                encoding="utf-8",
+            )
+            guard = self.make_guard()
+            guard.ring_counter_path = primary
+            guard.ring_counter_backup_path = backup
+
+            total, shown, pending = guard.load_ring_state()
+
+            self.assertEqual((total, shown, pending), (37, set(), set()))
+            self.assertIn("Recovered from backup", guard.ring_state_warning)
+            self.assertIn("Primary file repaired", guard.ring_state_warning)
+            repaired = json.loads(primary.read_text(encoding="utf-8"))
+            self.assertEqual(repaired["total_rings"], 37)
+            self.assertEqual(
+                len(list(state_directory.glob("ring-counter.corrupt-*.json"))),
+                1,
+            )
 
     def test_ring_count_announcement_waits_when_big_box_is_not_safe(self):
         guard = self.make_guard()
@@ -314,6 +450,37 @@ class GuardLogicTests(unittest.TestCase):
         self.assertTrue(guard.controller_lost)
         self.assertIsNone(guard.pending_count)
         self.assertEqual(reasons, ["ESP32 unplugged"])
+
+    def test_malformed_serial_message_does_not_refresh_heartbeat(self):
+        guard = self.make_guard()
+        guard.guard_active = True
+        guard.reader_connected = False
+        guard.controller_lost = True
+        guard.last_valid_message = 10.0
+        guard.last_serial_message_at = 10.0
+        guard.pending_count = None
+
+        guard.handle_serial_message("MAGNET_LOCK:COUNT:corrupt")
+
+        self.assertFalse(guard.reader_connected)
+        self.assertEqual(guard.last_valid_message, 10.0)
+        self.assertEqual(guard.last_serial_message_at, 10.0)
+
+    def test_invalid_sensor_count_configuration_blocks_activation(self):
+        guard = self.make_guard()
+        guard.guard_mode = "normal"
+        with (
+            patch.object(
+                guard_module,
+                "CONFIG_VALIDATION_ERRORS",
+                ["total_emeralds must be 7"],
+            ),
+            patch.object(guard_module, "PYCAW_AVAILABLE", True),
+        ):
+            self.assertIn(
+                "total_emeralds must be 7",
+                guard.guard_readiness_error(),
+            )
 
     def test_same_recent_event_sound_does_not_overlap(self):
         class FakeChannel:

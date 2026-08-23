@@ -28,6 +28,12 @@
   "ring_debounce_ms": 90,
   "ring_game_commit_seconds": 3.0,
   "ring_announcement_seconds": 5.0,
+  "emulator_process_names": [
+    "mame.exe",
+    "mame64.exe",
+    "groovymame.exe",
+    "retroarch.exe"
+  ],
   "cinematic_max_fps": 15,
   "cinematic_fade_seconds": 0.8,
   "cinematic_video_file": "2015-02-19-SonictheHedgehogCD-Opening(SonicBoomNAVersion).mp4.7fb0570ab57510d4a7d54beb920f6517.mp4"

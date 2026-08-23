@@ -48,7 +48,7 @@ anti-bounce interval prevents one coin-switch pulse from counting twice while
 still allowing rings to be entered quickly.
 
 - Every ring is counted, including while the guard is dormant or deactivated.
-- The persistent total is stored in `%LOCALAPPDATA%\MagnetArcadeGuard\ring-counter.json`.
+- The persistent total is stored in `%LOCALAPPDATA%\MagnetArcadeGuard\ring-counter.json`, with an automatically maintained `ring-counter.backup.json`. If the primary file is corrupt, the guard preserves a timestamped copy, recovers from the backup when possible, and shows a warning in the operator panel instead of silently losing the total.
 - Every deposit queues a non-activating `RING COLLECTED!` announcement showing
   the new persistent total. Ring Power and 50-ring announcements also include
   that total.
@@ -69,7 +69,8 @@ still allowing rings to be entered quickly.
   screen is then restored in Story Mode if emeralds are still missing.
 - At the first total of 50 rings, the non-blocking message `50 RINGS!` and
   `Find Alex for your prize!` is shown when Big Box is safely visible. If a game
-  is active at that moment, the message waits until Big Box returns.
+  is active at that moment, the message waits until Big Box returns. That pending
+  prize message is persisted, so closing or restarting the guard cannot lose it.
 
 ## LED energy meter
 
@@ -138,8 +139,10 @@ Status files are written to:
 Keep `guard-config.json` beside `MagnetArcadeGuardRings.exe`.
 
 - `default_mode`: `story` or `normal`.
+- `total_emeralds`: must remain `7`; a different value disables the guard because the installed firmware and sensor assembly are fixed at seven inputs.
 - `auto_activate`: normally `false` so the operator chooses a mode after launching.
 - `serial_port`: empty for automatic detection, or a fixed value such as `COM4`.
+- `emulator_process_names`: executable names that count as active games. Add another emulator's Windows `.exe` name here if the arcade configuration expands; names are case-insensitive.
 - `normal_warning_seconds`: Normal Mode timeout; default `10.0`.
 - `story_announcement_seconds`: duration of each non-blocking theft banner.
 - `story_shutdown_seconds`: duration of the arcade-shutdown announcement.
