@@ -2126,9 +2126,15 @@ class MagnetArcadeGuard:
             color = "#ff5555"
         elif event_kind == "normal":
             title = STORY_REMOVAL_OVERLAY_TITLE
+            energy_percent = round(
+                max(0, min(TOTAL_EMERALDS, present_count))
+                * 100
+                / TOTAL_EMERALDS
+            )
             detail = (
                 "Hey! Put that back!\n"
-                "We already did the thing!"
+                "We already did the thing!\n"
+                f"CHAOS ENERGY: {energy_percent}%"
             )
             color = "#ffcc66"
         else:
@@ -3004,7 +3010,10 @@ class MagnetArcadeGuard:
             "pending_ring_announcement",
             None,
         )
-        if getattr(self, "ring_power_announcement_visible", False):
+        if (
+            getattr(self, "ring_power_announcement_visible", False)
+            and not self.pending_ring_milestone
+        ):
             return
         if self.pending_ring_milestone:
             announcement_kind = "milestone"
@@ -3028,6 +3037,22 @@ class MagnetArcadeGuard:
             detail = f"TOTAL RINGS: {self.ring_count}"
             color = "#ffdd55"
             duration = RING_ANNOUNCEMENT_SECONDS
+
+        # Normal Mode announcements are intentionally non-blocking, so the
+        # current shrine energy is useful context. Story/Robotnik screens have
+        # a dedicated graphical meter and do not duplicate this text.
+        if getattr(self, "guard_mode", None) == "normal":
+            accepted_count = getattr(self, "accepted_count", None)
+            if accepted_count is None:
+                energy_text = "CHAOS ENERGY: --"
+            else:
+                energy_percent = round(
+                    max(0, min(TOTAL_EMERALDS, accepted_count))
+                    * 100
+                    / TOTAL_EMERALDS
+                )
+                energy_text = f"CHAOS ENERGY: {energy_percent}%"
+            detail = f"{detail}\n{energy_text}"
 
         # Ring totals are permitted over Big Box or our own Robotnik screen.
         # Never create this window over an emulator: GroovyMAME and RetroArch
@@ -3251,10 +3276,15 @@ class MagnetArcadeGuard:
             and not self.ring_burst_game_seen
             and self.ring_burst_game_seen_since != 0.0
         ):
-            self.ring_burst_game_seen_since = 0.0
+            # The emulator did become foreground, so the one-game access has
+            # been used even if it closed before the normal three-second
+            # stability threshold. Only a launch that never reaches an
+            # emulator remains available for another attempt.
             self.write_status(
-                "RING BURST GAME LAUNCH ABORTED | burst remains available"
+                "RING BURST GAME RETURNED BEFORE COMMIT | consuming burst"
             )
+            self.consume_ring_burst_on_return()
+            return
 
         if (
             self.ring_burst_game_seen
@@ -3273,9 +3303,14 @@ class MagnetArcadeGuard:
         self.write_status("UNHANDLED APP ERROR | " + detail)
 
         if self.guard_active or self.suspended_process_handle:
-            self.fault_disable_guard("Application error")
+            self.fault_disable_guard(
+                "Application error: " + detail[-140:]
+            )
         else:
-            self.last_fault = "Application error — guard remains disabled"
+            self.last_fault = (
+                "Application error — guard remains disabled: "
+                + detail[-120:]
+            )
             self.overlay_gate_state = "DISABLED_ERROR"
 
     def create_control_panel(self) -> None:
@@ -4084,41 +4119,58 @@ class MagnetArcadeGuard:
             self.show_missing_overlay(missing_count)
 
     def foreground_watchdog(self) -> None:
-        if self.running and self.guard_active:
-            if (
-                self.ring_power_announcement_visible
-                and getattr(self, "joystick_press_sequence", 0)
-                > getattr(self, "ring_power_ignore_press_sequence", 0)
-            ):
+        try:
+            if self.running and self.guard_active:
+                if (
+                    self.ring_power_announcement_visible
+                    and getattr(self, "joystick_press_sequence", 0)
+                    > getattr(
+                        self,
+                        "ring_power_ignore_press_sequence",
+                        0,
+                    )
+                ):
+                    try:
+                        self.handle_joystick_press()
+                    except Exception as error:
+                        self.recover_ring_ui_error(
+                            "joystick watchdog",
+                            error,
+                        )
                 try:
-                    self.handle_joystick_press()
+                    self.handle_ring_burst_foreground()
+                except Exception as error:
+                    self.recover_ring_burst_error(error)
+                # Keep the Big Box readiness timer warm even before a sensor
+                # event. This retains the settle delay after an emulator
+                # closes while allowing safe announcements immediately.
+                if (
+                    not self.overlay_visible
+                    and self.pending_overlay_missing is None
+                ):
+                    self.update_overlay_gate()
+                self.maybe_show_pending_overlay()
+
+            if self.running:
+                try:
+                    self.maybe_show_pending_ring_announcement()
                 except Exception as error:
                     self.recover_ring_ui_error(
-                        "joystick watchdog",
+                        "announcement watchdog",
                         error,
                     )
-            try:
-                self.handle_ring_burst_foreground()
-            except Exception as error:
+        except Exception as error:
+            # The watchdog must always reschedule itself. A display or
+            # foreground query failure should not strand Ring Power state or
+            # turn the whole program into a generic Tk application error.
+            detail = str(error).replace("\n", " ")[:160]
+            self.write_status(
+                "FOREGROUND WATCHDOG RECOVERED | " + detail
+            )
+            if self.ring_burst_active:
                 self.recover_ring_burst_error(error)
-            # Keep the Big Box readiness timer warm even before a sensor event.
-            # That makes announcements and takeovers feel immediate while still
-            # retaining the settle delay after an emulator closes.
-            if (
-                not self.overlay_visible
-                and self.pending_overlay_missing is None
-            ):
-                self.update_overlay_gate()
-            self.maybe_show_pending_overlay()
-
-        if self.running:
-            try:
-                self.maybe_show_pending_ring_announcement()
-            except Exception as error:
-                self.recover_ring_ui_error(
-                    "announcement watchdog",
-                    error,
-                )
+            elif self.guard_active:
+                self.fault_disable_guard("Application error")
 
         if self.running:
             self.root.after(250, self.foreground_watchdog)
@@ -4845,6 +4897,7 @@ class MagnetArcadeGuard:
         )
 
     def show_missing_overlay(self, missing_count: int) -> None:
+        self.hide_story_announcement()
         self.set_control_panel_visible(False)
 
         if not self.overlay_visible:
@@ -4898,6 +4951,7 @@ class MagnetArcadeGuard:
             return
 
     def hide_overlay(self, stop_music: bool = True) -> None:
+        self.hide_story_announcement()
         self.overlay_visible = False
         self.overlay_kind = None
         self.cancel_audio_watchdog()
@@ -5812,8 +5866,27 @@ class MagnetArcadeGuard:
 
         except queue.Empty:
             pass
+        except Exception as error:
+            detail = str(error).replace("\n", " ")[:160]
+            self.write_status(
+                "MESSAGE LOOP RECOVERED | " + detail
+            )
+            if self.ring_burst_active:
+                self.recover_ring_burst_error(error)
+            elif self.guard_active:
+                self.fault_disable_guard("Application error")
 
-        self.accept_stable_count()
+        try:
+            self.accept_stable_count()
+        except Exception as error:
+            detail = str(error).replace("\n", " ")[:160]
+            self.write_status(
+                "SENSOR EVENT RECOVERED | " + detail
+            )
+            if self.ring_burst_active:
+                self.recover_ring_burst_error(error)
+            elif self.guard_active:
+                self.fault_disable_guard("Application error")
 
         if self.running:
             self.root.after(50, self.process_messages)

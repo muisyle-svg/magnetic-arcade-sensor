@@ -185,6 +185,52 @@ class GuardLogicTests(unittest.TestCase):
         self.assertIn("TOTAL RINGS: 12", shown[0][1])
         self.assertIsNone(guard.pending_ring_announcement)
 
+    def test_normal_ring_announcement_includes_current_chaos_energy(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.guard_mode = "normal"
+        guard.accepted_count = 3
+        guard.ring_count = 12
+        guard.pending_ring_milestone = False
+        guard.pending_ring_announcement = "count"
+        guard.write_status = lambda *args, **kwargs: None
+        shown = []
+        guard.show_plain_announcement = (
+            lambda title, detail, color, duration, **kwargs: (
+                shown.append(detail) or True
+            )
+        )
+
+        guard.maybe_show_pending_ring_announcement()
+
+        self.assertIn("CHAOS ENERGY: 43%", shown[0])
+
+    def test_pending_milestone_can_replace_ring_power_at_safe_menu(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.guard_mode = "normal"
+        guard.ring_count = 50
+        guard.accepted_count = 7
+        guard.pending_ring_milestone = True
+        guard.pending_ring_announcement = "milestone"
+        guard.ring_power_announcement_visible = True
+        guard.ring_milestones_pending = {guard_module.RING_MILESTONE}
+        guard.ring_milestones_shown = set()
+        guard.write_status = lambda *args, **kwargs: None
+        guard.save_ring_state = lambda: None
+        shown = []
+        guard.show_plain_announcement = (
+            lambda title, detail, color, duration, **kwargs: (
+                shown.append((title, detail, duration)) or True
+            )
+        )
+
+        guard.maybe_show_pending_ring_announcement()
+
+        self.assertEqual(shown[0][0], guard_module.RING_MILESTONE_TITLE)
+        self.assertIn("CHAOS ENERGY: 100%", shown[0][1])
+        self.assertFalse(guard.pending_ring_milestone)
+
     def test_ring_power_announcement_waits_for_a_joystick_press(self):
         guard = self.make_guard()
         guard.running = True
@@ -472,6 +518,28 @@ class GuardLogicTests(unittest.TestCase):
             guard.handle_ring_burst_foreground()
 
         self.assertTrue(guard.ring_burst_game_seen)
+
+    def test_ring_burst_consumes_when_emulator_returns_before_commit(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_game_seen = False
+        guard.ring_burst_game_seen_since = 1.0
+        guard.guard_active = True
+        guard.foreground_process_name = guard_module.BIG_BOX_PROCESS_NAME
+        guard.overlay_gate_state = "BIGBOX_READY"
+        guard.guard_mode = "normal"
+        consumed = []
+        statuses = []
+        guard.update_overlay_gate = lambda: True
+        guard.consume_ring_burst_on_return = (
+            lambda: consumed.append(True)
+        )
+        guard.write_status = statuses.append
+
+        guard.handle_ring_burst_foreground()
+
+        self.assertEqual(consumed, [True])
+        self.assertIn("BEFORE COMMIT", statuses[0])
 
     def test_final_return_during_ring_burst_resumes_victory(self):
         guard = self.make_guard()

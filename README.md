@@ -51,7 +51,8 @@ still allowing rings to be entered quickly.
 - The persistent total is stored in `%LOCALAPPDATA%\MagnetArcadeGuard\ring-counter.json`, with an automatically maintained `ring-counter.backup.json`. If the primary file is corrupt, the guard preserves a timestamped copy, recovers from the backup when possible, and shows a warning in the operator panel instead of silently losing the total.
 - Every deposit queues a non-activating `RING COLLECTED!` announcement showing
   the new persistent total. Ring Power and 50-ring announcements also include
-  that total.
+  that total. In Normal Mode, these announcements also show the current Chaos
+  Energy percentage; the Robotnik screen keeps energy in its graphical meter.
 - Ring announcements are shown only while full-screen Big Box is safely in the
   foreground or over the guard's own Robotnik recovery screen. A ring deposited
   during MAME, GroovyMAME, RetroArch, or another game is still counted
@@ -64,9 +65,10 @@ still allowing rings to be entered quickly.
   never extend the burst.
 - In Normal Mode, the same burst is available when all seven emeralds are
   missing.
-- The burst remains available while the menu is idle. It becomes consumed only
-  after an emulator remains active for at least three seconds and Big Box has
-  safely returned. A failed or aborted game launch does not consume the burst.
+- The burst remains available while the menu is idle. It becomes consumed after
+  an emulator has actually become foreground and Big Box has safely returned;
+  even a very brief game launch is treated as using the burst. A launch that
+  never reaches an emulator remains available for another attempt.
   The Robotnik
   screen is then restored in Story Mode if emeralds are still missing.
 - At the first total of 50 rings, the non-blocking message `50 RINGS!` and
