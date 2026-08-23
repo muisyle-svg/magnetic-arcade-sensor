@@ -45,13 +45,15 @@ class GuardLogicTests(unittest.TestCase):
         guard.pending_ring_milestone = False
         guard.save_ring_state = lambda: None
         guard.write_status = lambda *args, **kwargs: None
-        guard.maybe_show_pending_ring_milestone = lambda: None
+        announcements = []
+        guard.request_ring_announcement = announcements.append
         guard.ring_burst_is_eligible = lambda: False
         guard.guard_active = False
 
         guard.handle_ring_entry()
 
         self.assertEqual(guard.ring_count, 5)
+        self.assertEqual(announcements, ["count"])
 
     def test_fiftieth_ring_queues_milestone_once(self):
         guard = self.make_guard()
@@ -61,10 +63,8 @@ class GuardLogicTests(unittest.TestCase):
         guard.pending_ring_milestone = False
         guard.save_ring_state = lambda: None
         guard.write_status = lambda *args, **kwargs: None
-        milestone_checks = []
-        guard.maybe_show_pending_ring_milestone = (
-            lambda: milestone_checks.append(True)
-        )
+        announcements = []
+        guard.request_ring_announcement = announcements.append
         guard.ring_burst_is_eligible = lambda: False
         guard.guard_active = False
 
@@ -72,8 +72,85 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(guard.ring_count, 50)
         self.assertTrue(guard.pending_ring_milestone)
-        self.assertEqual(milestone_checks, [True])
+        self.assertEqual(announcements, ["milestone"])
         self.assertIn(guard_module.RING_MILESTONE, guard.ring_milestones_shown)
+
+    def test_reset_ring_count_clears_total_and_rearms_milestone(self):
+        guard = self.make_guard()
+        guard.ring_count = 57
+        guard.ring_milestones_shown = {guard_module.RING_MILESTONE}
+        guard.pending_ring_milestone = True
+        guard.pending_ring_announcement = "milestone"
+        saved = []
+        statuses = []
+        guard.save_ring_state = lambda: saved.append(True)
+        guard.write_status = statuses.append
+        guard.update_control_panel = lambda: None
+
+        guard.reset_ring_count()
+
+        self.assertEqual(guard.ring_count, 0)
+        self.assertEqual(guard.ring_milestones_shown, set())
+        self.assertFalse(guard.pending_ring_milestone)
+        self.assertIsNone(guard.pending_ring_announcement)
+        self.assertEqual(saved, [True])
+        self.assertIn("previous_total=57", statuses[0])
+
+    def test_ring_count_announcement_includes_latest_total(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.ring_count = 12
+        guard.pending_ring_milestone = False
+        guard.pending_ring_announcement = "count"
+        guard.write_status = lambda *args, **kwargs: None
+        shown = []
+        guard.show_plain_announcement = (
+            lambda title, detail, color, duration, **kwargs: (
+                shown.append((title, detail, color, duration, kwargs)) or True
+            )
+        )
+
+        guard.maybe_show_pending_ring_announcement()
+
+        self.assertEqual(shown[0][0], guard_module.RING_COUNT_TITLE)
+        self.assertIn("TOTAL RINGS: 12", shown[0][1])
+        self.assertIsNone(guard.pending_ring_announcement)
+
+    def test_ring_count_announcement_waits_when_big_box_is_not_safe(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.ring_count = 13
+        guard.pending_ring_milestone = False
+        guard.pending_ring_announcement = "count"
+        guard.write_status = lambda *args, **kwargs: None
+        attempts = []
+        guard.show_plain_announcement = (
+            lambda *args, **kwargs: attempts.append((args, kwargs)) or False
+        )
+
+        guard.maybe_show_pending_ring_announcement()
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(guard.pending_ring_announcement, "count")
+
+    def test_ring_announcement_never_draws_over_foreground_emulator(self):
+        guard = self.make_guard()
+        guard.overlay_visible = True
+        guard.overlay_kind = "robotnik"
+        guard.emulator_owns_foreground = lambda: True
+        guard.can_show_story_announcement = lambda: self.fail(
+            "Big Box safety check should not run over an emulator"
+        )
+
+        shown = guard.show_plain_announcement(
+            guard_module.RING_COUNT_TITLE,
+            "TOTAL RINGS: 8",
+            "#ffdd55",
+            5.0,
+            allow_guard_overlay=True,
+        )
+
+        self.assertFalse(shown)
 
     def test_ring_burst_requires_robotnik_or_normal_all_missing(self):
         guard = self.make_guard()

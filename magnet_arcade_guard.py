@@ -47,6 +47,7 @@ def bootstrap_event(message: str) -> None:
 bootstrap_event("loading Tk support")
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import messagebox
 
 bootstrap_event("loading serial support")
 import serial
@@ -326,6 +327,7 @@ RING_ANNOUNCEMENT_SECONDS = config_number(
 RING_MILESTONE = 50
 RING_MILESTONE_TITLE = "50 RINGS!"
 RING_MILESTONE_MESSAGE = "Find Alex for your prize!"
+RING_COUNT_TITLE = "RING COLLECTED!"
 RING_BURST_TITLE = "RING POWER!"
 RING_BURST_MESSAGE = (
     "MASTER EMERALD ENERGY FULL!\n"
@@ -891,6 +893,7 @@ class MagnetArcadeGuard:
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
         self.pending_ring_milestone = False
+        self.pending_ring_announcement: Optional[str] = None
         local_app_data = Path(
             os.environ.get(
                 "LOCALAPPDATA",
@@ -940,6 +943,7 @@ class MagnetArcadeGuard:
         self.control_deactivate_button = None
         self.control_story_button = None
         self.control_normal_button = None
+        self.control_reset_rings_button = None
         self.announcement_window = None
         self.announcement_title_label = None
         self.announcement_detail_label = None
@@ -1953,6 +1957,17 @@ class MagnetArcadeGuard:
         self.overlay_monitor_bounds = monitor_bounds
         return True
 
+    def emulator_owns_foreground(self) -> bool:
+        """Fail safely when deciding whether a small overlay may be created."""
+        try:
+            foreground_window = ctypes.windll.user32.GetForegroundWindow()
+        except AttributeError:
+            return True
+        return (
+            self.get_window_process_name(foreground_window)
+            in EMULATOR_PROCESS_NAMES
+        )
+
     def show_story_announcement(
         self,
         present_count: int,
@@ -2590,29 +2605,57 @@ class MagnetArcadeGuard:
             self.ring_milestones_shown.add(RING_MILESTONE)
             self.save_ring_state()
             self.pending_ring_milestone = True
-            self.maybe_show_pending_ring_milestone()
 
-        if self.ring_burst_active or not self.ring_burst_is_eligible():
-            return
+        burst_started = False
+        if not self.ring_burst_active and self.ring_burst_is_eligible():
+            burst_started = True
+            self.ring_burst_active = True
+            self.ring_burst_game_seen = False
+            self.ring_burst_game_seen_since = 0.0
+            self.write_status("RING BURST ACTIVE | waiting for a game")
 
-        self.ring_burst_active = True
-        self.ring_burst_game_seen = False
-        self.ring_burst_game_seen_since = 0.0
-        self.write_status("RING BURST ACTIVE | waiting for a game")
+            if self.overlay_visible:
+                self.hide_overlay()
+            else:
+                self.hide_story_announcement()
+                self.cancel_normal_warning()
 
-        if self.overlay_visible:
-            self.hide_overlay()
+        if self.pending_ring_milestone:
+            announcement_kind = "milestone"
+        elif burst_started:
+            announcement_kind = "burst"
         else:
-            self.hide_story_announcement()
-            self.cancel_normal_warning()
+            announcement_kind = "count"
+        self.request_ring_announcement(announcement_kind)
 
-        if not self.pending_ring_milestone:
-            self.show_plain_announcement(
-                RING_BURST_TITLE,
-                RING_BURST_MESSAGE,
-                "#66ff99",
-                RING_BURST_ANNOUNCEMENT_SECONDS,
-            )
+    def reset_ring_count(self) -> None:
+        previous_total = self.ring_count
+        self.ring_count = 0
+        self.ring_milestones_shown.clear()
+        self.pending_ring_milestone = False
+        self.pending_ring_announcement = None
+        self.save_ring_state()
+        self.write_status(
+            f"RING COUNTER RESET | previous_total={previous_total}"
+        )
+        self.update_control_panel()
+
+    def confirm_reset_ring_count(self) -> None:
+        if not messagebox.askyesno(
+            "Reset Ring Count",
+            (
+                f"Reset the persistent ring total from {self.ring_count} "
+                "to 0?\n\nThe 50-ring prize announcement will also be re-armed."
+            ),
+            parent=self.control_window,
+        ):
+            return
+        self.reset_ring_count()
+        messagebox.showinfo(
+            "Ring Count Reset",
+            "The persistent ring total is now 0.",
+            parent=self.control_window,
+        )
 
     def show_plain_announcement(
         self,
@@ -2620,8 +2663,16 @@ class MagnetArcadeGuard:
         detail: str,
         color: str,
         duration_seconds: float,
+        allow_guard_overlay: bool = False,
     ) -> bool:
-        if not self.can_show_story_announcement():
+        guard_overlay_is_safe = (
+            allow_guard_overlay
+            and self.overlay_visible
+            and self.overlay_kind == "robotnik"
+        )
+        if guard_overlay_is_safe and self.emulator_owns_foreground():
+            return False
+        if not guard_overlay_is_safe and not self.can_show_story_announcement():
             return False
 
         self.hide_story_announcement()
@@ -2684,18 +2735,72 @@ class MagnetArcadeGuard:
         )
         return True
 
-    def maybe_show_pending_ring_milestone(self) -> None:
-        if not self.running or not self.pending_ring_milestone:
+    def request_ring_announcement(self, announcement_kind: str) -> None:
+        priorities = {"count": 1, "burst": 2, "milestone": 3}
+        current = getattr(self, "pending_ring_announcement", None)
+        if priorities.get(announcement_kind, 0) >= priorities.get(current, 0):
+            self.pending_ring_announcement = announcement_kind
+        self.maybe_show_pending_ring_announcement()
+
+    def maybe_show_pending_ring_announcement(self) -> None:
+        if not self.running:
             return
+
+        announcement_kind = getattr(
+            self,
+            "pending_ring_announcement",
+            None,
+        )
+        if self.pending_ring_milestone:
+            announcement_kind = "milestone"
+        if announcement_kind is None:
+            return
+
+        if announcement_kind == "milestone":
+            title = RING_MILESTONE_TITLE
+            detail = (
+                f"{RING_MILESTONE_MESSAGE}\nTOTAL RINGS: {self.ring_count}"
+            )
+            color = "#ffdd55"
+            duration = RING_ANNOUNCEMENT_SECONDS
+        elif announcement_kind == "burst":
+            title = RING_BURST_TITLE
+            detail = f"{RING_BURST_MESSAGE}\nTOTAL RINGS: {self.ring_count}"
+            color = "#66ff99"
+            duration = RING_BURST_ANNOUNCEMENT_SECONDS
+        else:
+            title = RING_COUNT_TITLE
+            detail = f"TOTAL RINGS: {self.ring_count}"
+            color = "#ffdd55"
+            duration = RING_ANNOUNCEMENT_SECONDS
+
+        # Ring totals are permitted over Big Box or our own Robotnik screen.
+        # Never create this window over an emulator: GroovyMAME and RetroArch
+        # can use exclusive modes or change resolution while a game is active.
         if not self.show_plain_announcement(
-            RING_MILESTONE_TITLE,
-            RING_MILESTONE_MESSAGE,
-            "#ffdd55",
-            RING_ANNOUNCEMENT_SECONDS,
+            title,
+            detail,
+            color,
+            duration,
+            allow_guard_overlay=True,
         ):
             return
-        self.pending_ring_milestone = False
-        self.write_status("RING MILESTONE DISPLAYED | 50 rings")
+
+        self.pending_ring_announcement = None
+        if announcement_kind == "milestone":
+            self.pending_ring_milestone = False
+            self.write_status(
+                f"RING MILESTONE DISPLAYED | total={self.ring_count}"
+            )
+        else:
+            self.write_status(
+                "RING COUNT DISPLAYED | "
+                f"kind={announcement_kind} | total={self.ring_count}"
+            )
+
+    def maybe_show_pending_ring_milestone(self) -> None:
+        """Compatibility wrapper retained for older tests and diagnostics."""
+        self.maybe_show_pending_ring_announcement()
 
     def consume_ring_burst_on_return(self) -> None:
         if not self.ring_burst_active:
@@ -2786,9 +2891,18 @@ class MagnetArcadeGuard:
 
     def create_control_panel(self) -> None:
         self.control_window = tk.Toplevel(self.root)
-        self.control_window.title("Magnetic Arcade Guard — Story/Normal Edition")
-        self.control_window.geometry("680x410+40+40")
-        self.control_window.minsize(620, 380)
+        self.control_window.title("Magnetic Arcade Guard — Ring Edition")
+        panel_width = max(520, min(680, self.screen_width - 20))
+        panel_height = max(380, min(445, self.screen_height - 40))
+        panel_x = min(40, max(0, (self.screen_width - panel_width) // 2))
+        panel_y = min(20, max(0, (self.screen_height - panel_height) // 2))
+        self.control_window.geometry(
+            f"{panel_width}x{panel_height}{panel_x:+d}{panel_y:+d}"
+        )
+        self.control_window.minsize(
+            min(620, panel_width),
+            min(420, panel_height),
+        )
         self.control_window.resizable(True, True)
         self.control_window.configure(background="#202020")
         try:
@@ -2891,6 +3005,20 @@ class MagnetArcadeGuard:
             row=1,
             column=1,
             padx=6,
+        )
+
+        self.control_reset_rings_button = tk.Button(
+            button_frame,
+            text="RESET RING COUNT",
+            width=52,
+            command=self.confirm_reset_ring_count,
+        )
+        self.control_reset_rings_button.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            padx=6,
+            pady=(8, 0),
         )
 
         tk.Label(
@@ -3574,7 +3702,7 @@ class MagnetArcadeGuard:
             self.maybe_show_pending_overlay()
 
         if self.running:
-            self.maybe_show_pending_ring_milestone()
+            self.maybe_show_pending_ring_announcement()
 
         if self.running:
             self.root.after(250, self.foreground_watchdog)

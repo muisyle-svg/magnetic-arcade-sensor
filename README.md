@@ -49,6 +49,15 @@ still allowing rings to be entered quickly.
 
 - Every ring is counted, including while the guard is dormant or deactivated.
 - The persistent total is stored in `%LOCALAPPDATA%\MagnetArcadeGuard\ring-counter.json`.
+- Every deposit queues a non-activating `RING COLLECTED!` announcement showing
+  the new persistent total. Ring Power and 50-ring announcements also include
+  that total.
+- Ring announcements are shown only while full-screen Big Box is safely in the
+  foreground or over the guard's own Robotnik recovery screen. A ring deposited
+  during MAME, GroovyMAME, RetroArch, or another game is still counted
+  immediately, but its latest total waits until Big Box or the guard screen is
+  safely visible. The guard never creates a ring-count window over a running
+  emulator.
 - When the Robotnik screen is active, one ring hides the takeover and gives a
   one-game Ring Power burst.
 - In Normal Mode, the same burst is available when all seven emeralds are
@@ -107,6 +116,9 @@ Only one guard instance can run at a time.
 
 - Story Mode and Normal Mode buttons select and activate that mode.
 - Deactivate Guard stops monitoring and closes any presentation.
+- Reset Ring Count asks for confirmation, resets the persistent total to zero,
+  and re-arms the one-time 50-ring prize announcement. It does not change the
+  guard mode or interrupt an active Ring Power pass.
 - Close Program exits the guard.
 - `Ctrl+Alt+F10` selects and activates Story Mode from anywhere.
 - `Ctrl+Alt+F12` activates the currently selected mode from anywhere.
