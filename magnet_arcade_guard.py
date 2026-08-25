@@ -754,6 +754,7 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 SW_SHOWNOACTIVATE = 4
+CURSOR_SHOWING = 0x00000001
 PROCESS_SUSPEND_RESUME = 0x0800
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x00100000
@@ -778,6 +779,22 @@ class Win32Rect(ctypes.Structure):
         ("top", ctypes.c_long),
         ("right", ctypes.c_long),
         ("bottom", ctypes.c_long),
+    ]
+
+
+class Win32Point(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_long),
+        ("y", ctypes.c_long),
+    ]
+
+
+class Win32CursorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("flags", ctypes.c_ulong),
+        ("hCursor", ctypes.c_void_p),
+        ("ptScreenPos", Win32Point),
     ]
 
 
@@ -1087,6 +1104,7 @@ class MagnetArcadeGuard:
         self.power_loss_generation = 0
         self.power_loss_active = False
         self.power_loss_started_at = 0.0
+        self.power_loss_cursor_hidden = False
         self.announcement_after_id = None
         self.normal_warning_after_id = None
         self.normal_warning_trigger_count: Optional[int] = None
@@ -2296,6 +2314,7 @@ class MagnetArcadeGuard:
         self.announcement_flash_window = tk.Toplevel(self.root)
         self.announcement_flash_window.overrideredirect(True)
         self.announcement_flash_window.configure(background="#fff6b0")
+        self.announcement_flash_window.configure(cursor="none")
         self.announcement_flash_window.attributes("-topmost", True)
         try:
             self.announcement_flash_window.attributes("-alpha", 0.78)
@@ -2310,6 +2329,7 @@ class MagnetArcadeGuard:
         self.power_loss_crt_window = tk.Toplevel(self.root)
         self.power_loss_crt_window.overrideredirect(True)
         self.power_loss_crt_window.configure(background="#050505")
+        self.power_loss_crt_window.configure(cursor="none")
         self.power_loss_crt_window.attributes("-topmost", True)
         try:
             self.power_loss_crt_window.attributes("-alpha", 0.18)
@@ -2489,6 +2509,33 @@ class MagnetArcadeGuard:
             alpha,
             centered=True,
         )
+
+    def hide_power_loss_cursor(self) -> None:
+        """Hide the real Windows pointer while the menu is losing power."""
+        if self.power_loss_cursor_hidden:
+            return
+        try:
+            cursor_info = Win32CursorInfo()
+            cursor_info.cbSize = ctypes.sizeof(Win32CursorInfo)
+            user32 = ctypes.windll.user32
+            if not user32.GetCursorInfo(ctypes.byref(cursor_info)):
+                return
+            if cursor_info.flags & CURSOR_SHOWING:
+                user32.ShowCursor(False)
+                self.power_loss_cursor_hidden = True
+        except (AttributeError, OSError, TypeError):
+            pass
+
+    def restore_power_loss_cursor(self) -> None:
+        """Restore the pointer only if this effect hid an initially visible one."""
+        if not self.power_loss_cursor_hidden:
+            return
+        try:
+            ctypes.windll.user32.ShowCursor(True)
+        except (AttributeError, OSError, TypeError):
+            pass
+        finally:
+            self.power_loss_cursor_hidden = False
 
     def flash_story_screen(self) -> None:
         if (
@@ -5831,6 +5878,7 @@ class MagnetArcadeGuard:
                 pass
         self.hide_announcement_flash()
         self.hide_power_loss_crt()
+        self.restore_power_loss_cursor()
         if self.power_loss_crt_window:
             try:
                 self.power_loss_crt_window.configure(background="#050505")
@@ -5908,6 +5956,7 @@ class MagnetArcadeGuard:
         self.overlay_kind = "story_power_loss"
         self.reset_counter_style()
         self.hide_energy_meter()
+        self.hide_power_loss_cursor()
         try:
             # The menu remains visible because Big Box is paused underneath;
             # only the temporary filter window should be visible above it.
