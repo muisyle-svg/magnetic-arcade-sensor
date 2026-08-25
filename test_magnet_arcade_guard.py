@@ -1115,10 +1115,10 @@ class GuardLogicTests(unittest.TestCase):
     def test_story_theft_messages_are_unique_for_each_partial_removal(self):
         messages = guard_module.STORY_STOLEN_TEXT
 
-        self.assertEqual(set(messages), set(range(1, 7)))
+        self.assertEqual(set(messages), set(range(1, 8)))
         self.assertEqual(
             len({title for title, detail in messages.values()}),
-            6,
+            7,
         )
         self.assertTrue(
             all("CHAOS" in title and "STOLEN" in title

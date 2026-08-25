@@ -647,6 +647,10 @@ STORY_STOLEN_TEXT = {
         "SIX CHAOS EMERALDS STOLEN!",
         "ONE MORE AND THE ARCADE WILL GO DARK!",
     ),
+    7: (
+        "SEVEN CHAOS EMERALDS STOLEN!",
+        "CHAOS ENERGY GONE! IT'S GOING DOWN!",
+    ),
 }
 
 STORY_RETURNED_TEXT = {
@@ -5610,6 +5614,7 @@ class MagnetArcadeGuard:
         ):
             return False
 
+        self.story_sequence_after_id = None
         self.cancel_power_loss_effect()
         if not self.show_text_takeover(
             "",
@@ -5618,16 +5623,8 @@ class MagnetArcadeGuard:
         ):
             return False
 
-        # Use the Robotnik image as the shrine's last visible signal. The
-        # filter above it handles the color loss and blackout without touching
-        # the physical display or changing the monitor mode.
-        if self.background_frames:
-            self.switch_background(
-                self.background_frames,
-                self.background_delays,
-                loop=True,
-            )
-
+        # Keep the power-loss sequence abstract and image-free. Robotnik's
+        # lock screen is intentionally reserved for after the Sonic cinematic.
         self.power_loss_active = True
         self.power_loss_started_at = time.monotonic()
         self.power_loss_generation += 1
@@ -5709,7 +5706,6 @@ class MagnetArcadeGuard:
             "story_shutdown",
         ):
             return
-        self.play_last_emerald_removal_sound()
         self.story_sequence_after_id = self.root.after(
             int(STORY_SHUTDOWN_SECONDS * 1000),
             self.show_story_question,
@@ -5745,11 +5741,29 @@ class MagnetArcadeGuard:
             )
 
     def start_story_shutdown_sequence(self) -> None:
+        self.cancel_story_sequence()
         self.pending_overlay_missing = None
         self.skip_cinematic_requested = False
         self.story_cycle_started = True
         self.story_intro_completed = False
+
+        # Give the final theft its own readable zero-energy announcement and
+        # play the final-emerald line immediately, before the power-loss
+        # transition begins.
+        if self.show_story_announcement(
+            0,
+            "removed",
+            duration_seconds=STORY_ANNOUNCEMENT_SECONDS,
+        ):
+            self.play_last_emerald_removal_sound()
+            self.story_sequence_after_id = self.root.after(
+                int(STORY_ANNOUNCEMENT_SECONDS * 1000),
+                self.start_story_power_loss_effect,
+            )
+            return
+
         if self.start_story_power_loss_effect():
+            self.play_last_emerald_removal_sound()
             return
 
         # The visual effect is optional. If it cannot be shown, preserve the
@@ -6985,6 +6999,16 @@ class MagnetArcadeGuard:
             "cinematic",
         }:
             return
+
+        # If the final-theft announcement is dismissed by returning an
+        # emerald, cancel its queued power-loss transition before showing the
+        # recovery announcement.
+        if (
+            current_count > 0
+            and getattr(self, "story_sequence_after_id", None) is not None
+            and not self.overlay_visible
+        ):
+            self.cancel_story_sequence()
 
         # Story Mode arms only after all seven have been observed together.
         # This preserves the fail-open baseline behavior when the guard starts
