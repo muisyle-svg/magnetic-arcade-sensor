@@ -5575,7 +5575,7 @@ class MagnetArcadeGuard:
         self.hide_announcement_flash()
 
     def show_power_loss_filter(self, color: str, alpha: float) -> None:
-        """Place a non-activating color filter above the guard window."""
+        """Place a non-activating color filter above the guarded display."""
         if not self.announcement_flash_window:
             return
 
@@ -5606,6 +5606,43 @@ class MagnetArcadeGuard:
         except (AttributeError, tk.TclError):
             pass
 
+    def show_power_loss_takeover(self) -> bool:
+        """Pause Big Box while leaving its last menu frame visible underneath."""
+        self.hide_story_announcement()
+        if not self.overlay_visible:
+            self.capture_return_window()
+            self.prepare_overlay_monitor()
+            if not self.suspend_return_process():
+                self.fault_disable_guard(
+                    "Could not safely pause Big Box for power loss"
+                )
+                return False
+
+        if not self.mute_other_audio():
+            self.fault_disable_guard("Could not mute background audio")
+            return False
+
+        self.cancel_completion()
+        self.stop_music()
+        # Keep the final-emerald voice line alive while the visual power loss
+        # begins. The normal shutdown card will stop it before narration.
+        self.schedule_audio_watchdog()
+        self.animation_generation += 1
+        self.active_frames = []
+        self.active_delays = []
+        self.background_label.configure(image="", background="black")
+        self.overlay_visible = True
+        self.overlay_kind = "story_power_loss"
+        self.reset_counter_style()
+        self.hide_energy_meter()
+        try:
+            # The menu remains visible because Big Box is paused underneath;
+            # only the temporary filter window should be visible above it.
+            self.root.withdraw()
+        except (AttributeError, tk.TclError):
+            pass
+        return True
+
     def start_story_power_loss_effect(self) -> bool:
         """Show the final-emerald power failure before story narration."""
         if not (
@@ -5616,15 +5653,11 @@ class MagnetArcadeGuard:
 
         self.story_sequence_after_id = None
         self.cancel_power_loss_effect()
-        if not self.show_text_takeover(
-            "",
-            "",
-            "story_power_loss",
-        ):
+        if not self.show_power_loss_takeover():
             return False
 
-        # Keep the power-loss sequence abstract and image-free. Robotnik's
-        # lock screen is intentionally reserved for after the Sonic cinematic.
+        # Keep the power-loss sequence image-free. The frozen Big Box menu is
+        # visible underneath the flashes until the final full blackout.
         self.power_loss_active = True
         self.power_loss_started_at = time.monotonic()
         self.power_loss_generation += 1
@@ -5634,6 +5667,26 @@ class MagnetArcadeGuard:
             lambda: self.update_story_power_loss(generation),
         )
         return True
+
+    def show_story_shutdown_narration(self) -> bool:
+        if not self.show_text_takeover(
+            STORY_SHUTDOWN_TITLE,
+            STORY_SHUTDOWN_MESSAGE,
+            "story_shutdown",
+        ):
+            return False
+        self.story_sequence_after_id = self.root.after(
+            int(STORY_SHUTDOWN_SECONDS * 1000),
+            self.show_story_question,
+        )
+        return True
+
+    def continue_story_power_loss_after_announcement(self) -> None:
+        self.story_sequence_after_id = None
+        if self.start_story_power_loss_effect():
+            return
+        if self.guard_active and self.guard_mode == "story":
+            self.show_story_shutdown_narration()
 
     def update_story_power_loss(self, generation: int) -> None:
         if (
@@ -5700,16 +5753,7 @@ class MagnetArcadeGuard:
         ):
             return
 
-        if not self.show_text_takeover(
-            STORY_SHUTDOWN_TITLE,
-            STORY_SHUTDOWN_MESSAGE,
-            "story_shutdown",
-        ):
-            return
-        self.story_sequence_after_id = self.root.after(
-            int(STORY_SHUTDOWN_SECONDS * 1000),
-            self.show_story_question,
-        )
+        self.show_story_shutdown_narration()
 
     def cancel_story_sequence(self) -> None:
         if self.story_sequence_after_id is not None:
@@ -5758,7 +5802,7 @@ class MagnetArcadeGuard:
             self.play_last_emerald_removal_sound()
             self.story_sequence_after_id = self.root.after(
                 int(STORY_ANNOUNCEMENT_SECONDS * 1000),
-                self.start_story_power_loss_effect,
+                self.continue_story_power_loss_after_announcement,
             )
             return
 
@@ -5769,17 +5813,8 @@ class MagnetArcadeGuard:
         # The visual effect is optional. If it cannot be shown, preserve the
         # original story path so a presentation failure never strands the
         # heist between the final sensor event and its narration.
-        if not self.show_text_takeover(
-            STORY_SHUTDOWN_TITLE,
-            STORY_SHUTDOWN_MESSAGE,
-            "story_shutdown",
-        ):
-            return
-        self.play_last_emerald_removal_sound()
-        self.story_sequence_after_id = self.root.after(
-            int(STORY_SHUTDOWN_SECONDS * 1000),
-            self.show_story_question,
-        )
+        if self.show_story_shutdown_narration():
+            self.play_last_emerald_removal_sound()
 
     def show_story_question(self) -> None:
         self.story_sequence_after_id = None

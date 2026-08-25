@@ -26,10 +26,12 @@ messages.
 
 The final Story Mode emerald removal now announces zero Chaos Energy with the
 segmented meter at 0, plays the final-emerald voice line immediately, and then
-uses a short image-free simulated power-loss sequence before the existing heist
-narration begins. Robotnik's lock screen remains reserved for after the Sonic
-cinematic. The seven-sensor firmware mirrors that moment with a final red LED
-failure effect, then returns to its normal red warning pulse.
+uses a short image-free simulated power-loss sequence over the frozen Big Box
+menu before the existing heist narration begins. The menu remains visible
+through the flashes and dimming until the final blackout. Robotnik's lock
+screen remains reserved for after the Sonic cinematic. The seven-sensor
+firmware mirrors that moment with a final red LED failure effect, then returns
+to its normal red warning pulse.
 
 This update adds ring-entry audio, immediate live updates to an active ring
 counter banner, vertically fitted announcement windows, a Normal Mode
