@@ -145,6 +145,10 @@ Only one guard instance can run at a time.
   guard mode or interrupt an active Ring Power pass.
 - Close Program exits the guard.
 - `Ctrl+Alt+F10` selects and activates Story Mode from anywhere.
+- `Ctrl+Alt+F9` skips the Sonic CD cinematic during the active Story Mode
+  heist. It is a one-shot testing shortcut; the narration and Robotnik screen
+  still run. Press it during the narration to arm the skip, or during the
+  cinematic to skip immediately.
 - `Ctrl+Alt+F12` activates the currently selected mode from anywhere.
 - `Ctrl+Alt+F11` deactivates the guard from anywhere.
 - `Ctrl+Shift+F12` closes the program from anywhere.

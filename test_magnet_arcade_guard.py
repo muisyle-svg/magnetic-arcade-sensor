@@ -76,6 +76,42 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(guard_module.joystick_button_mask(10), 1 << 9)
         self.assertEqual(guard_module.joystick_button_mask(1), 1)
 
+    def test_joystick_direction_counts_as_a_dismiss_input(self):
+        centered = MagicMock(
+            dwXpos=guard_module.JOYSTICK_AXIS_CENTER,
+            dwYpos=guard_module.JOYSTICK_AXIS_CENTER,
+            dwPOV=guard_module.JOY_POVCENTERED,
+        )
+        pushed = MagicMock(
+            dwXpos=0,
+            dwYpos=guard_module.JOYSTICK_AXIS_CENTER,
+            dwPOV=guard_module.JOY_POVCENTERED,
+        )
+        pov_pushed = MagicMock(
+            dwXpos=guard_module.JOYSTICK_AXIS_CENTER,
+            dwYpos=guard_module.JOYSTICK_AXIS_CENTER,
+            dwPOV=0,
+        )
+
+        self.assertFalse(guard_module.joystick_direction_active(centered))
+        self.assertTrue(guard_module.joystick_direction_active(pushed))
+        self.assertTrue(guard_module.joystick_direction_active(pov_pushed))
+
+    def test_later_ring_does_not_refresh_active_milestone(self):
+        guard = self.make_guard()
+        guard.active_ring_announcement_kind = "milestone"
+        guard.pending_ring_announcement = None
+        guard.write_status = lambda *args, **kwargs: None
+        refreshed = []
+        guard.refresh_active_ring_announcement = (
+            lambda: refreshed.append(True)
+        )
+
+        guard.request_ring_announcement("count")
+
+        self.assertEqual(refreshed, [])
+        self.assertIsNone(guard.pending_ring_announcement)
+
     def test_ring_entry_is_counted_while_guard_is_off(self):
         guard = self.make_guard()
         guard.ring_count = 4
@@ -83,6 +119,7 @@ class GuardLogicTests(unittest.TestCase):
         guard.ring_milestones_pending = set()
         guard.ring_burst_active = False
         guard.pending_ring_milestone = False
+        guard.guard_active = False
         guard.save_ring_state = lambda: None
         guard.write_status = lambda *args, **kwargs: None
         announcements = []
@@ -94,6 +131,62 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(guard.ring_count, 5)
         self.assertEqual(announcements, ["count"])
+
+    def test_ring_entry_plays_ring_sound_even_when_guard_is_off(self):
+        guard = self.make_guard()
+        guard.ring_count = 0
+        guard.ring_milestones_shown = set()
+        guard.ring_milestones_pending = set()
+        guard.ring_burst_active = False
+        guard.pending_ring_milestone = False
+        guard.guard_active = False
+        guard.save_ring_state = lambda: None
+        guard.write_status = lambda *args, **kwargs: None
+        guard.request_ring_announcement = lambda kind: None
+        guard.ring_burst_is_eligible = lambda: False
+
+        with patch.object(guard, "play_ring_sound") as play_ring_sound:
+            guard.handle_ring_entry()
+
+        play_ring_sound.assert_called_once_with()
+
+    def test_active_ring_count_banner_is_refreshed_immediately(self):
+        guard = self.make_guard()
+        guard.ring_count = 18
+        guard.pending_ring_announcement = None
+        guard.active_ring_announcement_kind = "count"
+        guard.ring_power_announcement_visible = False
+        refreshed = []
+        guard.refresh_active_ring_announcement = (
+            lambda: refreshed.append(guard.ring_count)
+        )
+
+        guard.request_ring_announcement("count")
+
+        self.assertEqual(refreshed, [18])
+        self.assertIsNone(guard.pending_ring_announcement)
+
+    def test_milestone_interrupts_active_ring_count_banner(self):
+        guard = self.make_guard()
+        guard.pending_ring_announcement = "count"
+        guard.active_ring_announcement_kind = "count"
+        hidden = []
+        guard.hide_story_announcement = lambda: hidden.append(True)
+
+        guard.request_ring_announcement("milestone")
+
+        self.assertEqual(hidden, [True])
+        self.assertEqual(guard.pending_ring_announcement, "milestone")
+
+    def test_milestone_message_does_not_follow_later_ring_total(self):
+        guard = self.make_guard()
+        guard.ring_count = 53
+
+        title, detail, _, _ = guard.ring_announcement_content("milestone")
+
+        self.assertEqual(title, guard_module.RING_MILESTONE_TITLE)
+        self.assertEqual(detail, guard_module.RING_MILESTONE_MESSAGE)
+        self.assertNotIn("53", detail)
 
     def test_ring_entry_during_active_burst_does_not_rearm_the_burst(self):
         guard = self.make_guard()
@@ -273,6 +366,22 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(hidden, [True])
         self.assertEqual(pending, [True])
+
+    def test_joystick_press_dismisses_emerald_announcement(self):
+        guard = self.make_guard()
+        guard.active_ring_announcement_kind = None
+        guard.announcement_after_id = "timer"
+        guard.announcement_window = MagicMock()
+        guard.ring_power_announcement_visible = False
+        hidden = []
+        statuses = []
+        guard.hide_story_announcement = lambda: hidden.append(True)
+        guard.write_status = statuses.append
+
+        guard.handle_joystick_press("9")
+
+        self.assertEqual(hidden, [True])
+        self.assertIn("EMERALD ANNOUNCEMENT DISMISSED", statuses[0])
 
     def test_ring_power_ignores_the_ring_trigger_edge_but_accepts_next_edge(self):
         guard = self.make_guard()
@@ -603,7 +712,7 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(events, [("overlay", 0), ("victory", None)])
 
-    def test_normal_ring_burst_restores_lock_after_game(self):
+    def test_normal_ring_burst_releases_lock_after_any_emerald_returns(self):
         guard = self.make_guard()
         guard.ring_burst_active = True
         guard.ring_burst_game_seen = True
@@ -622,12 +731,9 @@ class GuardLogicTests(unittest.TestCase):
         guard.consume_ring_burst_on_return()
 
         self.assertFalse(guard.ring_burst_active)
-        self.assertTrue(guard.normal_ring_lock_active)
-        self.assertEqual(
-            guard.pending_overlay_missing,
-            guard_module.TOTAL_EMERALDS - 2,
-        )
-        self.assertEqual(pending, [True])
+        self.assertFalse(guard.normal_ring_lock_active)
+        self.assertIsNone(getattr(guard, "pending_overlay_missing", None))
+        self.assertEqual(pending, [])
 
     def test_normal_ring_burst_does_not_restore_lock_if_all_are_back(self):
         guard = self.make_guard()
@@ -905,6 +1011,44 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(
             failures,
             ["Sonic cinematic produced no playable video frames"],
+        )
+
+    def test_story_cinematic_skip_is_armed_for_active_heist(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.guard_mode = "story"
+        guard.story_cycle_started = True
+        guard.overlay_kind = "story_eggman"
+        guard.skip_cinematic_requested = False
+        statuses = []
+        guard.write_status = statuses.append
+
+        guard.skip_story_cinematic()
+
+        self.assertTrue(guard.skip_cinematic_requested)
+        self.assertEqual(
+            statuses,
+            ["CINEMATIC SKIP ARMED | STORY HEIST"],
+        )
+
+    def test_story_cinematic_skip_bypasses_preparation(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.guard_active = True
+        guard.guard_mode = "story"
+        guard.story_cycle_started = True
+        guard.skip_cinematic_requested = True
+        guard.cinematic_prepare_state = "preparing"
+        guard.story_sequence_after_id = object()
+        guard.show_story_robotnik_screen = MagicMock()
+        guard.write_status = MagicMock()
+
+        guard.start_story_cinematic()
+
+        self.assertFalse(guard.skip_cinematic_requested)
+        guard.show_story_robotnik_screen.assert_called_once_with()
+        guard.write_status.assert_called_once_with(
+            "CINEMATIC SKIPPED | ROBOTNIK SCREEN ACTIVE"
         )
 
     def test_final_emerald_sound_timeout_does_not_hold_victory_forever(self):
@@ -1255,6 +1399,74 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(warnings, [(7, 6)])
         self.assertEqual(sounds, ["removed"])
+
+    def test_normal_mode_final_removal_uses_all_missing_lock(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = False
+        guard.normal_ring_lock_active = False
+        guard.overlay_kind = None
+        events = []
+        guard.show_normal_all_missing_overlay = (
+            lambda: events.append("all_missing")
+        )
+
+        guard.handle_normal_count_change(1, 0)
+
+        self.assertEqual(events, ["all_missing"])
+
+    def test_normal_all_missing_meter_uses_zero_present_emeralds(self):
+        guard = self.make_guard()
+        guard.normal_warning_after_id = None
+        guard.normal_ring_lock_active = False
+        guard.pending_overlay_missing = None
+        guard.guard_active = False
+        guard.cancel_normal_warning = lambda: None
+        guard.show_missing_overlay = MagicMock()
+
+        guard.show_normal_all_missing_overlay()
+
+        guard.show_missing_overlay.assert_called_once_with(
+            guard_module.TOTAL_EMERALDS,
+            message=guard_module.NORMAL_ALL_MISSING_MESSAGE,
+        )
+
+    def test_story_robotnik_screen_uses_ring_message_below_meter(self):
+        guard = self.make_guard()
+        guard.guard_active = True
+        guard.guard_mode = "story"
+        guard.accepted_count = 3
+        guard.show_missing_overlay = MagicMock()
+        guard.set_robotnik_title = lambda text: None
+
+        guard.show_story_robotnik_screen()
+
+        guard.show_missing_overlay.assert_called_once_with(
+            guard_module.TOTAL_EMERALDS - 3,
+            message=guard_module.STORY_ROBOTNIK_MESSAGE,
+        )
+
+    def test_normal_mode_restoration_uses_dedicated_announcement(self):
+        guard = self.make_guard()
+        guard.guard_active = True
+        guard.guard_mode = "normal"
+        shown = []
+        guard.show_story_announcement = (
+            lambda count, kind, duration_seconds=None: shown.append(
+                (count, kind, duration_seconds)
+            ) or True
+        )
+
+        self.assertTrue(guard.show_normal_restored_announcement(6))
+        self.assertEqual(
+            shown,
+            [
+                (
+                    6,
+                    "restored_normal",
+                    guard_module.STORY_ANNOUNCEMENT_SECONDS,
+                )
+            ],
+        )
 
     def test_energy_meter_text_shows_master_energy_and_progress(self):
         guard = self.make_guard()

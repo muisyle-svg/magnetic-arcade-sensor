@@ -10,6 +10,8 @@
   "robotnik_fade_ms": 250,
   "music_volume": 0.75,
   "sound_effect_volume": 1.0,
+  "ring_sound_file": "ring.mp3",
+  "act_clear_sound_file": "act-clear.mp3",
   "removal_sound_files": [
     "ohh-no-the-chaos-emerald.mp3",
     "ohh-no.mp3",
@@ -38,7 +40,7 @@
   "ring_joystick_button": 10,
   "ring_debounce_ms": 90,
   "ring_game_commit_seconds": 3.0,
-  "ring_announcement_seconds": 5.0,
+  "ring_announcement_seconds": 3.0,
   "ring_milestone_announcement_seconds": 10.0,
   "emulator_process_names": [
     "mame.exe",

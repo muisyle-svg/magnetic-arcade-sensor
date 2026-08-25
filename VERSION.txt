@@ -1,7 +1,7 @@
 MAGNETIC ARCADE GUARD - RING COUNTER BUILD
 
 Build family: Ring-enabled Story/Normal Mode
-Update: 2026-08-23
+Update: 2026-08-24
 
 Includes Windows-native ring input on joystick button 10, synchronized
 low-overhead cinematic playback, the graphical seven-segment Master Emerald
@@ -19,6 +19,37 @@ activation until prior cleanup is complete, re-queues interrupted prize
 messages, supervises ring input, makes serial-worker death explicit, and adds
 deadlines for cinematic and victory callbacks that could otherwise wait
 forever.
+
+This follow-up adds extra bottom safety space to meter announcements and lets
+any joystick button or direction dismiss temporary emerald stolen/restored
+messages.
+
+This update adds ring-entry audio, immediate live updates to an active ring
+counter banner, vertically fitted announcement windows, a Normal Mode
+all-emeralds-missing lock that still accepts rings, a Normal Mode Emerald
+Restored announcement with current energy, and the Medallion prize message.
+The 50-ring milestone plays the optional act-clear sound when
+act-clear.mp3 (or a descriptive act/clear audio filename) is available.
+
+This update adds the global Ctrl+Alt+F9 Story Mode testing shortcut, which
+skips the Sonic CD cinematic while preserving the heist narration and
+Robotnik lock screen.
+
+This update corrects the Normal Mode zero-energy display, adds the graphical
+segmented Master Emerald meter to the Normal Mode theft/restoration banners,
+makes the 50-ring prize interrupt ordinary ring-count banners immediately,
+and changes the Story Mode Robotnik footer to explain that a ring is needed
+until full energy returns.
+
+The segmented Master Emerald meter now also appears on Story Mode emerald
+stolen and emerald restored announcements.
+
+This reliability update keeps the 50-ring Medallion prize as the highest
+priority presentation: later rings and emerald transitions are deferred,
+ordinary event sounds cannot replace its act-clear audio, and its display
+timer is not reset by additional rings. Regular ring notices are shorter,
+dismissible with any joystick button or direction, and Story Mode keeps the
+ring-required footer on every Robotnik missing-emerald state.
 
 The frozen stable release remains at:
 ..\versions\stable-pre-story-mode\

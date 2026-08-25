@@ -38,6 +38,14 @@ last_removal_name = runtime_config.get(
     'last_emerald_removal_sound_file',
     'no-he-s-got-the-last-emerald.mp3',
 )
+ring_sound_name = runtime_config.get(
+    'ring_sound_file',
+    'ring.mp3',
+)
+act_clear_sound_name = runtime_config.get(
+    'act_clear_sound_file',
+    'act-clear.mp3',
+)
 final_completion_name = runtime_config.get(
     'final_completion_sound_file',
     'i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3',
@@ -49,12 +57,26 @@ asset_names = [
     '27. Sonic the Hedgehog Victory Theme.mp3',
     'Dr Robotniks Theme.mp3',
     'emerald.mp3',
+    ring_sound_name,
     *removal_names,
     last_removal_name,
     final_completion_name,
     'so-egg-man-s-behind-this-huh.mp3',
     cinematic_name,
 ]
+if (asset_directory / act_clear_sound_name).is_file():
+    asset_names.append(act_clear_sound_name)
+else:
+    matching_act_clear_assets = sorted(
+        path.name
+        for path in asset_directory.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in {'.mp3', '.wav', '.ogg'}
+        and 'act' in path.stem.lower()
+        and 'clear' in path.stem.lower()
+    )
+    if matching_act_clear_assets:
+        asset_names.append(matching_act_clear_assets[0])
 missing_assets = [
     name for name in asset_names
     if not (asset_directory / name).is_file()

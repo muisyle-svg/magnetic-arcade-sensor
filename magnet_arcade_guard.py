@@ -110,6 +110,8 @@ DEFAULT_CONFIG = {
     "robotnik_fade_ms": 250,
     "music_volume": 0.75,
     "sound_effect_volume": 1.0,
+    "ring_sound_file": "ring.mp3",
+    "act_clear_sound_file": "act-clear.mp3",
     "removal_sound_files": [
         "ohh-no-the-chaos-emerald.mp3",
         "ohh-no.mp3",
@@ -132,7 +134,7 @@ DEFAULT_CONFIG = {
     "ring_joystick_button": 10,
     "ring_debounce_ms": 90,
     "ring_game_commit_seconds": 3.0,
-    "ring_announcement_seconds": 5.0,
+    "ring_announcement_seconds": 3.0,
     "emulator_process_names": list(DEFAULT_EMULATOR_PROCESS_NAMES),
     "cinematic_max_fps": 15,
     "cinematic_video_file": (
@@ -232,6 +234,18 @@ def config_process_names(value, defaults) -> frozenset[str]:
 def joystick_button_mask(human_button_number: int) -> int:
     """Convert a 1-based Windows joystick button number to its bit mask."""
     return 1 << max(0, int(human_button_number) - 1)
+
+
+def joystick_direction_active(joystick_state) -> bool:
+    """Return true when a physical stick or POV hat is being held."""
+    axis_moved = (
+        abs(int(joystick_state.dwXpos) - JOYSTICK_AXIS_CENTER)
+        >= JOYSTICK_AXIS_THRESHOLD
+        or abs(int(joystick_state.dwYpos) - JOYSTICK_AXIS_CENTER)
+        >= JOYSTICK_AXIS_THRESHOLD
+    )
+    pov_active = int(joystick_state.dwPOV) != JOY_POVCENTERED
+    return axis_moved or pov_active
 
 
 AUTO_ACTIVATE = config_boolean(
@@ -359,8 +373,8 @@ RING_GAME_COMMIT_SECONDS = config_number(
     15.0,
 )
 RING_ANNOUNCEMENT_SECONDS = config_number(
-    RUNTIME_CONFIG.get("ring_announcement_seconds", 5.0),
-    5.0,
+    RUNTIME_CONFIG.get("ring_announcement_seconds", 3.0),
+    3.0,
     1.0,
     30.0,
 )
@@ -371,8 +385,8 @@ RING_MILESTONE_ANNOUNCEMENT_SECONDS = config_number(
     60.0,
 )
 RING_MILESTONE = 50
-RING_MILESTONE_TITLE = "50 RINGS!"
-RING_MILESTONE_MESSAGE = "Find Alex for your prize!"
+RING_MILESTONE_TITLE = "50 Rings!"
+RING_MILESTONE_MESSAGE = "You've earned a Medallion!"
 RING_COUNT_TITLE = "RING COLLECTED!"
 RING_BURST_TITLE = "RING POWER!"
 RING_BURST_MESSAGE = (
@@ -485,6 +499,12 @@ SUPERSONIC_IMAGE_NAME = "supersonic.gif"
 COMPLETION_AUDIO_NAME = "27. Sonic the Hedgehog Victory Theme.mp3"
 MISSING_AUDIO_NAME = "Dr Robotniks Theme.mp3"
 EMERALD_AUDIO_NAME = "emerald.mp3"
+RING_AUDIO_NAME = str(
+    RUNTIME_CONFIG.get("ring_sound_file", "ring.mp3")
+).strip() or "ring.mp3"
+ACT_CLEAR_AUDIO_NAME = str(
+    RUNTIME_CONFIG.get("act_clear_sound_file", "act-clear.mp3")
+).strip() or "act-clear.mp3"
 configured_removal_audio_names = RUNTIME_CONFIG.get(
     "removal_sound_files",
 )
@@ -549,6 +569,10 @@ ORIGINAL_MISSING_AUDIO_PATH = (
 ORIGINAL_EMERALD_AUDIO_PATH = (
     SOURCE_ASSET_DIRECTORY / EMERALD_AUDIO_NAME
 )
+ORIGINAL_RING_AUDIO_PATH = SOURCE_ASSET_DIRECTORY / RING_AUDIO_NAME
+ORIGINAL_ACT_CLEAR_AUDIO_PATH = (
+    SOURCE_ASSET_DIRECTORY / ACT_CLEAR_AUDIO_NAME
+)
 ORIGINAL_REMOVAL_AUDIO_PATHS = tuple(
     SOURCE_ASSET_DIRECTORY / name
     for name in REMOVAL_AUDIO_NAMES
@@ -573,6 +597,13 @@ COMPLETION_MESSAGE = (
 GAME_ON_MESSAGE = "EMERALDS FOUND! GAME ON!"
 RESTORED_MESSAGE = "ALL CHAOS EMERALDS RESTORED!"
 NORMAL_WARNING_MESSAGE = "Hey! Put that back! We already did the thing!"
+NORMAL_ALL_MISSING_MESSAGE = (
+    "You'll need a Ring if there's no Chaos Energy!"
+)
+STORY_ROBOTNIK_MESSAGE = (
+    "You'll need a ring to play until full energy is restored!"
+)
+NORMAL_RESTORED_TITLE = "EMERALD RESTORED!"
 STORY_REMOVAL_OVERLAY_TITLE = "A Chaos Emerald Was Stolen!"
 STORY_SHUTDOWN_TITLE = "ROBOTNIK'S CHAOS HEIST!"
 STORY_SHUTDOWN_MESSAGE = (
@@ -666,7 +697,13 @@ ERROR_ALREADY_EXISTS = 183
 CREATE_NO_WINDOW = 0x08000000
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MagnetArcadeGuard.SingleInstance"
 JOYERR_NOERROR = 0
+JOY_RETURNX = 0x00000001
+JOY_RETURNY = 0x00000002
+JOY_RETURNPOV = 0x00000004
 JOY_RETURNBUTTONS = 0x00000080
+JOY_POVCENTERED = 0xFFFF
+JOYSTICK_AXIS_CENTER = 32768
+JOYSTICK_AXIS_THRESHOLD = 12000
 
 
 class Win32Rect(ctypes.Structure):
@@ -949,6 +986,8 @@ class MagnetArcadeGuard:
         self.final_completion_sound_started_at = 0.0
         self.music_mode: Optional[str] = None
         self.emerald_sound = None
+        self.ring_sound = None
+        self.act_clear_sound = None
         self.removal_sound = None
         self.removal_sounds = []
         self.last_removal_sound_index = None
@@ -970,6 +1009,10 @@ class MagnetArcadeGuard:
         self.story_armed = False
         self.story_cycle_started = False
         self.story_intro_completed = False
+        # One-shot operator aid for testing: skip the cinematic during the
+        # next Story Mode heist without skipping the narration or Robotnik
+        # lock screen.
+        self.skip_cinematic_requested = False
         self.story_sequence_after_id = None
         self.announcement_after_id = None
         self.normal_warning_after_id = None
@@ -1014,6 +1057,7 @@ class MagnetArcadeGuard:
         self.ring_joystick_error = ""
         self.ring_joystick_signature = ()
         self.joystick_button_states = {}
+        self.joystick_direction_states = {}
         self.ring_last_press_at = {}
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
@@ -1027,6 +1071,8 @@ class MagnetArcadeGuard:
         self.pending_ring_milestone = False
         self.pending_ring_announcement: Optional[str] = None
         self.active_ring_announcement_kind: Optional[str] = None
+        self.milestone_deferred_count_change = False
+        self.milestone_deferred_previous_count: Optional[int] = None
         self.ring_state_warning = ""
         self.service_warning = ""
         self.serial_worker_failed = False
@@ -1101,6 +1147,7 @@ class MagnetArcadeGuard:
         self.announcement_window = None
         self.announcement_title_label = None
         self.announcement_detail_label = None
+        self.announcement_energy_canvas = None
         self.announcement_flash_window = None
         self.announcement_flash_after_id = None
 
@@ -1168,6 +1215,15 @@ class MagnetArcadeGuard:
             EMERALD_AUDIO_NAME,
             ORIGINAL_EMERALD_AUDIO_PATH,
         )
+        self.ring_audio_path = self.find_asset(
+            RING_AUDIO_NAME,
+            ORIGINAL_RING_AUDIO_PATH,
+        )
+        self.act_clear_audio_path = self.find_optional_audio_asset(
+            ACT_CLEAR_AUDIO_NAME,
+            ORIGINAL_ACT_CLEAR_AUDIO_PATH,
+            ("act", "clear"),
+        )
         self.removal_audio_paths = tuple(
             self.find_asset(name, original_path)
             for name, original_path in zip(
@@ -1227,6 +1283,12 @@ class MagnetArcadeGuard:
                     )
                     self.emerald_sound.set_volume(SOUND_EFFECT_VOLUME)
 
+                if self.ring_audio_path.exists():
+                    self.ring_sound = pygame.mixer.Sound(
+                        str(self.ring_audio_path)
+                    )
+                    self.ring_sound.set_volume(SOUND_EFFECT_VOLUME)
+
                 for removal_audio_path in self.removal_audio_paths:
                     if not removal_audio_path.exists():
                         continue
@@ -1265,6 +1327,17 @@ class MagnetArcadeGuard:
                         )
                     except pygame.error:
                         self.final_completion_sound = None
+
+                if self.act_clear_audio_path.exists():
+                    try:
+                        self.act_clear_sound = pygame.mixer.Sound(
+                            str(self.act_clear_audio_path)
+                        )
+                        self.act_clear_sound.set_volume(
+                            SOUND_EFFECT_VOLUME
+                        )
+                    except pygame.error:
+                        self.act_clear_sound = None
 
                 if self.eggman_reveal_audio_path.exists():
                     try:
@@ -1513,22 +1586,27 @@ class MagnetArcadeGuard:
             anchor="center",
         )
 
-    def set_energy_meter(
+    def render_segmented_energy_meter(
         self,
+        canvas,
         present_count: int,
         *,
         emphasis: bool = False,
-        visible: bool = True,
-    ) -> None:
-        if not getattr(self, "energy_canvas", None):
-            return
-
+        meter_width: Optional[int] = None,
+        meter_height: Optional[int] = None,
+    ) -> tuple[int, int]:
+        """Draw the same labeled, color-coded meter on any Tk canvas."""
         present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
-        self.energy_display_count = present_count
         _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
+        meter_width = meter_width or max(
+            240,
+            min(520, int(monitor_width * 0.72)),
+        )
+        meter_height = meter_height or max(
+            42,
+            min(62, int(monitor_height * 0.11)),
+        )
         text = self.energy_meter_text(present_count)
-        meter_width = max(240, min(520, int(monitor_width * 0.72)))
-        meter_height = max(42, min(62, int(monitor_height * 0.11)))
         base_size = max(10, min(18, int(monitor_height * 0.034)))
         if emphasis:
             base_size += 2
@@ -1539,13 +1617,13 @@ class MagnetArcadeGuard:
             available_width=meter_width,
         )
         color = self.energy_meter_color(present_count)
-        self.energy_canvas.configure(
+        canvas.configure(
             width=meter_width,
             height=meter_height,
             background="#000000",
         )
-        self.energy_canvas.delete("all")
-        self.energy_canvas.create_text(
+        canvas.delete("all")
+        canvas.create_text(
             meter_width / 2,
             max(9, font_size * 0.65),
             text=text,
@@ -1567,7 +1645,7 @@ class MagnetArcadeGuard:
             left = horizontal_margin + index * (segment_width + segment_gap)
             right = left + segment_width
             filled = index < present_count
-            self.energy_canvas.create_rectangle(
+            canvas.create_rectangle(
                 left,
                 bar_top,
                 right,
@@ -1576,10 +1654,61 @@ class MagnetArcadeGuard:
                 outline="#ffffff" if emphasis and filled else "#606060",
                 width=2 if emphasis and filled else 1,
             )
+        return meter_width, meter_height
+
+    def set_energy_meter(
+        self,
+        present_count: int,
+        *,
+        emphasis: bool = False,
+        visible: bool = True,
+    ) -> None:
+        if not getattr(self, "energy_canvas", None):
+            return
+
+        present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
+        self.energy_display_count = present_count
+        self.render_segmented_energy_meter(
+            self.energy_canvas,
+            present_count,
+            emphasis=emphasis,
+        )
         if visible:
             self.position_energy_meter()
         else:
             self.energy_canvas.place_forget()
+
+    def set_announcement_energy_meter(
+        self,
+        present_count: int,
+        *,
+        visible: bool,
+        emphasis: bool = False,
+    ) -> None:
+        """Show the Robotnik-style meter inside a normal-mode banner."""
+        canvas = getattr(self, "announcement_energy_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.pack_forget()
+        except tk.TclError:
+            pass
+        if not visible:
+            return
+        self.render_segmented_energy_meter(
+            canvas,
+            present_count,
+            emphasis=emphasis,
+            meter_width=max(
+                220,
+                min(500, int(self.overlay_monitor_bounds[2] * 0.70)),
+            ),
+            meter_height=max(
+                42,
+                min(62, int(self.overlay_monitor_bounds[3] * 0.10)),
+            ),
+        )
+        canvas.pack(pady=(0, 10))
 
     def animate_energy_meter(
         self,
@@ -1692,6 +1821,49 @@ class MagnetArcadeGuard:
             return local_path
 
         return original_path
+
+    def find_optional_audio_asset(
+        self,
+        asset_name: str,
+        original_path: Path,
+        keywords: tuple[str, ...],
+    ) -> Path:
+        """Find an optional audio asset, tolerating a descriptive filename."""
+        exact_path = self.find_asset(asset_name, original_path)
+        if exact_path.exists():
+            return exact_path
+
+        directories = [application_directory()]
+        bundled_directory = getattr(sys, "_MEIPASS", None)
+        if bundled_directory:
+            directories.append(Path(bundled_directory))
+        directories.extend(
+            [Path(__file__).resolve().parent, original_path.parent]
+        )
+        seen_directories = set()
+        for directory in directories:
+            directory_key = str(directory).lower()
+            if directory_key in seen_directories or not directory.is_dir():
+                continue
+            seen_directories.add(directory_key)
+            try:
+                candidates = sorted(
+                    path
+                    for path in directory.iterdir()
+                    if path.is_file()
+                    and path.suffix.lower() in {".mp3", ".wav", ".ogg"}
+                    and all(
+                        keyword.lower() in path.stem.lower()
+                        for keyword in keywords
+                    )
+                )
+            except OSError:
+                continue
+            if candidates:
+                candidate = candidates[0]
+                return self.find_asset(candidate.name, candidate)
+
+        return exact_path
 
     def load_background_image(self) -> None:
         if not PIL_AVAILABLE:
@@ -2000,6 +2172,12 @@ class MagnetArcadeGuard:
             justify="center",
         )
         self.announcement_detail_label.pack(pady=(2, 10))
+        self.announcement_energy_canvas = tk.Canvas(
+            self.announcement_window,
+            background="#000000",
+            borderwidth=0,
+            highlightthickness=0,
+        )
         self.announcement_window.withdraw()
 
         self.announcement_flash_window = tk.Toplevel(self.root)
@@ -2116,6 +2294,91 @@ class MagnetArcadeGuard:
         self.overlay_monitor_bounds = monitor_bounds
         return True
 
+    def configure_announcement_content(
+        self,
+        title: str,
+        detail: str,
+        color: str,
+        *,
+        title_max_size: int,
+        title_min_size: int,
+        detail_max_size: int,
+        detail_min_size: int,
+    ) -> tuple[int, int, int, int]:
+        """Fit announcement text horizontally and vertically before showing it."""
+        x, y, monitor_width, monitor_height = self.overlay_monitor_bounds
+        banner_width = max(1, int(monitor_width * 0.90))
+        wraplength = max(1, int(banner_width * 0.82))
+        title_size = self.fit_font_size(
+            tuple(title.splitlines()) or (title,),
+            max_size=title_max_size,
+            min_size=title_min_size,
+            available_width=banner_width,
+        )
+        detail_size = self.fit_font_size(
+            tuple(detail.splitlines()) or (detail,),
+            max_size=detail_max_size,
+            min_size=detail_min_size,
+            available_width=banner_width,
+        )
+
+        # The old fixed 30%-of-screen banner could clip packed labels at the
+        # top and bottom on short arcade displays. Allow a taller centered
+        # banner, then reduce fonts if the packed content still needs room.
+        max_banner_height = max(
+            88,
+            monitor_height - max(12, int(monitor_height * 0.04)),
+        )
+        required_height = max_banner_height
+        for _ in range(40):
+            self.announcement_title_label.configure(
+                text=title,
+                foreground=color,
+                font=("Arial", title_size, "bold"),
+                wraplength=wraplength,
+                justify="center",
+            )
+            self.announcement_detail_label.configure(
+                text=detail,
+                font=("Arial", detail_size, "bold"),
+                wraplength=wraplength,
+                justify="center",
+            )
+            self.announcement_window.update_idletasks()
+            required_height = (
+                self.announcement_title_label.winfo_reqheight()
+                + self.announcement_detail_label.winfo_reqheight()
+                + (
+                    self.announcement_energy_canvas.winfo_reqheight()
+                    if (
+                        getattr(self, "announcement_energy_canvas", None)
+                        and self.announcement_energy_canvas.winfo_manager()
+                        == "pack"
+                    )
+                    else 0
+                )
+                # Include a real safety margin below the packed meter. Tk's
+                # requested height can otherwise be a few pixels shorter
+                # than the final rendered canvas on arcade resolutions.
+                + 34
+            )
+            if required_height <= max_banner_height:
+                break
+            if detail_size > detail_min_size:
+                detail_size -= 1
+            elif title_size > title_min_size:
+                title_size -= 1
+            else:
+                break
+
+        banner_height = max(
+            88,
+            min(max_banner_height, required_height),
+        )
+        banner_x = x + (monitor_width - banner_width) // 2
+        banner_y = y + (monitor_height - banner_height) // 2
+        return banner_x, banner_y, banner_width, banner_height
+
     def emulator_owns_foreground(self) -> bool:
         """Fail safely when deciding whether a small overlay may be created."""
         try:
@@ -2133,11 +2396,23 @@ class MagnetArcadeGuard:
         event_kind: str,
         duration_seconds: Optional[float] = None,
     ) -> bool:
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            # The 50-ring prize owns the presentation until its guaranteed
+            # display interval completes.
+            return False
         if not self.can_show_story_announcement():
             return False
 
         self.hide_story_announcement()
         missing_count = TOTAL_EMERALDS - present_count
+        # Every temporary emerald status banner uses the same segmented meter
+        # as the full Robotnik screen, in both Story and Normal Mode.
+        uses_energy_meter = event_kind in {
+            "removed",
+            "returned",
+            "normal",
+            "restored_normal",
+        }
         if event_kind == "removed":
             _, detail = STORY_STOLEN_TEXT.get(
                 missing_count,
@@ -2150,17 +2425,15 @@ class MagnetArcadeGuard:
             color = "#ff5555"
         elif event_kind == "normal":
             title = STORY_REMOVAL_OVERLAY_TITLE
-            energy_percent = round(
-                max(0, min(TOTAL_EMERALDS, present_count))
-                * 100
-                / TOTAL_EMERALDS
-            )
             detail = (
                 "Hey! Put that back!\n"
-                "We already did the thing!\n"
-                f"CHAOS ENERGY: {energy_percent}%"
+                "We already did the thing!"
             )
             color = "#ffcc66"
+        elif event_kind == "restored_normal":
+            title = NORMAL_RESTORED_TITLE
+            detail = "THE SHRINE IS RECLAIMING ITS POWER!"
+            color = "#77ff99"
         else:
             title, detail = STORY_RETURNED_TEXT.get(
                 present_count,
@@ -2171,36 +2444,33 @@ class MagnetArcadeGuard:
             )
             color = "#77ff99"
 
-        x, y, width, height = self.overlay_monitor_bounds
-        banner_width = max(1, int(width * 0.90))
-        banner_height = max(88, min(180, int(height * 0.30)))
-        banner_x = x + (width - banner_width) // 2
-        banner_y = y + (height - banner_height) // 2
-        title_size = self.fit_font_size(
-            (title,),
-            max_size=max(14, min(26, int(height * 0.052))),
-            min_size=12,
-            available_width=banner_width,
-        )
-        detail_size = self.fit_font_size(
-            (detail,),
-            max_size=max(11, min(19, int(height * 0.035))),
-            min_size=10,
-            available_width=banner_width,
+        self.set_announcement_energy_meter(
+            present_count,
+            visible=uses_energy_meter,
         )
 
-        self.announcement_title_label.configure(
-            text=title,
-            foreground=color,
-            font=("Arial", title_size, "bold"),
-            wraplength=max(1, int(banner_width * 0.82)),
-            justify="center",
-        )
-        self.announcement_detail_label.configure(
-            text=detail,
-            font=("Arial", detail_size, "bold"),
-            wraplength=max(1, int(banner_width * 0.82)),
-            justify="center",
+        banner_x, banner_y, banner_width, banner_height = (
+            self.configure_announcement_content(
+                title,
+                detail,
+                color,
+                title_max_size=max(
+                    14,
+                    min(
+                        26,
+                        int(self.overlay_monitor_bounds[3] * 0.052),
+                    ),
+                ),
+                title_min_size=10,
+                detail_max_size=max(
+                    11,
+                    min(
+                        19,
+                        int(self.overlay_monitor_bounds[3] * 0.035),
+                    ),
+                ),
+                detail_min_size=8,
+            )
         )
         self.announcement_window.geometry(
             f"{banner_width}x{banner_height}{banner_x:+d}{banner_y:+d}"
@@ -2252,6 +2522,23 @@ class MagnetArcadeGuard:
 
     def hide_story_announcement(self) -> None:
         if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            # Do not let sensor changes, later rings, or a delayed callback
+            # interrupt the prize announcement. Keep it active and re-queue
+            # the durable milestone state if a caller tried to hide it.
+            self.pending_ring_milestone = True
+            self.pending_ring_announcement = "milestone"
+            self.ring_milestones_pending.add(RING_MILESTONE)
+            self.save_ring_state()
+            self.write_status(
+                "RING MILESTONE INTERRUPT IGNORED | kept visible"
+            )
+            return
+        previous_ring_kind = getattr(
+            self,
+            "active_ring_announcement_kind",
+            None,
+        )
+        if previous_ring_kind == "milestone":
             # Only the dedicated timeout callback acknowledges delivery. Any
             # other hide (game launch, mode switch, emerald event, shutdown)
             # means the camper did not receive the promised ten seconds.
@@ -2264,6 +2551,7 @@ class MagnetArcadeGuard:
             )
         self.active_ring_announcement_kind = None
         self.ring_power_announcement_visible = False
+        self.set_announcement_energy_meter(0, visible=False)
         if self.announcement_after_id is not None:
             try:
                 self.root.after_cancel(self.announcement_after_id)
@@ -2275,6 +2563,18 @@ class MagnetArcadeGuard:
             try:
                 self.announcement_window.withdraw()
             except tk.TclError:
+                pass
+
+        if (
+            previous_ring_kind is not None
+            and getattr(self, "pending_ring_announcement", None)
+            and getattr(self, "root", None) is not None
+        ):
+            try:
+                self.root.after_idle(
+                    self.maybe_show_pending_ring_announcement
+                )
+            except (AttributeError, tk.TclError):
                 pass
 
     # --------------------------------------------------
@@ -2413,6 +2713,14 @@ class MagnetArcadeGuard:
 
     def start_story_cinematic(self) -> None:
         self.story_sequence_after_id = None
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            self.milestone_deferred_count_change = True
+            return
+        if self.skip_cinematic_requested:
+            self.skip_cinematic_requested = False
+            self.write_status("CINEMATIC SKIPPED | ROBOTNIK SCREEN ACTIVE")
+            self.show_story_robotnik_screen()
+            return
         if self.cinematic_prepare_state == "preparing":
             if self.cinematic_story_wait_started_at == 0.0:
                 self.cinematic_story_wait_started_at = time.monotonic()
@@ -2722,6 +3030,7 @@ class MagnetArcadeGuard:
             return
         self.ring_input_restart_count += 1
         self.joystick_button_states.clear()
+        self.joystick_direction_states.clear()
         self.ring_last_press_at.clear()
         self.ring_input_thread = threading.Thread(
             target=self.worker_entry,
@@ -2901,7 +3210,12 @@ class MagnetArcadeGuard:
                 for joystick_id in range(joystick_slots):
                     joystick_state = Win32JoyInfoEx()
                     joystick_state.dwSize = ctypes.sizeof(Win32JoyInfoEx)
-                    joystick_state.dwFlags = JOY_RETURNBUTTONS
+                    joystick_state.dwFlags = (
+                        JOY_RETURNBUTTONS
+                        | JOY_RETURNX
+                        | JOY_RETURNY
+                        | JOY_RETURNPOV
+                    )
                     result = winmm.joyGetPosEx(
                         joystick_id,
                         ctypes.byref(joystick_state),
@@ -2913,6 +3227,15 @@ class MagnetArcadeGuard:
                     buttons = int(joystick_state.dwButtons)
                     previous_buttons = self.joystick_button_states.get(
                         joystick_id
+                    )
+                    direction_active = joystick_direction_active(
+                        joystick_state
+                    )
+                    previous_direction_active = (
+                        self.joystick_direction_states.get(
+                            joystick_id,
+                            False,
+                        )
                     )
                     new_buttons = (
                         buttons & ~previous_buttons
@@ -2928,7 +3251,10 @@ class MagnetArcadeGuard:
                         joystick_id,
                         0.0,
                     )
-                    if new_buttons:
+                    new_direction = (
+                        direction_active and not previous_direction_active
+                    )
+                    if new_buttons or new_direction:
                         self.joystick_press_sequence = (
                             getattr(self, "joystick_press_sequence", 0) + 1
                         )
@@ -2950,10 +3276,14 @@ class MagnetArcadeGuard:
                         self.ring_last_press_at[joystick_id] = now
                         self.messages.put(("RING", str(joystick_id), -1))
                     self.joystick_button_states[joystick_id] = buttons
+                    self.joystick_direction_states[joystick_id] = (
+                        direction_active
+                    )
 
                 for state_key in tuple(self.joystick_button_states):
                     if state_key not in live_keys:
                         del self.joystick_button_states[state_key]
+                        self.joystick_direction_states.pop(state_key, None)
                         self.ring_last_press_at.pop(state_key, None)
 
                 self.ring_joystick_signature = tuple(
@@ -2966,6 +3296,7 @@ class MagnetArcadeGuard:
             except Exception as error:
                 self.ring_joystick_error = str(error)[:120]
                 self.joystick_button_states.clear()
+                self.joystick_direction_states.clear()
                 if self.ring_input_stop_event.wait(0.5):
                     break
                 continue
@@ -3003,6 +3334,8 @@ class MagnetArcadeGuard:
     def handle_ring_entry(self) -> None:
         previous_total = self.ring_count
         self.ring_count += 1
+        if getattr(self, "active_ring_announcement_kind", None) != "milestone":
+            self.play_ring_sound()
 
         if (
             previous_total < RING_MILESTONE <= self.ring_count
@@ -3101,6 +3434,8 @@ class MagnetArcadeGuard:
         allow_guard_overlay: bool = False,
         timeout_callback=None,
     ) -> bool:
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            return False
         guard_overlay_is_safe = (
             allow_guard_overlay
             and self.overlay_visible
@@ -3112,35 +3447,28 @@ class MagnetArcadeGuard:
             return False
 
         self.hide_story_announcement()
-        x, y, width, height = self.overlay_monitor_bounds
-        banner_width = max(1, int(width * 0.90))
-        banner_height = max(88, min(200, int(height * 0.32)))
-        banner_x = x + (width - banner_width) // 2
-        banner_y = y + (height - banner_height) // 2
-        title_size = self.fit_font_size(
-            (title,),
-            max_size=max(16, min(32, int(height * 0.065))),
-            min_size=12,
-            available_width=banner_width,
-        )
-        detail_size = self.fit_font_size(
-            tuple(detail.splitlines()),
-            max_size=max(12, min(24, int(height * 0.045))),
-            min_size=10,
-            available_width=banner_width,
-        )
-        self.announcement_title_label.configure(
-            text=title,
-            foreground=color,
-            font=("Arial", title_size, "bold"),
-            wraplength=max(1, int(banner_width * 0.82)),
-            justify="center",
-        )
-        self.announcement_detail_label.configure(
-            text=detail,
-            font=("Arial", detail_size, "bold"),
-            wraplength=max(1, int(banner_width * 0.82)),
-            justify="center",
+        banner_x, banner_y, banner_width, banner_height = (
+            self.configure_announcement_content(
+                title,
+                detail,
+                color,
+                title_max_size=max(
+                    16,
+                    min(
+                        32,
+                        int(self.overlay_monitor_bounds[3] * 0.065),
+                    ),
+                ),
+                title_min_size=10,
+                detail_max_size=max(
+                    12,
+                    min(
+                        24,
+                        int(self.overlay_monitor_bounds[3] * 0.045),
+                    ),
+                ),
+                detail_min_size=8,
+            )
         )
         self.announcement_window.geometry(
             f"{banner_width}x{banner_height}{banner_x:+d}{banner_y:+d}"
@@ -3216,41 +3544,16 @@ class MagnetArcadeGuard:
             and abs(actual_height - expected_height) <= tolerance
         )
 
-    def request_ring_announcement(self, announcement_kind: str) -> None:
-        priorities = {"count": 1, "burst": 2, "milestone": 3}
-        current = getattr(self, "pending_ring_announcement", None)
-        if priorities.get(announcement_kind, 0) >= priorities.get(current, 0):
-            self.pending_ring_announcement = announcement_kind
-        if getattr(self, "ring_power_announcement_visible", False):
-            return
-        self.maybe_show_pending_ring_announcement()
-
-    def maybe_show_pending_ring_announcement(self) -> None:
-        if not self.running:
-            return
-
-        announcement_kind = getattr(
-            self,
-            "pending_ring_announcement",
-            None,
-        )
-        if (
-            getattr(self, "ring_power_announcement_visible", False)
-            and not self.pending_ring_milestone
-        ):
-            return
-        if getattr(self, "active_ring_announcement_kind", None) is not None:
-            return
-        if self.pending_ring_milestone:
-            announcement_kind = "milestone"
-        if announcement_kind is None:
-            return
-
+    def ring_announcement_content(
+        self,
+        announcement_kind: str,
+    ) -> tuple[str, str, str, Optional[float]]:
         if announcement_kind == "milestone":
             title = RING_MILESTONE_TITLE
-            detail = (
-                f"{RING_MILESTONE_MESSAGE}\nTOTAL RINGS: {self.ring_count}"
-            )
+            # This is a fixed milestone, not a live ring-count banner. Later
+            # rings should not turn the prize announcement into "53 rings"
+            # while the 50-ring event is being delivered.
+            detail = RING_MILESTONE_MESSAGE
             color = "#ffdd55"
             duration = RING_MILESTONE_ANNOUNCEMENT_SECONDS
         elif announcement_kind == "burst":
@@ -3280,6 +3583,134 @@ class MagnetArcadeGuard:
                 energy_text = f"CHAOS ENERGY: {energy_percent}%"
             detail = f"{detail}\n{energy_text}"
 
+        return title, detail, color, duration
+
+    def refresh_active_ring_announcement(self) -> None:
+        """Refresh a visible ring banner with the latest persistent total."""
+        announcement_kind = getattr(
+            self,
+            "active_ring_announcement_kind",
+            None,
+        )
+        if announcement_kind is None or not self.announcement_window:
+            return
+        if announcement_kind == "milestone":
+            # A later ring must not reset the milestone's full display timer.
+            return
+
+        title, detail, color, duration = self.ring_announcement_content(
+            announcement_kind
+        )
+        banner_x, banner_y, banner_width, banner_height = (
+            self.configure_announcement_content(
+                title,
+                detail,
+                color,
+                title_max_size=max(
+                    16,
+                    min(
+                        32,
+                        int(self.overlay_monitor_bounds[3] * 0.065),
+                    ),
+                ),
+                title_min_size=10,
+                detail_max_size=max(
+                    12,
+                    min(
+                        24,
+                        int(self.overlay_monitor_bounds[3] * 0.045),
+                    ),
+                ),
+                detail_min_size=8,
+            )
+        )
+        self.announcement_window.geometry(
+            f"{banner_width}x{banner_height}{banner_x:+d}{banner_y:+d}"
+        )
+        self.apply_announcement_window_style()
+
+        if self.announcement_after_id is not None:
+            try:
+                self.root.after_cancel(self.announcement_after_id)
+            except (AttributeError, tk.TclError):
+                pass
+            self.announcement_after_id = None
+        if duration is not None:
+            callback = (
+                self.complete_ring_milestone_announcement
+                if announcement_kind == "milestone"
+                else self.hide_story_announcement
+            )
+            self.announcement_after_id = self.root.after(
+                int(duration * 1000),
+                callback,
+            )
+        self.write_status(
+            "RING ANNOUNCEMENT UPDATED | "
+            f"kind={announcement_kind} | total={self.ring_count}"
+        )
+
+    def request_ring_announcement(self, announcement_kind: str) -> None:
+        priorities = {"count": 1, "burst": 2, "milestone": 3}
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            self.write_status(
+                "RING ANNOUNCEMENT HELD | 50-RING PRIZE ACTIVE"
+            )
+            return
+        current = getattr(self, "pending_ring_announcement", None)
+        if priorities.get(announcement_kind, 0) >= priorities.get(current, 0):
+            self.pending_ring_announcement = announcement_kind
+        active_kind = getattr(self, "active_ring_announcement_kind", None)
+        if active_kind is not None:
+            active_priority = priorities.get(active_kind, 0)
+            pending_priority = priorities.get(
+                getattr(self, "pending_ring_announcement", None),
+                0,
+            )
+            if pending_priority > active_priority:
+                # A milestone must interrupt an ordinary count banner as soon
+                # as the threshold ring is processed. hide_story_announcement
+                # schedules the higher-priority pending announcement safely on
+                # the Tk event queue.
+                self.hide_story_announcement()
+                return
+            if pending_priority <= active_priority:
+                self.pending_ring_announcement = None
+            self.refresh_active_ring_announcement()
+            return
+        if getattr(self, "ring_power_announcement_visible", False):
+            return
+        self.maybe_show_pending_ring_announcement()
+
+    def maybe_show_pending_ring_announcement(self) -> None:
+        if (
+            not self.running
+            or getattr(self, "active_ring_announcement_kind", None)
+            == "milestone"
+        ):
+            return
+
+        announcement_kind = getattr(
+            self,
+            "pending_ring_announcement",
+            None,
+        )
+        if (
+            getattr(self, "ring_power_announcement_visible", False)
+            and not self.pending_ring_milestone
+        ):
+            return
+        if getattr(self, "active_ring_announcement_kind", None) is not None:
+            return
+        if self.pending_ring_milestone:
+            announcement_kind = "milestone"
+        if announcement_kind is None:
+            return
+
+        title, detail, color, duration = self.ring_announcement_content(
+            announcement_kind
+        )
+
         # Ring totals are permitted over Big Box or our own Robotnik screen.
         # Never create this window over an emulator: GroovyMAME and RetroArch
         # can use exclusive modes or change resolution while a game is active.
@@ -3299,6 +3730,8 @@ class MagnetArcadeGuard:
 
         self.pending_ring_announcement = None
         self.active_ring_announcement_kind = announcement_kind
+        if announcement_kind == "milestone":
+            self.play_act_clear_sound()
         if announcement_kind == "burst":
             self.ring_power_announcement_visible = True
             # The ring insertion that caused this announcement also produces
@@ -3341,9 +3774,41 @@ class MagnetArcadeGuard:
             self.pending_ring_announcement = "burst"
         self.hide_story_announcement()
         self.maybe_show_pending_ring_announcement()
+        self.reconcile_deferred_count_change()
 
     def handle_joystick_press(self, press_sequence=None) -> None:
-        """Dismiss a persistent Ring Power banner on the next button press."""
+        """Dismiss temporary notices or Ring Power on joystick input."""
+        active_kind = getattr(self, "active_ring_announcement_kind", None)
+        if active_kind == "milestone":
+            # The 50-ring prize owns the presentation and audio until its
+            # guaranteed display interval completes.
+            return
+
+        if active_kind == "count":
+            try:
+                self.hide_story_announcement()
+                self.write_status("RING COUNT ANNOUNCEMENT DISMISSED | joystick")
+                self.maybe_show_pending_ring_announcement()
+            except Exception as error:
+                self.recover_ring_ui_error("count dismissal", error)
+            return
+
+        if (
+            getattr(self, "announcement_after_id", None) is not None
+            and getattr(self, "announcement_window", None) is not None
+        ):
+            try:
+                self.hide_story_announcement()
+                self.write_status(
+                    "EMERALD ANNOUNCEMENT DISMISSED | joystick"
+                )
+            except Exception as error:
+                self.recover_ring_ui_error(
+                    "emerald announcement dismissal",
+                    error,
+                )
+            return
+
         if not getattr(self, "ring_power_announcement_visible", False):
             return
 
@@ -3471,9 +3936,11 @@ class MagnetArcadeGuard:
             return
 
         if burst_origin == "normal_all_missing" and self.guard_mode == "normal":
-            if self.accepted_count == TOTAL_EMERALDS:
+            accepted_count = self.accepted_count or 0
+            if accepted_count > 0:
                 self.normal_ring_lock_active = False
                 self.pending_overlay_missing = None
+                self.show_normal_restored_announcement(accepted_count)
                 return
             self.normal_ring_lock_active = True
             self.pending_overlay_missing = (
@@ -3710,6 +4177,7 @@ class MagnetArcadeGuard:
             self.control_window,
             text=(
                 "Keyboard: Story Mode Ctrl+Alt+F10  |  "
+                "Skip Cinematic Ctrl+Alt+F9\n"
                 "Activate Ctrl+Alt+F12\n"
                 "Deactivate Ctrl+Alt+F11  |  "
                 "Close Ctrl+Shift+F12"
@@ -4341,7 +4809,14 @@ class MagnetArcadeGuard:
         # the overlay has appeared.
         if self.overlay_visible:
             self.pending_overlay_missing = None
-            self.show_missing_overlay(missing_count)
+            self.show_missing_overlay(
+                missing_count,
+                message=(
+                    STORY_ROBOTNIK_MESSAGE
+                    if self.guard_mode == "story" and missing_count > 0
+                    else None
+                ),
+            )
             return
 
         self.maybe_show_pending_overlay()
@@ -4349,6 +4824,8 @@ class MagnetArcadeGuard:
     def maybe_show_pending_overlay(self) -> None:
         if (
             not self.running
+            or getattr(self, "active_ring_announcement_kind", None)
+            == "milestone"
             or not self.guard_active
             or self.overlay_visible
             or self.completion_in_progress
@@ -4380,8 +4857,21 @@ class MagnetArcadeGuard:
             and not self.story_intro_completed
         ):
             self.start_story_shutdown_sequence()
+        elif (
+            self.guard_mode == "normal"
+            and getattr(self, "normal_ring_lock_active", False)
+            and self.accepted_count == 0
+        ):
+            self.show_normal_all_missing_overlay()
         else:
-            self.show_missing_overlay(missing_count)
+            self.show_missing_overlay(
+                missing_count,
+                message=(
+                    STORY_ROBOTNIK_MESSAGE
+                    if self.guard_mode == "story" and missing_count > 0
+                    else None
+                ),
+            )
 
     def foreground_watchdog(self) -> None:
         try:
@@ -4941,6 +5431,9 @@ class MagnetArcadeGuard:
         message: str,
         overlay_kind: str,
     ) -> bool:
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            self.milestone_deferred_count_change = True
+            return False
         self.hide_story_announcement()
         if not self.overlay_visible:
             self.capture_return_window()
@@ -5049,8 +5542,28 @@ class MagnetArcadeGuard:
             self.story_sequence_after_id = None
         self.cancel_cinematic()
 
+    def skip_story_cinematic(self) -> None:
+        """Skip the current/next story cinematic for operator testing."""
+        if not self.running or self.guard_mode != "story":
+            return
+
+        if self.overlay_kind == "cinematic":
+            self.skip_cinematic_requested = False
+            self.write_status("CINEMATIC SKIPPED | ROBOTNIK SCREEN ACTIVE")
+            self.finish_story_cinematic()
+            return
+
+        if self.story_cycle_started:
+            self.skip_cinematic_requested = True
+            self.write_status("CINEMATIC SKIP ARMED | STORY HEIST")
+        else:
+            self.write_status(
+                "CINEMATIC SKIP IGNORED | NO STORY HEIST ACTIVE"
+            )
+
     def start_story_shutdown_sequence(self) -> None:
         self.pending_overlay_missing = None
+        self.skip_cinematic_requested = False
         self.story_cycle_started = True
         self.story_intro_completed = False
         if not self.show_text_takeover(
@@ -5120,12 +5633,24 @@ class MagnetArcadeGuard:
         return f"{title}  {detail}"
 
     def show_story_robotnik_screen(self) -> None:
-        if not self.guard_active or self.guard_mode != "story":
+        if (
+            not self.guard_active
+            or self.guard_mode != "story"
+            or getattr(self, "active_ring_announcement_kind", None)
+            == "milestone"
+        ):
             return
         self.story_intro_completed = True
         present_count = self.accepted_count or 0
         missing_count = TOTAL_EMERALDS - present_count
-        self.show_missing_overlay(max(1, missing_count))
+        self.show_missing_overlay(
+            max(1, missing_count),
+            message=(
+                STORY_ROBOTNIK_MESSAGE
+                if missing_count > 0
+                else None
+            ),
+        )
         if not self.guard_active:
             return
         if present_count > 0:
@@ -5143,6 +5668,31 @@ class MagnetArcadeGuard:
                 pass
             self.normal_warning_after_id = None
         self.normal_warning_trigger_count = None
+
+    def show_normal_all_missing_overlay(self) -> None:
+        """Lock Normal Mode when the final emerald is removed."""
+        self.cancel_normal_warning()
+        self.normal_ring_lock_active = True
+        self.pending_overlay_missing = None
+        self.show_missing_overlay(
+            TOTAL_EMERALDS,
+            message=NORMAL_ALL_MISSING_MESSAGE,
+        )
+        if self.guard_active and self.overlay_visible:
+            self.play_last_emerald_removal_sound()
+
+    def show_normal_restored_announcement(self, present_count: int) -> bool:
+        """Show a short, non-blocking Normal Mode restoration message."""
+        if (
+            not getattr(self, "guard_active", False)
+            or getattr(self, "guard_mode", None) != "normal"
+        ):
+            return False
+        return self.show_story_announcement(
+            present_count,
+            "restored_normal",
+            duration_seconds=STORY_ANNOUNCEMENT_SECONDS,
+        )
 
     def show_normal_warning(
         self,
@@ -5188,7 +5738,15 @@ class MagnetArcadeGuard:
             justify="center",
         )
 
-    def show_missing_overlay(self, missing_count: int) -> None:
+    def show_missing_overlay(
+        self,
+        missing_count: int,
+        *,
+        message: Optional[str] = None,
+    ) -> None:
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            self.milestone_deferred_count_change = True
+            return
         self.hide_story_announcement()
         self.set_control_panel_visible(False)
 
@@ -5219,8 +5777,9 @@ class MagnetArcadeGuard:
         self.overlay_visible = True
         self.overlay_kind = "robotnik"
         _, _, monitor_width, _ = self.overlay_monitor_bounds
+        display_message = message or self.missing_text(missing_count)
         count_size = self.fit_font_size(
-            (self.missing_text(missing_count),),
+            (display_message,),
             max_size=self.count_font_size,
             min_size=12,
             available_width=monitor_width,
@@ -5228,7 +5787,7 @@ class MagnetArcadeGuard:
         self.set_robotnik_title(LOCK_MESSAGE)
         self.reset_counter_style()
         self.count_label.configure(
-            text=self.missing_text(missing_count),
+            text=display_message,
             font=("Arial", count_size, "bold"),
             wraplength=max(1, int(monitor_width * 0.82)),
             justify="center",
@@ -5243,6 +5802,12 @@ class MagnetArcadeGuard:
             return
 
     def hide_overlay(self, stop_music: bool = True) -> None:
+        if (
+            getattr(self, "active_ring_announcement_kind", None) == "milestone"
+            and getattr(self, "guard_active", False)
+        ):
+            self.milestone_deferred_count_change = True
+            return
         cleanup_warnings = []
         self.overlay_visible = False
         self.overlay_kind = None
@@ -5379,6 +5944,9 @@ class MagnetArcadeGuard:
             )
 
     def show_completion_message(self) -> None:
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            self.milestone_deferred_count_change = True
+            return
         if self.completion_in_progress:
             return
 
@@ -5496,6 +6064,13 @@ class MagnetArcadeGuard:
         force: bool = False,
         duck_music: bool = True,
     ) -> bool:
+        if (
+            getattr(self, "active_ring_announcement_kind", None) == "milestone"
+            and event_kind != "act_clear"
+        ):
+            # Keep the prize's act-clear audio uninterrupted by later rings or
+            # sensor transitions.
+            return False
         if not self.audio_ready or self.event_channel is None or sound is None:
             return False
 
@@ -5537,6 +6112,26 @@ class MagnetArcadeGuard:
             "final_return" if final else "returned",
             force=final,
             duck_music=not final,
+        )
+
+    def play_ring_sound(self) -> bool:
+        if not hasattr(self, "audio_ready"):
+            return False
+        return self.play_event_sound(
+            self.ring_sound,
+            "ring_entered",
+            force=True,
+            duck_music=True,
+        )
+
+    def play_act_clear_sound(self) -> bool:
+        if not hasattr(self, "audio_ready"):
+            return False
+        return self.play_event_sound(
+            self.act_clear_sound,
+            "act_clear",
+            force=True,
+            duck_music=False,
         )
 
     def play_removal_sound(self) -> bool:
@@ -5645,6 +6240,9 @@ class MagnetArcadeGuard:
         self.final_emerald_wait_started_at = 0.0
 
     def begin_final_emerald_transition(self) -> None:
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            self.milestone_deferred_count_change = True
+            return
         self.cancel_final_emerald_transition()
         self.count_label.configure(text=RESTORED_MESSAGE)
         self.animate_counter("restored")
@@ -6085,12 +6683,60 @@ class MagnetArcadeGuard:
         else:
             self.handle_normal_count_change(previous_count, count)
 
+    def defer_count_change_for_milestone(
+        self,
+        previous_count: int,
+        current_count: int,
+    ) -> bool:
+        """Hold sensor-driven presentation while the 50-ring prize plays."""
+        if getattr(self, "active_ring_announcement_kind", None) != "milestone":
+            return False
+        if not getattr(self, "milestone_deferred_count_change", False):
+            self.milestone_deferred_previous_count = previous_count
+        self.milestone_deferred_count_change = True
+        self.write_status(
+            "SENSOR PRESENTATION DEFERRED | 50-RING PRIZE ACTIVE"
+        )
+        return True
+
+    def reconcile_deferred_count_change(self) -> None:
+        """Apply the final sensor state after the milestone releases priority."""
+        if getattr(self, "active_ring_announcement_kind", None) == "milestone":
+            return
+        if not getattr(self, "milestone_deferred_count_change", False):
+            return
+
+        previous_count = self.milestone_deferred_previous_count
+        self.milestone_deferred_count_change = False
+        self.milestone_deferred_previous_count = None
+        if not self.guard_active or self.ring_burst_active:
+            return
+
+        current_count = self.accepted_count
+        if previous_count is None or current_count is None:
+            self.maybe_show_pending_overlay()
+            return
+        if current_count == previous_count:
+            self.maybe_show_pending_overlay()
+            return
+
+        if self.guard_mode == "story":
+            self.handle_story_count_change(previous_count, current_count)
+        else:
+            self.handle_normal_count_change(previous_count, current_count)
+
     def handle_story_count_change(
         self,
         previous_count: int,
         current_count: int,
     ) -> None:
         if current_count == previous_count:
+            return
+
+        if self.defer_count_change_for_milestone(
+            previous_count,
+            current_count,
+        ):
             return
 
         # Ring Power intentionally hides the blocking screen while a game is
@@ -6114,7 +6760,14 @@ class MagnetArcadeGuard:
                     self.begin_final_emerald_transition()
                 return
 
-            self.show_missing_overlay(TOTAL_EMERALDS - current_count)
+            self.show_missing_overlay(
+                TOTAL_EMERALDS - current_count,
+                message=(
+                    STORY_ROBOTNIK_MESSAGE
+                    if current_count < TOTAL_EMERALDS
+                    else None
+                ),
+            )
             if not self.guard_active:
                 return
             if current_count > 0:
@@ -6180,6 +6833,12 @@ class MagnetArcadeGuard:
         if current_count == previous_count:
             return
 
+        if self.defer_count_change_for_milestone(
+            previous_count,
+            current_count,
+        ):
+            return
+
         # A Normal Mode Ring Power pass creates a real all-missing lock that
         # must return after the one permitted game. Sensor updates still get
         # accepted during the pass, but presentation waits until Big Box is
@@ -6198,6 +6857,18 @@ class MagnetArcadeGuard:
                 if self.overlay_kind == "robotnik":
                     self.hide_overlay()
                 self.play_emerald_sound()
+                self.show_normal_restored_announcement(current_count)
+                return
+
+            # Normal Mode only needs to remain locked while every emerald is
+            # gone. Returning even one immediately restores play access.
+            if current_count > 0:
+                self.normal_ring_lock_active = False
+                self.pending_overlay_missing = None
+                if self.overlay_kind == "robotnik":
+                    self.hide_overlay()
+                self.play_emerald_sound()
+                self.show_normal_restored_announcement(current_count)
                 return
 
             self.request_missing_overlay(
@@ -6222,6 +6893,7 @@ class MagnetArcadeGuard:
             ):
                 self.finish_normal_warning()
             self.play_emerald_sound()
+            self.show_normal_restored_announcement(current_count)
             return
 
         if (
@@ -6231,7 +6903,9 @@ class MagnetArcadeGuard:
         ):
             # A second real removal is a new event, so keep the warning up
             # for a full interval from the newest removal.
-            if self.show_normal_warning(previous_count, current_count):
+            if current_count == 0:
+                self.show_normal_all_missing_overlay()
+            elif self.show_normal_warning(previous_count, current_count):
                 self.play_removal_sound()
             return
 
@@ -6239,7 +6913,9 @@ class MagnetArcadeGuard:
         # the usable full-screen foreground. A missing baseline or a steady
         # missing count never opens the warning.
         if current_count < previous_count:
-            if self.show_normal_warning(previous_count, current_count):
+            if current_count == 0:
+                self.show_normal_all_missing_overlay()
+            elif self.show_normal_warning(previous_count, current_count):
                 self.play_removal_sound()
 
     def handle_disconnect(self, reason: str) -> None:
@@ -6266,6 +6942,8 @@ class MagnetArcadeGuard:
                         return
                     elif value == "STORY_MODE":
                         self.select_story_mode()
+                    elif value == "SKIP_CINEMATIC":
+                        self.skip_story_cinematic()
                     elif value == "DEACTIVATE":
                         self.deactivate_guard()
                     elif value == "ACTIVATE":
@@ -6503,6 +7181,9 @@ class MagnetArcadeGuard:
         self.story_armed = False
         self.story_cycle_started = False
         self.story_intro_completed = False
+        self.skip_cinematic_requested = False
+        self.milestone_deferred_count_change = False
+        self.milestone_deferred_previous_count = None
         self.reset_ring_burst_state(clear_normal_lock=True)
         self.controller_lost = True
         self.reader_connected = False
@@ -6545,6 +7226,9 @@ class MagnetArcadeGuard:
         self.story_armed = False
         self.story_cycle_started = False
         self.story_intro_completed = False
+        self.skip_cinematic_requested = False
+        self.milestone_deferred_count_change = False
+        self.milestone_deferred_previous_count = None
         self.reset_ring_burst_state(clear_normal_lock=True)
         self.completion_in_progress = False
         self.reset_big_box_readiness()
@@ -6601,10 +7285,12 @@ class MagnetArcadeGuard:
         exit_combo = (0x11, 0x10, 0x7B)  # Ctrl, Shift, F12
         deactivate_combo = (0x11, 0x12, 0x7A)  # Ctrl, Alt, F11
         story_mode_combo = (0x11, 0x12, 0x79)  # Ctrl, Alt, F10
+        skip_cinematic_combo = (0x11, 0x12, 0x78)  # Ctrl, Alt, F9
         keyboard_activate_combo = (0x11, 0x12, 0x7B)
         was_exit_pressed = False
         was_deactivate_pressed = False
         was_story_mode_pressed = False
+        was_skip_cinematic_pressed = False
         was_activate_pressed = False
 
         while self.running:
@@ -6619,6 +7305,10 @@ class MagnetArcadeGuard:
             ctrl_alt_f10_pressed = all(
                 user32.GetAsyncKeyState(key) & 0x8000
                 for key in story_mode_combo
+            )
+            ctrl_alt_f9_pressed = all(
+                user32.GetAsyncKeyState(key) & 0x8000
+                for key in skip_cinematic_combo
             )
             ctrl_alt_f12_pressed = all(
                 user32.GetAsyncKeyState(key) & 0x8000
@@ -6648,12 +7338,16 @@ class MagnetArcadeGuard:
             if story_mode_pressed and not was_story_mode_pressed:
                 self.messages.put(("CONTROL", "STORY_MODE", -1))
 
+            if ctrl_alt_f9_pressed and not was_skip_cinematic_pressed:
+                self.messages.put(("CONTROL", "SKIP_CINEMATIC", -1))
+
             if activate_pressed and not was_activate_pressed:
                 self.messages.put(("CONTROL", "ACTIVATE", -1))
 
             was_exit_pressed = exit_pressed
             was_deactivate_pressed = deactivate_pressed
             was_story_mode_pressed = story_mode_pressed
+            was_skip_cinematic_pressed = ctrl_alt_f9_pressed
             was_activate_pressed = activate_pressed
             time.sleep(0.05)
 
