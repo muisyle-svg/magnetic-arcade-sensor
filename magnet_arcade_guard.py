@@ -5749,7 +5749,23 @@ class MagnetArcadeGuard:
         self.skip_cinematic_requested = False
         self.story_cycle_started = True
         self.story_intro_completed = False
-        self.start_story_power_loss_effect()
+        if self.start_story_power_loss_effect():
+            return
+
+        # The visual effect is optional. If it cannot be shown, preserve the
+        # original story path so a presentation failure never strands the
+        # heist between the final sensor event and its narration.
+        if not self.show_text_takeover(
+            STORY_SHUTDOWN_TITLE,
+            STORY_SHUTDOWN_MESSAGE,
+            "story_shutdown",
+        ):
+            return
+        self.play_last_emerald_removal_sound()
+        self.story_sequence_after_id = self.root.after(
+            int(STORY_SHUTDOWN_SECONDS * 1000),
+            self.show_story_question,
+        )
 
     def show_story_question(self) -> None:
         self.story_sequence_after_id = None
