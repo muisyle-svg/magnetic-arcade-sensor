@@ -5641,14 +5641,19 @@ class MagnetArcadeGuard:
             self.capture_return_window()
             self.prepare_overlay_monitor()
             if not self.suspend_return_process():
-                self.fault_disable_guard(
-                    "Could not safely pause Big Box for power loss"
+                # The power-loss presentation is short and visual. If the
+                # optional process pause fails, keep the effect rather than
+                # skipping it or turning a presentation problem into a guard
+                # failure. The normal overlay path still protects input once
+                # its takeover is established.
+                self.write_status(
+                    "POWER LOSS VISUAL ONLY | Big Box pause unavailable"
                 )
-                return False
 
         if not self.mute_other_audio():
-            self.fault_disable_guard("Could not mute background audio")
-            return False
+            self.write_status(
+                "POWER LOSS VISUAL ONLY | background audio mute unavailable"
+            )
 
         self.cancel_completion()
         self.stop_music()
@@ -5696,6 +5701,21 @@ class MagnetArcadeGuard:
         )
         return True
 
+    def load_story_shutdown_sound(self) -> None:
+        if getattr(self, "story_shutdown_sound", None) is not None:
+            return
+        if not getattr(self, "audio_ready", False) or not PYGAME_AVAILABLE:
+            return
+
+        audio_path = getattr(self, "story_shutdown_audio_path", None)
+        if not audio_path or not audio_path.exists():
+            return
+        try:
+            self.story_shutdown_sound = pygame.mixer.Sound(str(audio_path))
+            self.story_shutdown_sound.set_volume(SOUND_EFFECT_VOLUME)
+        except pygame.error:
+            self.story_shutdown_sound = None
+
     def show_story_shutdown_narration(self) -> bool:
         if not self.show_text_takeover(
             STORY_SHUTDOWN_TITLE,
@@ -5703,12 +5723,19 @@ class MagnetArcadeGuard:
             "story_shutdown",
         ):
             return False
-        self.play_event_sound(
+        self.load_story_shutdown_sound()
+        played = self.play_event_sound(
             getattr(self, "story_shutdown_sound", None),
             "story_shutdown",
             force=True,
             duck_music=False,
         )
+        if not played:
+            self.write_status(
+                "STORY SHUTDOWN SOUND NOT PLAYED | "
+                f"asset={STORY_SHUTDOWN_AUDIO_NAME}",
+                event=False,
+            )
         self.story_sequence_after_id = self.root.after(
             int(STORY_SHUTDOWN_SECONDS * 1000),
             self.show_story_question,
