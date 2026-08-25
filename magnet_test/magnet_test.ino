@@ -44,6 +44,7 @@ const byte ENERGY_GREEN[SENSOR_COUNT + 1] = {
 enum LedEffect {
   LED_EFFECT_NONE,
   LED_EFFECT_REMOVED,
+  LED_EFFECT_FINAL_REMOVED,
   LED_EFFECT_RETURNED,
   LED_EFFECT_ALL_RETURNED,
 };
@@ -127,7 +128,11 @@ void startLedEffect(int oldCount, int newCount) {
   }
 
   if (newCount < oldCount) {
-    activeLedEffect = LED_EFFECT_REMOVED;
+    activeLedEffect = (
+      newCount == 0
+      ? LED_EFFECT_FINAL_REMOVED
+      : LED_EFFECT_REMOVED
+    );
     returnEnergyBoostActive = false;
   } else if (newCount == SENSOR_COUNT) {
     activeLedEffect = LED_EFFECT_ALL_RETURNED;
@@ -152,6 +157,33 @@ bool renderLedEffect() {
       return true;
     }
     if (elapsed < 230) {
+      setLed(0, 0);
+      return true;
+    }
+  } else if (activeLedEffect == LED_EFFECT_FINAL_REMOVED) {
+    // The final emerald makes the Master Emerald appear to lose power:
+    // bright red warning flashes, unstable flicker, then darkness before
+    // the normal slow red warning pulse resumes for the narration.
+    if (elapsed < 120) {
+      setLed(255, 0);
+      return true;
+    }
+    if (elapsed < 230) {
+      setLed(0, 0);
+      return true;
+    }
+    if (elapsed < 520) {
+      setLed((elapsed / 55 % 2) ? 32 : 210, 0);
+      return true;
+    }
+    if (elapsed < 900) {
+      int brightness = 190 - static_cast<int>(
+        150UL * (elapsed - 520) / 380
+      );
+      setLed(brightness, 0);
+      return true;
+    }
+    if (elapsed < 1550) {
       setLed(0, 0);
       return true;
     }

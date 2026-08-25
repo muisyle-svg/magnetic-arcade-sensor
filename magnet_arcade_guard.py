@@ -616,6 +616,9 @@ STORY_QUESTION_MESSAGE = (
 )
 STORY_EGGMAN_TITLE = "SO EGGMAN'S BEHIND THIS, HUH?"
 STORY_EGGMAN_MESSAGE = ""
+STORY_POWER_LOSS_SECONDS = 1.55
+STORY_POWER_LOSS_BLACKOUT_MS = 180
+STORY_POWER_LOSS_TICK_MS = 55
 ENERGY_ANIMATION_STEP_MS = 55
 ENERGY_EMPHASIS_MS = 420
 
@@ -1014,6 +1017,10 @@ class MagnetArcadeGuard:
         # lock screen.
         self.skip_cinematic_requested = False
         self.story_sequence_after_id = None
+        self.power_loss_after_id = None
+        self.power_loss_generation = 0
+        self.power_loss_active = False
+        self.power_loss_started_at = 0.0
         self.announcement_after_id = None
         self.normal_warning_after_id = None
         self.normal_warning_trigger_count: Optional[int] = None
@@ -5533,6 +5540,181 @@ class MagnetArcadeGuard:
             return False
         return True
 
+    def cancel_power_loss_effect(self) -> None:
+        """Stop the temporary story power-failure presentation safely."""
+        self.power_loss_generation += 1
+        if self.power_loss_after_id is not None:
+            try:
+                self.root.after_cancel(self.power_loss_after_id)
+            except tk.TclError:
+                pass
+            self.power_loss_after_id = None
+
+        self.power_loss_active = False
+        self.power_loss_started_at = 0.0
+        try:
+            self.background_label.place_configure(x=0, y=0)
+        except tk.TclError:
+            pass
+
+        if self.announcement_flash_window:
+            try:
+                self.announcement_flash_window.configure(
+                    background="#fff6b0"
+                )
+                self.announcement_flash_window.attributes(
+                    "-alpha",
+                    0.78,
+                )
+            except tk.TclError:
+                pass
+        self.hide_announcement_flash()
+
+    def show_power_loss_filter(self, color: str, alpha: float) -> None:
+        """Place a non-activating color filter above the guard window."""
+        if not self.announcement_flash_window:
+            return
+
+        x, y, width, height = self.overlay_monitor_bounds
+        try:
+            self.announcement_flash_window.geometry(
+                f"{width}x{height}{x:+d}{y:+d}"
+            )
+            self.announcement_flash_window.configure(background=color)
+            self.announcement_flash_window.attributes(
+                "-alpha",
+                max(0.0, min(1.0, float(alpha))),
+            )
+            self.apply_announcement_window_style(
+                self.announcement_flash_window
+            )
+            self.announcement_flash_window.deiconify()
+            window_handle = self.announcement_flash_window.winfo_id()
+            ctypes.windll.user32.SetWindowPos(
+                window_handle,
+                HWND_TOPMOST,
+                x,
+                y,
+                width,
+                height,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            )
+        except (AttributeError, tk.TclError):
+            pass
+
+    def start_story_power_loss_effect(self) -> bool:
+        """Show the final-emerald power failure before story narration."""
+        if not (
+            self.guard_active
+            and self.guard_mode == "story"
+        ):
+            return False
+
+        self.cancel_power_loss_effect()
+        if not self.show_text_takeover(
+            "",
+            "",
+            "story_power_loss",
+        ):
+            return False
+
+        # Use the Robotnik image as the shrine's last visible signal. The
+        # filter above it handles the color loss and blackout without touching
+        # the physical display or changing the monitor mode.
+        if self.background_frames:
+            self.switch_background(
+                self.background_frames,
+                self.background_delays,
+                loop=True,
+            )
+
+        self.power_loss_active = True
+        self.power_loss_started_at = time.monotonic()
+        self.power_loss_generation += 1
+        generation = self.power_loss_generation
+        self.power_loss_after_id = self.root.after(
+            0,
+            lambda: self.update_story_power_loss(generation),
+        )
+        return True
+
+    def update_story_power_loss(self, generation: int) -> None:
+        if (
+            generation != self.power_loss_generation
+            or not self.power_loss_active
+            or not self.running
+        ):
+            return
+
+        self.power_loss_after_id = None
+        elapsed = time.monotonic() - self.power_loss_started_at
+        progress = elapsed / STORY_POWER_LOSS_SECONDS
+        tick = max(0, int(elapsed * 1000 / STORY_POWER_LOSS_TICK_MS))
+
+        if progress >= 1.0:
+            self.show_power_loss_filter("#000000", 1.0)
+            self.power_loss_after_id = self.root.after(
+                STORY_POWER_LOSS_BLACKOUT_MS,
+                lambda: self.finish_story_power_loss(generation),
+            )
+            return
+
+        if progress < 0.18:
+            # A brief warning flash before the shrine starts failing.
+            color = "#fff6b0" if tick % 2 == 0 else "#ff3344"
+            alpha = 0.72 if tick % 2 == 0 else 0.54
+        elif progress < 0.42:
+            color = "#ff1f3d" if tick % 3 == 0 else "#000000"
+            alpha = 0.18 + progress * 0.55
+        else:
+            color = "#000000"
+            alpha = min(0.98, 0.22 + (progress - 0.42) / 0.58 * 0.76)
+            # Uneven power loss: briefly reveal the image between dark pulses.
+            if tick % 4 == 0:
+                alpha = max(0.08, alpha - 0.24)
+
+        self.show_power_loss_filter(color, alpha)
+        jitter = 0
+        if progress >= 0.28 and tick % 3 != 1:
+            jitter = (-1 if tick % 2 else 1) * max(
+                2,
+                int(10 * min(1.0, progress)),
+            )
+        try:
+            self.background_label.place_configure(x=jitter, y=0)
+        except tk.TclError:
+            pass
+
+        self.power_loss_after_id = self.root.after(
+            STORY_POWER_LOSS_TICK_MS,
+            lambda: self.update_story_power_loss(generation),
+        )
+
+    def finish_story_power_loss(self, generation: int) -> None:
+        if generation != self.power_loss_generation:
+            return
+        self.power_loss_after_id = None
+        self.cancel_power_loss_effect()
+        if not (
+            self.guard_active
+            and self.guard_mode == "story"
+            and self.overlay_visible
+            and self.overlay_kind == "story_power_loss"
+        ):
+            return
+
+        if not self.show_text_takeover(
+            STORY_SHUTDOWN_TITLE,
+            STORY_SHUTDOWN_MESSAGE,
+            "story_shutdown",
+        ):
+            return
+        self.play_last_emerald_removal_sound()
+        self.story_sequence_after_id = self.root.after(
+            int(STORY_SHUTDOWN_SECONDS * 1000),
+            self.show_story_question,
+        )
+
     def cancel_story_sequence(self) -> None:
         if self.story_sequence_after_id is not None:
             try:
@@ -5541,6 +5723,7 @@ class MagnetArcadeGuard:
                 pass
             self.story_sequence_after_id = None
         self.cancel_cinematic()
+        self.cancel_power_loss_effect()
 
     def skip_story_cinematic(self) -> None:
         """Skip the current/next story cinematic for operator testing."""
@@ -5566,17 +5749,7 @@ class MagnetArcadeGuard:
         self.skip_cinematic_requested = False
         self.story_cycle_started = True
         self.story_intro_completed = False
-        if not self.show_text_takeover(
-            STORY_SHUTDOWN_TITLE,
-            STORY_SHUTDOWN_MESSAGE,
-            "story_shutdown",
-        ):
-            return
-        self.play_last_emerald_removal_sound()
-        self.story_sequence_after_id = self.root.after(
-            int(STORY_SHUTDOWN_SECONDS * 1000),
-            self.show_story_question,
-        )
+        self.start_story_power_loss_effect()
 
     def show_story_question(self) -> None:
         self.story_sequence_after_id = None
@@ -6792,6 +6965,7 @@ class MagnetArcadeGuard:
             "story_shutdown",
             "story_question",
             "story_eggman",
+            "story_power_loss",
             "cinematic",
         }:
             return
