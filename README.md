@@ -19,7 +19,7 @@ Story Mode arms only after the guard has observed all seven emeralds in place. S
 - Removing emeralds 1–6 shows a centered, briefly flashing, non-blocking theft banner over a full-screen Big Box menu. Big Box remains usable and the banner does not take keyboard or joystick focus.
 - The shutdown story cards use larger monitor-aware text, while still shrinking or wrapping to stay inside the arcade display.
 - Each partial theft chooses a different sound from the configured reaction clips; the same clip is never chosen twice in a row.
-- Removing the seventh emerald starts the full takeover only after Big Box is the stable full-screen foreground. It pauses Big Box, mutes its audio, announces the shutdown, asks where a hero can be found, and plays the bundled Sonic CD opening.
+- Removing the seventh emerald starts the full takeover only after Big Box is the stable full-screen foreground. It pauses Big Box, mutes its audio, and runs a roughly ten-second staged power failure over the frozen menu: fluorescent flicker, worsening glitches and blackouts, then a classic CRT line-to-dot collapse. The four optional clips `flourescent-lights-buzzing.mp3`, `lantern-buzzes-fades.mp3`, `lantern-whines-buzzing-dies.mp3`, and `tv-off.mp3` play in that order before the shutdown narration continues.
 - The final theft uses the dedicated `no-he-s-got-the-last-emerald.mp3` clip. Before the cinematic, the Eggman reveal screen only says `SO EGGMAN'S BEHIND THIS, HUH?` and plays its matching voice clip.
 - The first shutdown narration card also plays `i-m-afraid-our-little-game-ends-now.mp3`.
 - After the cinematic, the Robotnik recovery screen shows the number recovered while the separate Chaos Energy meter updates as each emerald returns.
@@ -89,7 +89,7 @@ The ESP32 independently controls the existing red and green LED legs; the blue l
 - The resting color moves from red through orange, amber, and yellow-green to bright green as the detected count rises from 0 to 7.
 - The pulse gradually becomes faster as Chaos Energy rises.
 - The Robotnik screen shows a seven-segment graphical `MASTER EMERALD POWER` meter with a short stepped increase/decrease animation whenever the count changes.
-- Removing an emerald produces two red alarm flashes.
+- Removing an emerald produces two red alarm flashes. Removing the final emerald starts a long red power-failure effect synchronized to the Windows shutdown sequence: unstable flicker, fading glow, dying buzz, and a final blackout before the normal red warning pulse resumes.
 - Returning an emerald produces a green absorption flash followed by a temporary faster energy pulse.
 - Returning the final emerald produces the three-stage green charge effect followed by the fast green pulse.
 
@@ -184,6 +184,7 @@ Keep `guard-config.json` beside `MagnetArcadeGuardRings.exe`.
 - `music_volume` and `sound_effect_volume`: values from `0.0` to `1.0`.
 - `removal_sound_files`: list of partial-theft sounds; the guard randomly chooses without repeating the previous clip.
 - `last_emerald_removal_sound_file`: dedicated sound for the seventh and final theft.
+- `power_loss_lights_sound_file`, `power_loss_buzz_fades_sound_file`, `power_loss_buzz_dies_sound_file`, and `power_loss_tv_off_sound_file`: optional staged sounds for the final Story Mode power failure. Their built-in timing is 2.347, 3.968, 2.005, and 2.051 seconds respectively.
 - `final_completion_sound_file`: sound played after the victory music and Super Sonic animation.
 - `ring_joystick_button`: human-numbered joystick button used for rings; default `10`.
 - `ring_debounce_ms`: short anti-bounce interval; default `90` ms.

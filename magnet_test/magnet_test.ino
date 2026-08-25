@@ -30,6 +30,20 @@ const unsigned long HEARTBEAT_INTERVAL_MS = 1000;
 const unsigned long SENSOR_DEBOUNCE_MS = 30;
 const unsigned long RETURN_ENERGY_BOOST_MS = 1600;
 const unsigned long RETURN_BOOST_PULSE_PERIOD_MS = 700;
+// Keep the final LED failure effect long enough to accompany the Windows
+// shutdown sequence: fluorescent buzz, fading buzz, dying buzz, then TV off.
+const unsigned long POWER_LOSS_LIGHTS_MS = 2347;
+const unsigned long POWER_LOSS_BUZZ_FADES_MS = 3968;
+const unsigned long POWER_LOSS_BUZZ_DIES_MS = 2005;
+const unsigned long POWER_LOSS_TV_OFF_MS = 2051;
+const unsigned long POWER_LOSS_BUZZ_FADES_START_MS =
+  POWER_LOSS_LIGHTS_MS;
+const unsigned long POWER_LOSS_BUZZ_DIES_START_MS =
+  POWER_LOSS_LIGHTS_MS + POWER_LOSS_BUZZ_FADES_MS;
+const unsigned long POWER_LOSS_TV_OFF_START_MS =
+  POWER_LOSS_BUZZ_DIES_START_MS + POWER_LOSS_BUZZ_DIES_MS;
+const unsigned long POWER_LOSS_TOTAL_MS =
+  POWER_LOSS_TV_OFF_START_MS + POWER_LOSS_TV_OFF_MS;
 
 // Resting energy color for 0 through 7 detected emeralds. The LED has only
 // red and green connected, so these values move through red, orange, amber,
@@ -161,30 +175,74 @@ bool renderLedEffect() {
       return true;
     }
   } else if (activeLedEffect == LED_EFFECT_FINAL_REMOVED) {
-    // The final emerald makes the Master Emerald appear to lose power:
-    // bright red warning flashes, unstable flicker, then darkness before
-    // the normal slow red warning pulse resumes for the narration.
+    // The final emerald makes the Master Emerald appear to lose power over
+    // the same long arc as the Windows display: unstable red flicker, a
+    // fading buzz, a dying glow, then darkness before normal red narration
+    // mode resumes.
     if (elapsed < 120) {
       setLed(255, 0);
       return true;
     }
-    if (elapsed < 230) {
+    if (elapsed < 250) {
       setLed(0, 0);
       return true;
     }
-    if (elapsed < 520) {
-      setLed((elapsed / 55 % 2) ? 32 : 210, 0);
+    if (elapsed < POWER_LOSS_LIGHTS_MS) {
+      unsigned long flicker = (elapsed - 250) / 75;
+      if (flicker % 13 == 0 || flicker % 13 == 1) {
+        setLed(255, 0);
+      } else if (flicker % 13 == 2 || flicker % 13 == 5) {
+        setLed(32, 0);
+      } else if (flicker % 13 == 3 || flicker % 13 == 4) {
+        setLed(0, 0);
+      } else {
+        setLed(185, 0);
+      }
       return true;
     }
-    if (elapsed < 900) {
-      int brightness = 190 - static_cast<int>(
-        150UL * (elapsed - 520) / 380
+    if (elapsed < POWER_LOSS_BUZZ_DIES_START_MS) {
+      unsigned long phase = elapsed - POWER_LOSS_BUZZ_FADES_START_MS;
+      int baseline = 190 - static_cast<int>(
+        100UL * phase / POWER_LOSS_BUZZ_FADES_MS
       );
-      setLed(brightness, 0);
+      unsigned long flicker = phase / 95;
+      if (flicker % 17 == 1 || flicker % 17 == 2
+          || flicker % 17 == 9) {
+        setLed(0, 0);
+      } else if (flicker % 17 == 6) {
+        setLed(255, 0);
+      } else {
+        setLed(baseline, 0);
+      }
       return true;
     }
-    if (elapsed < 1550) {
-      setLed(0, 0);
+    if (elapsed < POWER_LOSS_TV_OFF_START_MS) {
+      unsigned long phase = elapsed - POWER_LOSS_BUZZ_DIES_START_MS;
+      int baseline = 105 - static_cast<int>(
+        90UL * phase / POWER_LOSS_BUZZ_DIES_MS
+      );
+      unsigned long flicker = phase / 70;
+      if (flicker % 11 == 0 || flicker % 11 == 3) {
+        setLed(120, 0);
+      } else if (flicker % 11 == 1 || flicker % 11 == 2
+          || flicker % 11 == 4 || flicker % 11 == 5) {
+        setLed(0, 0);
+      } else {
+        setLed(baseline, 0);
+      }
+      return true;
+    }
+    if (elapsed < POWER_LOSS_TOTAL_MS) {
+      unsigned long phase = elapsed - POWER_LOSS_TV_OFF_START_MS;
+      if (phase < 130) {
+        setLed(255, 0);
+      } else if (phase < 560) {
+        setLed((phase / 80 % 2) ? 0 : 45, 0);
+      } else if (phase < 920) {
+        setLed((phase / 120 % 2) ? 0 : 12, 0);
+      } else {
+        setLed(0, 0);
+      }
       return true;
     }
   } else if (activeLedEffect == LED_EFFECT_RETURNED) {

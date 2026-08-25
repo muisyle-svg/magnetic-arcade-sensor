@@ -124,6 +124,16 @@ DEFAULT_CONFIG = {
     "story_shutdown_sound_file": (
         "i-m-afraid-our-little-game-ends-now.mp3"
     ),
+    "power_loss_lights_sound_file": (
+        "flourescent-lights-buzzing.mp3"
+    ),
+    "power_loss_buzz_fades_sound_file": (
+        "lantern-buzzes-fades.mp3"
+    ),
+    "power_loss_buzz_dies_sound_file": (
+        "lantern-whines-buzzing-dies.mp3"
+    ),
+    "power_loss_tv_off_sound_file": "tv-off.mp3",
     "final_completion_sound_file": (
         "i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3"
     ),
@@ -543,6 +553,24 @@ STORY_SHUTDOWN_AUDIO_NAME = str(
         "i-m-afraid-our-little-game-ends-now.mp3",
     )
 ).strip() or "i-m-afraid-our-little-game-ends-now.mp3"
+POWER_LOSS_AUDIO_DEFAULTS = {
+    "lights": "flourescent-lights-buzzing.mp3",
+    "buzz_fades": "lantern-buzzes-fades.mp3",
+    "buzz_dies": "lantern-whines-buzzing-dies.mp3",
+    "tv_off": "tv-off.mp3",
+}
+POWER_LOSS_AUDIO_NAMES = {
+    key: (
+        str(
+            RUNTIME_CONFIG.get(
+                f"power_loss_{key}_sound_file",
+                default_name,
+            )
+        ).strip()
+        or default_name
+    )
+    for key, default_name in POWER_LOSS_AUDIO_DEFAULTS.items()
+}
 EGGMAN_REVEAL_AUDIO_NAME = "so-egg-man-s-behind-this-huh.mp3"
 CINEMATIC_VIDEO_NAME = (
     str(
@@ -595,6 +623,10 @@ ORIGINAL_FINAL_COMPLETION_AUDIO_PATH = (
 ORIGINAL_STORY_SHUTDOWN_AUDIO_PATH = (
     SOURCE_ASSET_DIRECTORY / STORY_SHUTDOWN_AUDIO_NAME
 )
+ORIGINAL_POWER_LOSS_AUDIO_PATHS = {
+    key: SOURCE_ASSET_DIRECTORY / name
+    for key, name in POWER_LOSS_AUDIO_NAMES.items()
+}
 ORIGINAL_EGGMAN_REVEAL_AUDIO_PATH = (
     SOURCE_ASSET_DIRECTORY / EGGMAN_REVEAL_AUDIO_NAME
 )
@@ -628,9 +660,24 @@ STORY_QUESTION_MESSAGE = (
 )
 STORY_EGGMAN_TITLE = "SO EGGMAN'S BEHIND THIS, HUH?"
 STORY_EGGMAN_MESSAGE = ""
-STORY_POWER_LOSS_SECONDS = 1.55
-STORY_POWER_LOSS_BLACKOUT_MS = 180
-STORY_POWER_LOSS_TICK_MS = 55
+POWER_LOSS_AUDIO_STEPS = (
+    ("lights", 2347),
+    ("buzz_fades", 3968),
+    ("buzz_dies", 2005),
+    ("tv_off", 2051),
+)
+POWER_LOSS_CRT_START_MS = sum(
+    duration_ms
+    for _name, duration_ms in POWER_LOSS_AUDIO_STEPS[:3]
+)
+STORY_POWER_LOSS_TOTAL_MS = sum(
+    duration_ms
+    for _name, duration_ms in POWER_LOSS_AUDIO_STEPS
+)
+STORY_POWER_LOSS_SECONDS = STORY_POWER_LOSS_TOTAL_MS / 1000.0
+STORY_POWER_LOSS_BLACKOUT_MS = 400
+STORY_POWER_LOSS_TICK_MS = 45
+POWER_LOSS_CRT_COLLAPSE_MS = 1800
 ENERGY_ANIMATION_STEP_MS = 55
 ENERGY_EMPHASIS_MS = 420
 
@@ -1013,6 +1060,7 @@ class MagnetArcadeGuard:
         self.last_emerald_removal_sound = None
         self.final_completion_sound = None
         self.story_shutdown_sound = None
+        self.power_loss_sounds = {}
         self.eggman_reveal_sound = None
         self.event_channel = None
         self.event_audio_after_id = None
@@ -1035,6 +1083,7 @@ class MagnetArcadeGuard:
         self.skip_cinematic_requested = False
         self.story_sequence_after_id = None
         self.power_loss_after_id = None
+        self.power_loss_audio_after_id = None
         self.power_loss_generation = 0
         self.power_loss_active = False
         self.power_loss_started_at = 0.0
@@ -1174,6 +1223,8 @@ class MagnetArcadeGuard:
         self.announcement_energy_canvas = None
         self.announcement_flash_window = None
         self.announcement_flash_after_id = None
+        self.power_loss_crt_window = None
+        self.power_loss_crt_canvas = None
 
         self.screen_width = self.root.winfo_screenwidth()
         self.screen_height = self.root.winfo_screenheight()
@@ -1267,6 +1318,13 @@ class MagnetArcadeGuard:
             STORY_SHUTDOWN_AUDIO_NAME,
             ORIGINAL_STORY_SHUTDOWN_AUDIO_PATH,
         )
+        self.power_loss_audio_paths = {
+            key: self.find_asset(
+                POWER_LOSS_AUDIO_NAMES[key],
+                ORIGINAL_POWER_LOSS_AUDIO_PATHS[key],
+            )
+            for key in POWER_LOSS_AUDIO_NAMES
+        }
         self.eggman_reveal_audio_path = self.find_asset(
             EGGMAN_REVEAL_AUDIO_NAME,
             ORIGINAL_EGGMAN_REVEAL_AUDIO_PATH,
@@ -1366,6 +1424,22 @@ class MagnetArcadeGuard:
                         )
                     except pygame.error:
                         self.story_shutdown_sound = None
+
+                for power_loss_key, power_loss_audio_path in (
+                    self.power_loss_audio_paths.items()
+                ):
+                    if not power_loss_audio_path.exists():
+                        continue
+                    try:
+                        power_loss_sound = pygame.mixer.Sound(
+                            str(power_loss_audio_path)
+                        )
+                        power_loss_sound.set_volume(SOUND_EFFECT_VOLUME)
+                        self.power_loss_sounds[power_loss_key] = (
+                            power_loss_sound
+                        )
+                    except pygame.error:
+                        continue
 
                 if self.act_clear_audio_path.exists():
                     try:
@@ -2229,6 +2303,27 @@ class MagnetArcadeGuard:
             pass
         self.announcement_flash_window.withdraw()
 
+        # Separate non-activating surface for the glitch bars and the final
+        # CRT line-to-dot collapse. Keeping it independent from the full-screen
+        # filter lets the frozen Big Box menu remain visible through the
+        # flicker while still producing a clean white line at the end.
+        self.power_loss_crt_window = tk.Toplevel(self.root)
+        self.power_loss_crt_window.overrideredirect(True)
+        self.power_loss_crt_window.configure(background="#050505")
+        self.power_loss_crt_window.attributes("-topmost", True)
+        try:
+            self.power_loss_crt_window.attributes("-alpha", 0.18)
+        except tk.TclError:
+            pass
+        self.power_loss_crt_canvas = tk.Canvas(
+            self.power_loss_crt_window,
+            background="#050505",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self.power_loss_crt_canvas.pack(fill="both", expand=True)
+        self.power_loss_crt_window.withdraw()
+
     def apply_announcement_window_style(self, window=None) -> None:
         window = window or self.announcement_window
         if not window:
@@ -2266,6 +2361,134 @@ class MagnetArcadeGuard:
                 self.announcement_flash_window.withdraw()
             except tk.TclError:
                 pass
+
+    def hide_power_loss_crt(self) -> None:
+        if self.power_loss_crt_window:
+            try:
+                self.power_loss_crt_window.withdraw()
+            except tk.TclError:
+                pass
+        if self.power_loss_crt_canvas:
+            try:
+                self.power_loss_crt_canvas.delete("all")
+            except tk.TclError:
+                pass
+
+    def position_power_loss_window(
+        self,
+        window,
+        width: int,
+        height: int,
+        alpha: float,
+        centered: bool = False,
+    ) -> None:
+        if not window:
+            return
+
+        x, y, monitor_width, monitor_height = self.overlay_monitor_bounds
+        if centered:
+            x += max(0, (monitor_width - width) // 2)
+            y += max(0, (monitor_height - height) // 2)
+        try:
+            window.geometry(f"{width}x{height}{x:+d}{y:+d}")
+            window.attributes(
+                "-alpha",
+                max(0.0, min(1.0, float(alpha))),
+            )
+            self.apply_announcement_window_style(window)
+            window.deiconify()
+            window_handle = window.winfo_id()
+            ctypes.windll.user32.SetWindowPos(
+                window_handle,
+                HWND_TOPMOST,
+                x,
+                y,
+                width,
+                height,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            )
+        except (AttributeError, tk.TclError):
+            pass
+
+    def show_power_loss_glitches(
+        self,
+        tick: int,
+        alpha: float,
+    ) -> None:
+        """Draw irregular scanline glitches over the dimming menu."""
+        if not self.power_loss_crt_window or not self.power_loss_crt_canvas:
+            return
+
+        _x, _y, width, height = self.overlay_monitor_bounds
+        width = max(1, int(width))
+        height = max(1, int(height))
+        canvas = self.power_loss_crt_canvas
+        try:
+            canvas.configure(background="#050505")
+            canvas.delete("all")
+            bar_colors = ("#ffffff", "#ff3344", "#111111", "#fff6b0")
+            for index in range(9):
+                bar_y = (tick * (31 + index * 7) + index * 97) % height
+                bar_height = 2 + ((tick + index * 3) % 15)
+                color = bar_colors[(tick + index * 2) % len(bar_colors)]
+                canvas.create_rectangle(
+                    0,
+                    bar_y,
+                    width,
+                    min(height, bar_y + bar_height),
+                    fill=color,
+                    outline="",
+                )
+            # A few narrow vertical tears make the failure look less like a
+            # uniform brightness fade without touching the menu underneath.
+            for index in range(3):
+                tear_x = (tick * (43 + index * 11) + 73 * index) % width
+                tear_width = 1 + ((tick + index) % 5)
+                canvas.create_rectangle(
+                    tear_x,
+                    0,
+                    min(width, tear_x + tear_width),
+                    height,
+                    fill="#ffffff" if (tick + index) % 2 else "#111111",
+                    outline="",
+                )
+            canvas.update_idletasks()
+        except tk.TclError:
+            return
+
+        self.position_power_loss_window(
+            self.power_loss_crt_window,
+            width,
+            height,
+            alpha,
+        )
+
+    def show_power_loss_crt_line(
+        self,
+        line_width: int,
+        line_height: int,
+        alpha: float,
+    ) -> None:
+        """Show the final horizontal CRT collapse, shrinking toward a dot."""
+        if not self.power_loss_crt_window or not self.power_loss_crt_canvas:
+            return
+
+        line_width = max(2, int(line_width))
+        line_height = max(2, int(line_height))
+        try:
+            self.power_loss_crt_window.configure(background="#ffffff")
+            self.power_loss_crt_canvas.configure(background="#ffffff")
+            self.power_loss_crt_canvas.delete("all")
+        except tk.TclError:
+            return
+
+        self.position_power_loss_window(
+            self.power_loss_crt_window,
+            line_width,
+            line_height,
+            alpha,
+            centered=True,
+        )
 
     def flash_story_screen(self) -> None:
         if (
@@ -5581,6 +5804,12 @@ class MagnetArcadeGuard:
             except tk.TclError:
                 pass
             self.power_loss_after_id = None
+        if self.power_loss_audio_after_id is not None:
+            try:
+                self.root.after_cancel(self.power_loss_audio_after_id)
+            except tk.TclError:
+                pass
+            self.power_loss_audio_after_id = None
 
         self.power_loss_active = False
         self.power_loss_started_at = 0.0
@@ -5601,6 +5830,17 @@ class MagnetArcadeGuard:
             except tk.TclError:
                 pass
         self.hide_announcement_flash()
+        self.hide_power_loss_crt()
+        if self.power_loss_crt_window:
+            try:
+                self.power_loss_crt_window.configure(background="#050505")
+            except tk.TclError:
+                pass
+        if self.power_loss_crt_canvas:
+            try:
+                self.power_loss_crt_canvas.configure(background="#050505")
+            except tk.TclError:
+                pass
 
     def show_power_loss_filter(self, color: str, alpha: float) -> None:
         """Place a non-activating color filter above the guarded display."""
@@ -5695,11 +5935,39 @@ class MagnetArcadeGuard:
         self.power_loss_started_at = time.monotonic()
         self.power_loss_generation += 1
         generation = self.power_loss_generation
+        self.start_power_loss_audio_sequence(generation)
         self.power_loss_after_id = self.root.after(
             0,
             lambda: self.update_story_power_loss(generation),
         )
         return True
+
+    def start_power_loss_audio_sequence(self, generation: int) -> None:
+        """Play the staged electrical failure sounds without blocking Tk."""
+        self.power_loss_audio_after_id = None
+
+        def play_step(step_index: int) -> None:
+            if (
+                generation != self.power_loss_generation
+                or not self.power_loss_active
+                or not self.running
+            ):
+                return
+
+            audio_key, duration_ms = POWER_LOSS_AUDIO_STEPS[step_index]
+            self.play_event_sound(
+                self.power_loss_sounds.get(audio_key),
+                f"power_loss_{audio_key}",
+                force=True,
+                duck_music=False,
+            )
+            if step_index + 1 < len(POWER_LOSS_AUDIO_STEPS):
+                self.power_loss_audio_after_id = self.root.after(
+                    duration_ms,
+                    lambda: play_step(step_index + 1),
+                )
+
+        play_step(0)
 
     def load_story_shutdown_sound(self) -> None:
         if getattr(self, "story_shutdown_sound", None) is not None:
@@ -5758,43 +6026,124 @@ class MagnetArcadeGuard:
             return
 
         self.power_loss_after_id = None
-        elapsed = time.monotonic() - self.power_loss_started_at
-        progress = elapsed / STORY_POWER_LOSS_SECONDS
-        tick = max(0, int(elapsed * 1000 / STORY_POWER_LOSS_TICK_MS))
+        elapsed_ms = max(
+            0,
+            int(
+                (time.monotonic() - self.power_loss_started_at)
+                * 1000
+            ),
+        )
+        tick = elapsed_ms // STORY_POWER_LOSS_TICK_MS
 
-        if progress >= 1.0:
+        if elapsed_ms >= STORY_POWER_LOSS_TOTAL_MS:
             self.show_power_loss_filter("#000000", 1.0)
+            self.hide_power_loss_crt()
             self.power_loss_after_id = self.root.after(
                 STORY_POWER_LOSS_BLACKOUT_MS,
                 lambda: self.finish_story_power_loss(generation),
             )
             return
 
-        if progress < 0.18:
-            # A brief warning flash before the shrine starts failing.
-            color = "#fff6b0" if tick % 2 == 0 else "#ff3344"
-            alpha = 0.72 if tick % 2 == 0 else 0.54
-        elif progress < 0.42:
-            color = "#ff1f3d" if tick % 3 == 0 else "#000000"
-            alpha = 0.18 + progress * 0.55
-        else:
-            color = "#000000"
-            alpha = min(0.98, 0.22 + (progress - 0.42) / 0.58 * 0.76)
-            # Uneven power loss: briefly reveal the image between dark pulses.
-            if tick % 4 == 0:
-                alpha = max(0.08, alpha - 0.24)
+        if elapsed_ms < POWER_LOSS_CRT_START_MS:
+            # The menu remains visible underneath these sharp, irregular
+            # pulses. The first audio clip gets bright fluorescent-like
+            # flashes; the later clips make the blackouts longer and the red
+            # warning color more unstable as the energy drains away.
+            if elapsed_ms < POWER_LOSS_AUDIO_STEPS[0][1]:
+                pattern = tick % 13
+                if pattern in {0, 1}:
+                    color, alpha = "#fff6b0", 0.80
+                elif pattern in {2, 5, 9}:
+                    color, alpha = "#ff3344", 0.62
+                elif pattern in {3, 4}:
+                    color, alpha = "#000000", 0.36
+                else:
+                    color, alpha = "#000000", 0.07
+                glitch_alpha = 0.28 if pattern in {1, 4, 8, 11} else 0.0
+            elif elapsed_ms < sum(
+                duration_ms
+                for _name, duration_ms in POWER_LOSS_AUDIO_STEPS[:2]
+            ):
+                phase = (
+                    elapsed_ms - POWER_LOSS_AUDIO_STEPS[0][1]
+                ) / POWER_LOSS_AUDIO_STEPS[1][1]
+                pattern = tick % 17
+                darkness = min(0.86, 0.20 + phase * 0.48)
+                if pattern in {0, 6}:
+                    color, alpha = "#ff1f3d", 0.48
+                elif pattern in {1, 2, 3, 9, 10}:
+                    color, alpha = "#000000", min(0.96, darkness + 0.25)
+                else:
+                    color, alpha = "#000000", darkness
+                glitch_alpha = 0.34 if pattern in {2, 5, 8, 13} else 0.0
+            else:
+                final_phase_start = sum(
+                    duration_ms
+                    for _name, duration_ms in POWER_LOSS_AUDIO_STEPS[:2]
+                )
+                phase = (
+                    elapsed_ms - final_phase_start
+                ) / POWER_LOSS_AUDIO_STEPS[2][1]
+                pattern = tick % 19
+                darkness = min(0.98, 0.62 + phase * 0.30)
+                if pattern in {0, 7}:
+                    color, alpha = "#ff3344", 0.34
+                elif pattern in {1, 2, 3, 4, 11, 12}:
+                    color, alpha = "#000000", min(1.0, darkness + 0.18)
+                else:
+                    color, alpha = "#000000", darkness
+                glitch_alpha = 0.42 if pattern in {3, 6, 10, 15} else 0.0
 
-        self.show_power_loss_filter(color, alpha)
-        jitter = 0
-        if progress >= 0.28 and tick % 3 != 1:
-            jitter = (-1 if tick % 2 else 1) * max(
-                2,
-                int(10 * min(1.0, progress)),
-            )
-        try:
-            self.background_label.place_configure(x=jitter, y=0)
-        except tk.TclError:
-            pass
+            self.show_power_loss_filter(color, alpha)
+            if glitch_alpha:
+                self.show_power_loss_glitches(tick, glitch_alpha)
+            else:
+                self.hide_power_loss_crt()
+        else:
+            # The TV-off clip begins with the display already black. Then the
+            # remaining picture collapses into a bright horizontal CRT line,
+            # contracts toward the center, becomes a dot, and disappears.
+            collapse_elapsed = elapsed_ms - POWER_LOSS_CRT_START_MS
+            self.show_power_loss_filter("#000000", 1.0)
+            self.hide_power_loss_crt()
+            if collapse_elapsed < 110:
+                self.show_power_loss_filter("#ffffff", 0.94)
+            else:
+                collapse_progress = min(
+                    1.0,
+                    (collapse_elapsed - 110)
+                    / max(1, POWER_LOSS_CRT_COLLAPSE_MS - 110),
+                )
+                monitor_width = max(1, self.overlay_monitor_bounds[2])
+                if collapse_progress < 0.78:
+                    width_progress = collapse_progress / 0.78
+                    line_width = int(
+                        monitor_width * (0.92 - 0.86 * width_progress)
+                    )
+                    line_height = 3
+                elif collapse_progress < 0.93:
+                    dot_progress = (collapse_progress - 0.78) / 0.15
+                    line_width = int(
+                        monitor_width * 0.06 * (1.0 - dot_progress)
+                        + 8 * dot_progress
+                    )
+                    line_height = int(3 + 5 * dot_progress)
+                else:
+                    dot_progress = (collapse_progress - 0.93) / 0.07
+                    dot_size = int(8 - 6 * min(1.0, dot_progress))
+                    line_width = dot_size
+                    line_height = dot_size
+                line_alpha = 1.0
+                if collapse_progress > 0.92:
+                    line_alpha = max(
+                        0.0,
+                        1.0 - (collapse_progress - 0.92) / 0.08,
+                    )
+                self.show_power_loss_crt_line(
+                    line_width,
+                    line_height,
+                    line_alpha,
+                )
 
         self.power_loss_after_id = self.root.after(
             STORY_POWER_LOSS_TICK_MS,

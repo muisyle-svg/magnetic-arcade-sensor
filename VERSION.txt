@@ -1,7 +1,12 @@
 MAGNETIC ARCADE GUARD - RING COUNTER BUILD
 
 Build family: Ring-enabled Story/Normal Mode
-Update: 2026-08-24
+Update: 2026-08-25
+
+Latest change: the final Story Mode power failure now unfolds over about ten
+seconds with staged electrical audio, escalating flicker/glitches, and a
+classic CRT collapse from a full-screen line to a dot before black. The
+seven-sensor firmware has the matching long red LED failure sequence.
 
 Includes Windows-native ring input on joystick button 10, synchronized
 low-overhead cinematic playback, the graphical seven-segment Master Emerald

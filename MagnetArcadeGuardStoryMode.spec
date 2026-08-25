@@ -42,6 +42,24 @@ story_shutdown_name = runtime_config.get(
     'story_shutdown_sound_file',
     'i-m-afraid-our-little-game-ends-now.mp3',
 )
+power_loss_audio_names = [
+    runtime_config.get(
+        'power_loss_lights_sound_file',
+        'flourescent-lights-buzzing.mp3',
+    ),
+    runtime_config.get(
+        'power_loss_buzz_fades_sound_file',
+        'lantern-buzzes-fades.mp3',
+    ),
+    runtime_config.get(
+        'power_loss_buzz_dies_sound_file',
+        'lantern-whines-buzzing-dies.mp3',
+    ),
+    runtime_config.get(
+        'power_loss_tv_off_sound_file',
+        'tv-off.mp3',
+    ),
+]
 ring_sound_name = runtime_config.get(
     'ring_sound_file',
     'ring.mp3',
@@ -65,6 +83,7 @@ asset_names = [
     *removal_names,
     last_removal_name,
     story_shutdown_name,
+    *power_loss_audio_names,
     final_completion_name,
     'so-egg-man-s-behind-this-huh.mp3',
     cinematic_name,
