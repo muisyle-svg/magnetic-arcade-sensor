@@ -121,6 +121,9 @@ DEFAULT_CONFIG = {
     "last_emerald_removal_sound_file": (
         "no-he-s-got-the-last-emerald.mp3"
     ),
+    "story_shutdown_sound_file": (
+        "i-m-afraid-our-little-game-ends-now.mp3"
+    ),
     "final_completion_sound_file": (
         "i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3"
     ),
@@ -534,6 +537,12 @@ FINAL_COMPLETION_AUDIO_NAME = str(
         "i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3",
     )
 ).strip() or "i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3"
+STORY_SHUTDOWN_AUDIO_NAME = str(
+    RUNTIME_CONFIG.get(
+        "story_shutdown_sound_file",
+        "i-m-afraid-our-little-game-ends-now.mp3",
+    )
+).strip() or "i-m-afraid-our-little-game-ends-now.mp3"
 EGGMAN_REVEAL_AUDIO_NAME = "so-egg-man-s-behind-this-huh.mp3"
 CINEMATIC_VIDEO_NAME = (
     str(
@@ -582,6 +591,9 @@ ORIGINAL_LAST_EMERALD_REMOVAL_AUDIO_PATH = (
 )
 ORIGINAL_FINAL_COMPLETION_AUDIO_PATH = (
     SOURCE_ASSET_DIRECTORY / FINAL_COMPLETION_AUDIO_NAME
+)
+ORIGINAL_STORY_SHUTDOWN_AUDIO_PATH = (
+    SOURCE_ASSET_DIRECTORY / STORY_SHUTDOWN_AUDIO_NAME
 )
 ORIGINAL_EGGMAN_REVEAL_AUDIO_PATH = (
     SOURCE_ASSET_DIRECTORY / EGGMAN_REVEAL_AUDIO_NAME
@@ -1000,6 +1012,7 @@ class MagnetArcadeGuard:
         self.last_removal_sound_index = None
         self.last_emerald_removal_sound = None
         self.final_completion_sound = None
+        self.story_shutdown_sound = None
         self.eggman_reveal_sound = None
         self.event_channel = None
         self.event_audio_after_id = None
@@ -1250,6 +1263,10 @@ class MagnetArcadeGuard:
             FINAL_COMPLETION_AUDIO_NAME,
             ORIGINAL_FINAL_COMPLETION_AUDIO_PATH,
         )
+        self.story_shutdown_audio_path = self.find_asset(
+            STORY_SHUTDOWN_AUDIO_NAME,
+            ORIGINAL_STORY_SHUTDOWN_AUDIO_PATH,
+        )
         self.eggman_reveal_audio_path = self.find_asset(
             EGGMAN_REVEAL_AUDIO_NAME,
             ORIGINAL_EGGMAN_REVEAL_AUDIO_PATH,
@@ -1338,6 +1355,17 @@ class MagnetArcadeGuard:
                         )
                     except pygame.error:
                         self.final_completion_sound = None
+
+                if self.story_shutdown_audio_path.exists():
+                    try:
+                        self.story_shutdown_sound = pygame.mixer.Sound(
+                            str(self.story_shutdown_audio_path)
+                        )
+                        self.story_shutdown_sound.set_volume(
+                            SOUND_EFFECT_VOLUME
+                        )
+                    except pygame.error:
+                        self.story_shutdown_sound = None
 
                 if self.act_clear_audio_path.exists():
                     try:
@@ -5675,6 +5703,12 @@ class MagnetArcadeGuard:
             "story_shutdown",
         ):
             return False
+        self.play_event_sound(
+            getattr(self, "story_shutdown_sound", None),
+            "story_shutdown",
+            force=True,
+            duck_music=False,
+        )
         self.story_sequence_after_id = self.root.after(
             int(STORY_SHUTDOWN_SECONDS * 1000),
             self.show_story_question,

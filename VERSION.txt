@@ -33,6 +33,9 @@ screen remains reserved for after the Sonic cinematic. The seven-sensor
 firmware mirrors that moment with a final red LED failure effect, then returns
 to its normal red warning pulse.
 
+The first shutdown narration card now plays
+i-m-afraid-our-little-game-ends-now.mp3.
+
 This update adds ring-entry audio, immediate live updates to an active ring
 counter banner, vertically fitted announcement windows, a Normal Mode
 all-emeralds-missing lock that still accepts rings, a Normal Mode Emerald

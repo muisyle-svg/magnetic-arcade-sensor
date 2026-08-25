@@ -21,6 +21,7 @@ Story Mode arms only after the guard has observed all seven emeralds in place. S
 - Each partial theft chooses a different sound from the configured reaction clips; the same clip is never chosen twice in a row.
 - Removing the seventh emerald starts the full takeover only after Big Box is the stable full-screen foreground. It pauses Big Box, mutes its audio, announces the shutdown, asks where a hero can be found, and plays the bundled Sonic CD opening.
 - The final theft uses the dedicated `no-he-s-got-the-last-emerald.mp3` clip. Before the cinematic, the Eggman reveal screen only says `SO EGGMAN'S BEHIND THIS, HUH?` and plays its matching voice clip.
+- The first shutdown narration card also plays `i-m-afraid-our-little-game-ends-now.mp3`.
 - After the cinematic, the Robotnik recovery screen shows the number recovered while the separate Chaos Energy meter updates as each emerald returns.
 - The final return immediately updates the text, lets the return sound finish, pauses briefly, and plays the Sonic/Super Sonic victory sequence. After the victory music finishes while Super Sonic is displayed, the bundled `i-ll-show-you-what-the-chaos-emeralds-can-really-do.mp3` clip plays.
 - Completing the full story automatically changes the running guard to Normal Mode.

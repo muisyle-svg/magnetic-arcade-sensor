@@ -38,6 +38,10 @@ last_removal_name = runtime_config.get(
     'last_emerald_removal_sound_file',
     'no-he-s-got-the-last-emerald.mp3',
 )
+story_shutdown_name = runtime_config.get(
+    'story_shutdown_sound_file',
+    'i-m-afraid-our-little-game-ends-now.mp3',
+)
 ring_sound_name = runtime_config.get(
     'ring_sound_file',
     'ring.mp3',
@@ -60,6 +64,7 @@ asset_names = [
     ring_sound_name,
     *removal_names,
     last_removal_name,
+    story_shutdown_name,
     final_completion_name,
     'so-egg-man-s-behind-this-huh.mp3',
     cinematic_name,
