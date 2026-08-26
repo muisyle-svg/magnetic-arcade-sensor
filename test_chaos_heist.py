@@ -455,6 +455,20 @@ class GuardLogicTests(unittest.TestCase):
             3,
         )
 
+    def test_firmware_reports_are_nonblocking_when_the_pc_stops_reading(self):
+        firmware = (
+            Path(__file__).resolve().parent
+            / "ChaosHeistController"
+            / "ChaosHeistController.ino"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("availableForWrite", firmware)
+        self.assertIn("sendProtocolLine", firmware)
+        self.assertNotIn("Serial.print(", firmware)
+        self.assertNotIn("Serial.println(", firmware)
+        self.assertNotIn('Serial.print("MAGNET_LOCK:COUNT:")', firmware)
+        self.assertNotIn('Serial.println("MAGNET_LOCK:READY")', firmware)
+
     def test_pending_milestone_can_replace_ring_power_at_safe_menu(self):
         guard = self.make_guard()
         guard.running = True

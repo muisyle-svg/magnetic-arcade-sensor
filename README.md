@@ -109,7 +109,7 @@ The ESP32 independently controls the existing red and green LED legs; the blue l
 - Returning an emerald produces a green absorption flash followed by a temporary faster energy pulse.
 - Returning the final emerald produces the three-stage green charge effect followed by the fast green pulse.
 
-The LED does not depend on the Windows guard, Big Box, or the USB connection. The Windows guard keeps its serial connection open while dormant so deactivation does not unnecessarily interrupt the controller. The animation remains integer-only to avoid the ESP32-C3 floating-point crash encountered during earlier testing.
+The LED does not depend on the Windows guard, Big Box, or the USB connection. The Windows guard keeps its serial connection open while dormant so deactivation does not unnecessarily interrupt the controller. USB telemetry is deliberately best-effort and non-blocking: if the guard is closed or stops reading, serial output is dropped rather than allowed to freeze sensor polling or LED animation. The animation remains integer-only to avoid the ESP32-C3 floating-point crash encountered during earlier testing.
 
 ## ESP32 wiring
 

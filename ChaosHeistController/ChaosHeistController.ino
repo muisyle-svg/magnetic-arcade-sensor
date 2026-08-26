@@ -325,9 +325,26 @@ void updateLed(int currentCount) {
   setLed(red, green);
 }
 
+void sendProtocolLine(const char *line) {
+  size_t length = strlen(line);
+
+  // Never let a disconnected or non-reading PC stall loop(). The LED and
+  // sensor state are autonomous; USB reporting is best-effort telemetry.
+  if (Serial.availableForWrite() < static_cast<int>(length)) {
+    return;
+  }
+
+  Serial.write(reinterpret_cast<const uint8_t *>(line), length);
+}
+
+void sendReady() {
+  sendProtocolLine("MAGNET_LOCK:READY\n");
+}
+
 void sendCount(int count) {
-  Serial.print("MAGNET_LOCK:COUNT:");
-  Serial.println(count);
+  char message[32];
+  snprintf(message, sizeof(message), "MAGNET_LOCK:COUNT:%d\n", count);
+  sendProtocolLine(message);
 }
 
 void setup() {
@@ -345,7 +362,7 @@ void setup() {
   pinMode(GREEN_LED_PIN, OUTPUT);
   setLed(0, 0);
 
-  Serial.println("MAGNET_LOCK:READY");
+  sendReady();
 
   // Send the initial state immediately.
   previousCount = countMagnets();
