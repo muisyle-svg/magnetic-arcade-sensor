@@ -425,6 +425,8 @@ class GuardLogicTests(unittest.TestCase):
         self.assertTrue(guard.ring_power_announcement_visible)
 
     def test_ring_power_announcement_has_selection_message_and_countdown(self):
+        self.assertEqual(guard_module.RING_POWER_SELECTION_SECONDS, 35.0)
+        self.assertEqual(guard_module.RING_POWER_SEGMENT_SECONDS, 5.0)
         guard = self.make_guard()
         guard.ring_count = 8
         guard.ring_burst_selection_deadline = 160.0
@@ -436,7 +438,8 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(title, guard_module.RING_BURST_TITLE)
         self.assertIn(guard_module.RING_BURST_MESSAGE, detail)
-        self.assertIn("TIME LEFT: 60 SECONDS", detail)
+        self.assertNotIn("TIME LEFT", detail)
+        self.assertIn("TOTAL RINGS: 8", detail)
         self.assertNotIn("ONE GAME OF CHAOS POWER CHARGED", detail)
         self.assertIsNone(duration)
 
@@ -452,17 +455,22 @@ class GuardLogicTests(unittest.TestCase):
         guard.root = MagicMock()
         shown = []
         animation = []
+        meter = []
         guard.show_plain_announcement = (
             lambda *args, **kwargs: shown.append((args, kwargs)) or True
         )
-        guard.animate_announcement_energy_meter = (
+        guard.show_ring_power_meter_overlay = (
+            lambda present: meter.append(present)
+        )
+        guard.animate_ring_power_meter_fill = (
             lambda previous, current: animation.append((previous, current))
         )
 
         with patch.object(time, "monotonic", return_value=100.0):
             guard.maybe_show_pending_ring_announcement()
 
-        self.assertEqual(shown[0][1]["energy_present_count"], 3)
+        self.assertNotIn("energy_present_count", shown[0][1])
+        self.assertEqual(meter, [3])
         self.assertEqual(animation, [(3, guard_module.TOTAL_EMERALDS)])
         self.assertEqual(
             guard.ring_burst_selection_deadline,
@@ -491,6 +499,60 @@ class GuardLogicTests(unittest.TestCase):
         self.assertFalse(guard.ring_burst_selection_expired)
         self.assertIsNone(guard.ring_power_selection_after_id)
         self.assertIsNone(guard.ring_power_countdown_after_id)
+
+    def test_ring_power_meter_drains_one_segment_every_five_seconds(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_selection_expired = False
+        guard.ring_burst_game_seen_since = 0.0
+        guard.ring_burst_selection_deadline = 135.0
+        guard.ring_power_selection_started_at = 100.0
+        guard.ring_power_meter_blink_on = True
+        guard.overlay_monitor_bounds = (0, 0, 640, 480)
+        guard.ring_power_meter_canvas = MagicMock()
+        rendered = []
+        guard.render_segmented_energy_meter = (
+            lambda canvas, present_count, **kwargs: rendered.append(
+                (present_count, kwargs)
+            )
+        )
+
+        guard.render_ring_power_countdown_meter(now=100.0)
+        guard.render_ring_power_countdown_meter(now=105.0)
+        guard.render_ring_power_countdown_meter(now=130.0)
+
+        self.assertEqual(
+            [entry[0] for entry in rendered],
+            [guard_module.TOTAL_EMERALDS, 6, 1],
+        )
+        self.assertEqual(rendered[0][1]["blink_segment_index"], 6)
+        self.assertEqual(rendered[1][1]["blink_segment_index"], 5)
+        self.assertEqual(rendered[2][1]["blink_segment_index"], 0)
+
+    def test_ring_power_meter_stays_when_text_banner_is_dismissed(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_selection_expired = False
+        guard.ring_burst_game_seen_since = 0.0
+        guard.ring_burst_selection_deadline = 135.0
+        guard.ring_power_selection_started_at = 100.0
+        guard.ring_power_announcement_visible = True
+        guard.ring_power_meter_visible = True
+        guard.joystick_press_sequence = 1
+        guard.ring_power_ignore_press_sequence = 0
+        guard.ring_power_ignore_until = 0.0
+        guard.hide_story_announcement = lambda: setattr(
+            guard,
+            "ring_power_announcement_visible",
+            False,
+        )
+        guard.maybe_show_pending_ring_announcement = lambda: None
+        guard.write_status = lambda *args, **kwargs: None
+
+        guard.handle_joystick_press()
+
+        self.assertFalse(guard.ring_power_announcement_visible)
+        self.assertTrue(guard.ring_power_meter_visible)
 
     def test_ring_power_timeout_waits_for_safe_menu_before_restoring_lock(self):
         guard = self.make_guard()

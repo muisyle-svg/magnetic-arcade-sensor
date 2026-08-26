@@ -173,7 +173,7 @@ DEFAULT_CONFIG = {
     "ring_joystick_button": 10,
     "ring_debounce_ms": 90,
     "ring_game_commit_seconds": 3.0,
-    "ring_power_selection_seconds": 60.0,
+    "ring_power_selection_seconds": 35.0,
     "ring_announcement_seconds": 3.0,
     "ring_milestone_announcement_seconds": 10.0,
     "emulator_process_names": list(DEFAULT_EMULATOR_PROCESS_NAMES),
@@ -639,10 +639,13 @@ RING_GAME_COMMIT_SECONDS = config_number(
     15.0,
 )
 RING_POWER_SELECTION_SECONDS = config_number(
-    RUNTIME_CONFIG.get("ring_power_selection_seconds", 60.0),
-    60.0,
+    RUNTIME_CONFIG.get("ring_power_selection_seconds", 35.0),
+    35.0,
     5.0,
     300.0,
+)
+RING_POWER_SEGMENT_SECONDS = (
+    RING_POWER_SELECTION_SECONDS / TOTAL_EMERALDS
 )
 RING_ANNOUNCEMENT_SECONDS = config_number(
     RUNTIME_CONFIG.get("ring_announcement_seconds", 3.0),
@@ -1458,6 +1461,12 @@ class ChaosHeistApp:
         self.ring_power_selection_after_id = None
         self.ring_power_countdown_after_id = None
         self.ring_power_last_countdown_seconds: Optional[int] = None
+        self.ring_power_selection_started_at = 0.0
+        self.ring_power_meter_animation_after_id = None
+        self.ring_power_meter_animation_generation = 0
+        self.ring_power_meter_filling = False
+        self.ring_power_meter_blink_on = True
+        self.ring_power_meter_visible = False
         self.announcement_energy_animation_after_id = None
         self.announcement_energy_animation_generation = 0
         self.normal_ring_lock_active = False
@@ -1542,6 +1551,8 @@ class ChaosHeistApp:
         self.announcement_title_label = None
         self.announcement_detail_label = None
         self.announcement_energy_canvas = None
+        self.ring_power_meter_window = None
+        self.ring_power_meter_canvas = None
         self.announcement_flash_window = None
         self.announcement_flash_after_id = None
         self.power_loss_crt_window = None
@@ -2049,8 +2060,15 @@ class ChaosHeistApp:
         emphasis: bool = False,
         meter_width: Optional[int] = None,
         meter_height: Optional[int] = None,
+        blink_segment_index: Optional[int] = None,
+        blink_on: bool = True,
     ) -> tuple[int, int]:
-        """Draw the same labeled, color-coded meter on any Tk canvas."""
+        """Draw the same labeled, color-coded meter on any Tk canvas.
+
+        ``blink_segment_index`` is used by Ring Power's countdown. The
+        selected segment alternates between its normal filled color and the
+        empty-segment appearance while all other segments remain stable.
+        """
         present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
         _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
         meter_width = meter_width or max(
@@ -2100,6 +2118,8 @@ class ChaosHeistApp:
             left = horizontal_margin + index * (segment_width + segment_gap)
             right = left + segment_width
             filled = index < present_count
+            if index == blink_segment_index and not blink_on:
+                filled = False
             canvas.create_rectangle(
                 left,
                 bar_top,
@@ -2164,6 +2184,192 @@ class ChaosHeistApp:
             ),
         )
         canvas.pack(pady=(0, 10))
+
+    def ring_power_meter_size(self) -> tuple[int, int]:
+        """Return a compact meter size that remains usable on arcade modes."""
+        _x, _y, monitor_width, monitor_height = self.overlay_monitor_bounds
+        return (
+            max(220, min(500, int(monitor_width * 0.70))),
+            max(42, min(62, int(monitor_height * 0.10))),
+        )
+
+    def show_ring_power_meter_overlay(self, present_count: int) -> None:
+        """Show Ring Power's independent, non-dismissable energy display."""
+        window = getattr(self, "ring_power_meter_window", None)
+        canvas = getattr(self, "ring_power_meter_canvas", None)
+        if window is None or canvas is None:
+            return
+
+        present_count = max(
+            0,
+            min(TOTAL_EMERALDS, int(present_count)),
+        )
+        meter_width, meter_height = self.ring_power_meter_size()
+        x, y, monitor_width, monitor_height = self.overlay_monitor_bounds
+        meter_x = x + max(0, (monitor_width - meter_width) // 2)
+        meter_y = y + max(
+            4,
+            min(
+                int(monitor_height * 0.76),
+                monitor_height - meter_height - max(4, int(monitor_height * 0.04)),
+            ),
+        )
+        try:
+            self.render_segmented_energy_meter(
+                canvas,
+                present_count,
+                emphasis=True,
+                meter_width=meter_width,
+                meter_height=meter_height,
+            )
+            window.geometry(
+                f"{meter_width}x{meter_height}{meter_x:+d}{meter_y:+d}"
+            )
+            self.apply_announcement_window_style(window)
+            window.deiconify()
+            window.update_idletasks()
+            window_handle = window.winfo_id()
+            ctypes.windll.user32.SetWindowPos(
+                window_handle,
+                HWND_TOPMOST,
+                meter_x,
+                meter_y,
+                meter_width,
+                meter_height,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            )
+            ctypes.windll.user32.ShowWindow(
+                window_handle,
+                SW_SHOWNOACTIVATE,
+            )
+            self.ring_power_meter_visible = True
+        except (AttributeError, tk.TclError):
+            self.ring_power_meter_visible = False
+
+    def hide_ring_power_meter_overlay(self) -> None:
+        """Hide Ring Power's meter without affecting other announcements."""
+        self.cancel_ring_power_meter_animation()
+        window = getattr(self, "ring_power_meter_window", None)
+        if window is not None:
+            try:
+                window.withdraw()
+            except tk.TclError:
+                pass
+        self.ring_power_meter_visible = False
+
+    def cancel_ring_power_meter_animation(self) -> None:
+        self.ring_power_meter_animation_generation = (
+            getattr(self, "ring_power_meter_animation_generation", 0) + 1
+        )
+        after_id = getattr(
+            self,
+            "ring_power_meter_animation_after_id",
+            None,
+        )
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except (AttributeError, tk.TclError):
+                pass
+        self.ring_power_meter_animation_after_id = None
+        self.ring_power_meter_filling = False
+
+    def render_ring_power_countdown_meter(self, now=None) -> None:
+        """Render the seven five-second Ring Power countdown phases."""
+        if not (
+            getattr(self, "ring_burst_active", False)
+            and getattr(self, "ring_burst_selection_deadline", None) is not None
+            and not getattr(self, "ring_burst_selection_expired", False)
+            and getattr(self, "ring_burst_game_seen_since", 0.0) == 0.0
+        ):
+            return
+        canvas = getattr(self, "ring_power_meter_canvas", None)
+        if canvas is None:
+            return
+
+        started_at = getattr(self, "ring_power_selection_started_at", 0.0)
+        if not started_at:
+            deadline = self.ring_burst_selection_deadline
+            started_at = deadline - RING_POWER_SELECTION_SECONDS
+        if now is None:
+            now = time.monotonic()
+        elapsed = max(0.0, float(now) - started_at)
+        phase = min(
+            TOTAL_EMERALDS - 1,
+            int(elapsed / RING_POWER_SEGMENT_SECONDS),
+        )
+        remaining_segments = TOTAL_EMERALDS - phase
+        self.render_segmented_energy_meter(
+            canvas,
+            remaining_segments,
+            emphasis=True,
+            meter_width=self.ring_power_meter_size()[0],
+            meter_height=self.ring_power_meter_size()[1],
+            blink_segment_index=remaining_segments - 1,
+            blink_on=getattr(self, "ring_power_meter_blink_on", True),
+        )
+
+    def animate_ring_power_meter_fill(
+        self,
+        previous_count: int,
+        current_count: int,
+    ) -> None:
+        """Quickly fill the independent meter before its timed drain begins."""
+        canvas = getattr(self, "ring_power_meter_canvas", None)
+        if canvas is None:
+            return
+        previous_count = max(
+            0,
+            min(TOTAL_EMERALDS, int(previous_count)),
+        )
+        current_count = max(
+            0,
+            min(TOTAL_EMERALDS, int(current_count)),
+        )
+        self.cancel_ring_power_meter_animation()
+        self.ring_power_meter_filling = True
+        generation = self.ring_power_meter_animation_generation
+        step = 1 if current_count >= previous_count else -1
+        values = list(range(previous_count, current_count + step, step))
+        if not values:
+            values = [current_count]
+
+        def show_step(index: int) -> None:
+            if generation != self.ring_power_meter_animation_generation:
+                return
+            if not (
+                getattr(self, "ring_burst_active", False)
+                and getattr(self, "ring_burst_selection_deadline", None)
+                is not None
+            ):
+                self.ring_power_meter_animation_after_id = None
+                self.ring_power_meter_filling = False
+                return
+
+            self.ring_power_meter_animation_after_id = None
+            last_step = index + 1 >= len(values)
+            self.show_ring_power_meter_overlay(values[index])
+            if last_step:
+                self.ring_power_meter_filling = False
+                self.render_ring_power_countdown_meter()
+                return
+            self.ring_power_meter_animation_after_id = self.root.after(
+                RING_POWER_METER_STEP_MS,
+                lambda: show_step(index + 1),
+            )
+
+        show_step(0)
+
+    def update_ring_power_meter(self) -> None:
+        """Toggle the active drain segment and redraw the independent meter."""
+        if getattr(self, "ring_power_meter_filling", False):
+            return
+        self.ring_power_meter_blink_on = not getattr(
+            self,
+            "ring_power_meter_blink_on",
+            True,
+        )
+        self.render_ring_power_countdown_meter()
 
     def cancel_announcement_energy_animation(self) -> None:
         self.announcement_energy_animation_generation = (
@@ -2704,6 +2910,29 @@ class ChaosHeistApp:
             highlightthickness=0,
         )
         self.announcement_window.withdraw()
+
+        # Ring Power's meter has its own non-activating surface. The text
+        # banner can be dismissed for convenience, but this meter remains
+        # visible until a game starts or Ring Power expires.
+        self.ring_power_meter_window = tk.Toplevel(self.root)
+        self.ring_power_meter_window.overrideredirect(True)
+        self.ring_power_meter_window.configure(
+            background="#000000",
+            cursor="none",
+        )
+        self.ring_power_meter_window.attributes("-topmost", True)
+        try:
+            self.ring_power_meter_window.attributes("-alpha", 0.94)
+        except tk.TclError:
+            pass
+        self.ring_power_meter_canvas = tk.Canvas(
+            self.ring_power_meter_window,
+            background="#000000",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self.ring_power_meter_canvas.pack(fill="both", expand=True)
+        self.ring_power_meter_window.withdraw()
 
         self.announcement_flash_window = tk.Toplevel(self.root)
         self.announcement_flash_window.overrideredirect(True)
@@ -3295,6 +3524,7 @@ class ChaosHeistApp:
 
         self.active_ring_announcement_kind = None
         self.ring_power_announcement_visible = False
+        self.hide_ring_power_meter_overlay()
         self.cancel_announcement_energy_animation()
         if self.announcement_after_id is not None:
             try:
@@ -4227,10 +4457,14 @@ class ChaosHeistApp:
         self.cancel_ring_power_selection_timer()
         self.cancel_ring_power_countdown()
         self.ring_burst_selection_expired = False
+        self.ring_power_selection_started_at = time.monotonic()
         self.ring_burst_selection_deadline = (
-            time.monotonic() + RING_POWER_SELECTION_SECONDS
+            self.ring_power_selection_started_at
+            + RING_POWER_SELECTION_SECONDS
         )
         self.ring_power_last_countdown_seconds = None
+        self.ring_power_meter_blink_on = True
+        self.ring_power_meter_filling = True
         if not getattr(self, "root", None):
             return
         self.ring_power_selection_after_id = self.root.after(
@@ -4245,17 +4479,19 @@ class ChaosHeistApp:
     def cancel_ring_power_selection_for_game(self) -> None:
         self.cancel_ring_power_selection_timer()
         self.cancel_ring_power_countdown()
+        self.hide_ring_power_meter_overlay()
         self.ring_burst_selection_deadline = None
         self.ring_burst_selection_expired = False
         self.ring_power_last_countdown_seconds = None
+        self.ring_power_selection_started_at = 0.0
 
     def ring_power_countdown_tick(self) -> None:
         self.ring_power_countdown_after_id = None
         if not (
             getattr(self, "ring_burst_active", False)
-            and getattr(self, "active_ring_announcement_kind", None)
-            == "burst"
-            and getattr(self, "ring_power_announcement_visible", False)
+            and getattr(self, "ring_burst_selection_deadline", None)
+            is not None
+            and not getattr(self, "ring_burst_selection_expired", False)
         ):
             return
         if getattr(self, "ring_burst_game_seen_since", 0.0) != 0.0:
@@ -4266,19 +4502,15 @@ class ChaosHeistApp:
             self.handle_ring_power_selection_timeout()
             return
 
-        if (
-            remaining
-            != getattr(self, "ring_power_last_countdown_seconds", None)
-        ):
-            try:
-                self.refresh_active_ring_announcement()
-            except Exception as error:
-                self.recover_ring_ui_error(
-                    "ring power countdown",
-                    error,
-                )
-                return
+        try:
             self.ring_power_last_countdown_seconds = remaining
+            self.update_ring_power_meter()
+        except Exception as error:
+            self.recover_ring_ui_error(
+                "ring power meter countdown",
+                error,
+            )
+            return
         self.ring_power_countdown_after_id = self.root.after(
             RING_POWER_COUNTDOWN_TICK_MS,
             self.ring_power_countdown_tick,
@@ -4310,8 +4542,10 @@ class ChaosHeistApp:
 
         self.ring_burst_selection_expired = True
         self.ring_burst_selection_deadline = None
+        self.ring_power_selection_started_at = 0.0
         self.ring_power_last_countdown_seconds = None
         self.cancel_ring_power_countdown()
+        self.hide_ring_power_meter_overlay()
         if (
             getattr(self, "active_ring_announcement_kind", None) == "burst"
             or getattr(self, "ring_power_announcement_visible", False)
@@ -4359,11 +4593,13 @@ class ChaosHeistApp:
         self.cancel_ring_power_selection_timer()
         self.cancel_ring_power_countdown()
         self.cancel_announcement_energy_animation()
+        self.hide_ring_power_meter_overlay()
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
         self.ring_burst_origin = None
         self.ring_burst_selection_deadline = None
+        self.ring_power_selection_started_at = 0.0
         self.ring_burst_selection_expired = False
         self.ring_power_last_countdown_seconds = None
         self.ring_power_announcement_visible = False
@@ -4605,7 +4841,6 @@ class ChaosHeistApp:
             title = RING_BURST_TITLE
             detail = (
                 f"{RING_BURST_MESSAGE}\n"
-                f"TIME LEFT: {self.ring_power_seconds_remaining()} SECONDS\n"
                 f"TOTAL RINGS: {self.ring_count}"
             )
             color = "#66ff99"
@@ -4709,6 +4944,17 @@ class ChaosHeistApp:
                 "RING ANNOUNCEMENT HELD | 50-RING PRIZE ACTIVE"
             )
             return
+        if (
+            announcement_kind != "milestone"
+            and getattr(self, "ring_burst_active", False)
+            and getattr(self, "ring_burst_selection_deadline", None)
+            is not None
+        ):
+            # Once the independent meter is running, later rings must not
+            # replace or restart its countdown. The persistent total is still
+            # recorded by handle_ring_entry, and a milestone may interrupt
+            # this branch because it has higher presentation priority.
+            return
         current = getattr(self, "pending_ring_announcement", None)
         if priorities.get(announcement_kind, 0) >= priorities.get(current, 0):
             self.pending_ring_announcement = announcement_kind
@@ -4786,7 +5032,6 @@ class ChaosHeistApp:
                 if announcement_kind == "milestone"
                 else None
             ),
-            energy_present_count=burst_energy_count,
         ):
             return
 
@@ -4797,7 +5042,8 @@ class ChaosHeistApp:
         if announcement_kind == "burst":
             self.ring_power_announcement_visible = True
             self.start_ring_power_selection_window()
-            self.animate_announcement_energy_meter(
+            self.show_ring_power_meter_overlay(burst_energy_count or 0)
+            self.animate_ring_power_meter_fill(
                 burst_energy_count or 0,
                 TOTAL_EMERALDS,
             )
@@ -5294,11 +5540,7 @@ class ChaosHeistApp:
                 return "RING POWER EXPIRED — RETURNING TO LOCK", "#ffcc66"
             if self.ring_burst_game_seen_since:
                 return "RING POWER — GAME ACCESS IN USE", "#66ff99"
-            remaining = self.ring_power_seconds_remaining()
-            return (
-                f"RING POWER — SELECT A GAME ({remaining}s)",
-                "#66ff99",
-            )
+            return "RING POWER — SELECT A GAME", "#66ff99"
 
         if self.completion_in_progress:
             return "SONIC VICTORY SCREEN", "#66ccff"
@@ -6011,6 +6253,11 @@ class ChaosHeistApp:
                     or getattr(
                         self,
                         "ring_power_announcement_visible",
+                        False,
+                    )
+                    or getattr(
+                        self,
+                        "ring_power_meter_visible",
                         False,
                     )
                 )

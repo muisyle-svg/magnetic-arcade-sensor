@@ -54,10 +54,13 @@ be counted twice.
   that total. In Normal Mode, these announcements also show the current Chaos
   Energy percentage; the Robotnik screen keeps energy in its graphical meter.
 - Ring Power shows the current segmented Chaos Energy meter, rapidly fills it
-  to full, and gives 60 seconds to launch a game. Selecting a game cancels the
-  countdown immediately; returning to Big Box then restores the Robotnik lock
-  as usual. If no game is selected before the countdown expires, the Robotnik
-  lock returns without covering an active game.
+  to full, and gives 35 seconds to launch a game. The meter itself is the
+  countdown: each of its seven segments blinks for five seconds and then goes
+  dark. Selecting a game cancels the countdown immediately; returning to Big
+  Box then restores the Robotnik lock as usual. If no game is selected before
+  the countdown expires, the Robotnik lock returns without covering an active
+  game. The instructional text can be dismissed independently, but the meter
+  remains until a game starts or the deadline expires.
 - Ring announcements are shown only while full-screen Big Box is safely in the
   foreground or over the guard's own Robotnik recovery screen. A ring deposited
   during MAME, GroovyMAME, RetroArch, or another game is still counted
@@ -201,7 +204,7 @@ Keep `chaos-heist-config.json` beside `ChaosHeist.exe`. A legacy `guard-config.j
 - `ring_joystick_button`: human-numbered joystick button used for rings; default `10`.
 - `ring_debounce_ms`: short anti-bounce interval; default `90` ms.
 - `ring_game_commit_seconds`: how long an emulator must remain active before one Ring Power use is committed; default `3.0` seconds. Returning to Big Box restores the Robotnik screen if it granted the burst.
-- `ring_power_selection_seconds`: how long Ring Power waits for a game to be selected; default `60.0` seconds. The countdown is canceled as soon as an emulator is detected.
+- `ring_power_selection_seconds`: how long Ring Power waits for a game to be selected; default `35.0` seconds. The on-screen countdown is the seven-segment Chaos Energy meter: one segment blinks for each five-second phase, then goes dark. The meter is independent from the dismissible Ring Power text and disappears as soon as an emulator is detected.
 - `ring_announcement_seconds`: how long ordinary ring-count messages remain visible; default `3.0`.
 - `ring_milestone_announcement_seconds`: how long the 50-ring prize message must remain visible before it is acknowledged; minimum and default `10.0`.
 - `cinematic_max_fps`: maximum cinematic display rate; default `15` to keep audio and video synchronized on the arcade PC.

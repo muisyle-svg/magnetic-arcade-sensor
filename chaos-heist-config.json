@@ -45,7 +45,7 @@
   "ring_joystick_button": 10,
   "ring_debounce_ms": 90,
   "ring_game_commit_seconds": 3.0,
-  "ring_power_selection_seconds": 60.0,
+  "ring_power_selection_seconds": 35.0,
   "ring_announcement_seconds": 3.0,
   "ring_milestone_announcement_seconds": 10.0,
   "emulator_process_names": [
