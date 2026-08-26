@@ -173,6 +173,7 @@ DEFAULT_CONFIG = {
     "ring_joystick_button": 10,
     "ring_debounce_ms": 90,
     "ring_game_commit_seconds": 3.0,
+    "ring_power_selection_seconds": 60.0,
     "ring_announcement_seconds": 3.0,
     "ring_milestone_announcement_seconds": 10.0,
     "emulator_process_names": list(DEFAULT_EMULATOR_PROCESS_NAMES),
@@ -637,6 +638,12 @@ RING_GAME_COMMIT_SECONDS = config_number(
     1.0,
     15.0,
 )
+RING_POWER_SELECTION_SECONDS = config_number(
+    RUNTIME_CONFIG.get("ring_power_selection_seconds", 60.0),
+    60.0,
+    5.0,
+    300.0,
+)
 RING_ANNOUNCEMENT_SECONDS = config_number(
     RUNTIME_CONFIG.get("ring_announcement_seconds", 3.0),
     3.0,
@@ -654,9 +661,7 @@ RING_MILESTONE_TITLE = "50 Rings!"
 RING_MILESTONE_MESSAGE = "You've earned a Medallion!"
 RING_COUNT_TITLE = "RING COLLECTED!"
 RING_BURST_TITLE = "RING POWER!"
-RING_BURST_MESSAGE = (
-    "ONE GAME OF CHAOS POWER CHARGED!"
-)
+RING_BURST_MESSAGE = "This won't last long, quick play a game!"
 RING_BURST_ANNOUNCEMENT_SECONDS = 2.0
 RING_STATE_VERSION = 2
 CINEMATIC_MAX_FPS = config_number(
@@ -947,6 +952,8 @@ STORY_POWER_LOSS_TICK_MS = 45
 POWER_LOSS_CRT_COLLAPSE_MS = 1800
 ENERGY_ANIMATION_STEP_MS = 55
 ENERGY_EMPHASIS_MS = 420
+RING_POWER_COUNTDOWN_TICK_MS = 250
+RING_POWER_METER_STEP_MS = 70
 
 STORY_STOLEN_TEXT = {
     1: (
@@ -1446,6 +1453,13 @@ class ChaosHeistApp:
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
         self.ring_burst_origin: Optional[str] = None
+        self.ring_burst_selection_deadline: Optional[float] = None
+        self.ring_burst_selection_expired = False
+        self.ring_power_selection_after_id = None
+        self.ring_power_countdown_after_id = None
+        self.ring_power_last_countdown_seconds: Optional[int] = None
+        self.announcement_energy_animation_after_id = None
+        self.announcement_energy_animation_generation = 0
         self.normal_ring_lock_active = False
         self.ring_power_announcement_visible = False
         self.ring_power_ignore_until = 0.0
@@ -2126,7 +2140,7 @@ class ChaosHeistApp:
         visible: bool,
         emphasis: bool = False,
     ) -> None:
-        """Show the Robotnik-style meter inside a normal-mode banner."""
+        """Show the Robotnik-style meter inside a temporary banner."""
         canvas = getattr(self, "announcement_energy_canvas", None)
         if canvas is None:
             return
@@ -2150,6 +2164,76 @@ class ChaosHeistApp:
             ),
         )
         canvas.pack(pady=(0, 10))
+
+    def cancel_announcement_energy_animation(self) -> None:
+        self.announcement_energy_animation_generation = (
+            getattr(self, "announcement_energy_animation_generation", 0) + 1
+        )
+        after_id = getattr(
+            self,
+            "announcement_energy_animation_after_id",
+            None,
+        )
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except (AttributeError, tk.TclError):
+                pass
+        self.announcement_energy_animation_after_id = None
+
+    def animate_announcement_energy_meter(
+        self,
+        previous_count: int,
+        current_count: int,
+    ) -> None:
+        """Rapidly fill the temporary Ring Power meter to full energy."""
+        if not getattr(self, "announcement_energy_canvas", None):
+            return
+        previous_count = max(
+            0,
+            min(TOTAL_EMERALDS, int(previous_count)),
+        )
+        current_count = max(
+            0,
+            min(TOTAL_EMERALDS, int(current_count)),
+        )
+        self.cancel_announcement_energy_animation()
+        generation = self.announcement_energy_animation_generation
+        step = 1 if current_count >= previous_count else -1
+        values = list(range(previous_count, current_count + step, step))
+        if not values:
+            values = [current_count]
+
+        def show_step(index: int) -> None:
+            if generation != self.announcement_energy_animation_generation:
+                return
+            if (
+                getattr(self, "active_ring_announcement_kind", None)
+                != "burst"
+                or not getattr(
+                    self,
+                    "ring_power_announcement_visible",
+                    False,
+                )
+            ):
+                self.announcement_energy_animation_after_id = None
+                return
+
+            self.announcement_energy_animation_after_id = None
+            last_step = index + 1 >= len(values)
+            self.set_announcement_energy_meter(
+                values[index],
+                visible=True,
+                emphasis=not last_step,
+            )
+            if last_step:
+                return
+            self.announcement_energy_animation_after_id = self.root.after(
+                RING_POWER_METER_STEP_MS,
+                lambda: show_step(index + 1),
+            )
+
+        show_step(0)
 
     def animate_energy_meter(
         self,
@@ -3167,6 +3251,7 @@ class ChaosHeistApp:
             )
         self.active_ring_announcement_kind = None
         self.ring_power_announcement_visible = False
+        self.cancel_announcement_energy_animation()
         self.set_announcement_energy_meter(0, visible=False)
         if self.announcement_after_id is not None:
             try:
@@ -3210,6 +3295,7 @@ class ChaosHeistApp:
 
         self.active_ring_announcement_kind = None
         self.ring_power_announcement_visible = False
+        self.cancel_announcement_energy_animation()
         if self.announcement_after_id is not None:
             try:
                 self.root.after_cancel(self.announcement_after_id)
@@ -4108,14 +4194,178 @@ class ChaosHeistApp:
     def ring_burst_is_eligible(self) -> bool:
         return self.current_ring_burst_origin() is not None
 
+    def ring_power_seconds_remaining(self) -> int:
+        if getattr(self, "ring_burst_selection_expired", False):
+            return 0
+        deadline = getattr(self, "ring_burst_selection_deadline", None)
+        if deadline is None:
+            return max(0, int(math.ceil(RING_POWER_SELECTION_SECONDS)))
+        return max(
+            0,
+            int(math.ceil(deadline - time.monotonic())),
+        )
+
+    def cancel_ring_power_selection_timer(self) -> None:
+        after_id = getattr(self, "ring_power_selection_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except (AttributeError, tk.TclError):
+                pass
+        self.ring_power_selection_after_id = None
+
+    def cancel_ring_power_countdown(self) -> None:
+        after_id = getattr(self, "ring_power_countdown_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except (AttributeError, tk.TclError):
+                pass
+        self.ring_power_countdown_after_id = None
+
+    def start_ring_power_selection_window(self) -> None:
+        self.cancel_ring_power_selection_timer()
+        self.cancel_ring_power_countdown()
+        self.ring_burst_selection_expired = False
+        self.ring_burst_selection_deadline = (
+            time.monotonic() + RING_POWER_SELECTION_SECONDS
+        )
+        self.ring_power_last_countdown_seconds = None
+        if not getattr(self, "root", None):
+            return
+        self.ring_power_selection_after_id = self.root.after(
+            int(RING_POWER_SELECTION_SECONDS * 1000),
+            self.handle_ring_power_selection_timeout,
+        )
+        self.ring_power_countdown_after_id = self.root.after(
+            RING_POWER_COUNTDOWN_TICK_MS,
+            self.ring_power_countdown_tick,
+        )
+
+    def cancel_ring_power_selection_for_game(self) -> None:
+        self.cancel_ring_power_selection_timer()
+        self.cancel_ring_power_countdown()
+        self.ring_burst_selection_deadline = None
+        self.ring_burst_selection_expired = False
+        self.ring_power_last_countdown_seconds = None
+
+    def ring_power_countdown_tick(self) -> None:
+        self.ring_power_countdown_after_id = None
+        if not (
+            getattr(self, "ring_burst_active", False)
+            and getattr(self, "active_ring_announcement_kind", None)
+            == "burst"
+            and getattr(self, "ring_power_announcement_visible", False)
+        ):
+            return
+        if getattr(self, "ring_burst_game_seen_since", 0.0) != 0.0:
+            self.cancel_ring_power_selection_for_game()
+            return
+        remaining = self.ring_power_seconds_remaining()
+        if remaining <= 0:
+            self.handle_ring_power_selection_timeout()
+            return
+
+        if (
+            remaining
+            != getattr(self, "ring_power_last_countdown_seconds", None)
+        ):
+            try:
+                self.refresh_active_ring_announcement()
+            except Exception as error:
+                self.recover_ring_ui_error(
+                    "ring power countdown",
+                    error,
+                )
+                return
+            self.ring_power_last_countdown_seconds = remaining
+        self.ring_power_countdown_after_id = self.root.after(
+            RING_POWER_COUNTDOWN_TICK_MS,
+            self.ring_power_countdown_tick,
+        )
+
+    def handle_ring_power_selection_timeout(self) -> None:
+        self.ring_power_selection_after_id = None
+        if not (
+            getattr(self, "ring_burst_active", False)
+            and getattr(self, "guard_active", False)
+        ):
+            return
+        if getattr(self, "ring_burst_game_seen_since", 0.0) != 0.0:
+            self.cancel_ring_power_selection_for_game()
+            return
+        deadline = getattr(self, "ring_burst_selection_deadline", None)
+        if deadline is None:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            self.ring_power_selection_after_id = self.root.after(
+                max(
+                    50,
+                    int(remaining * 1000),
+                ),
+                self.handle_ring_power_selection_timeout,
+            )
+            return
+
+        self.ring_burst_selection_expired = True
+        self.ring_burst_selection_deadline = None
+        self.ring_power_last_countdown_seconds = None
+        self.cancel_ring_power_countdown()
+        if (
+            getattr(self, "active_ring_announcement_kind", None) == "burst"
+            or getattr(self, "ring_power_announcement_visible", False)
+        ):
+            if getattr(self, "pending_ring_announcement", None) == "burst":
+                self.pending_ring_announcement = None
+            self.active_ring_announcement_kind = None
+            self.ring_power_announcement_visible = False
+            try:
+                self.hide_story_announcement()
+            except Exception as error:
+                self.recover_ring_ui_error(
+                    "ring power timeout cleanup",
+                    error,
+                )
+        self.write_status(
+            "RING POWER SELECTION EXPIRED | waiting for safe Robotnik return"
+        )
+        try:
+            self.handle_ring_burst_foreground()
+        except Exception as error:
+            self.recover_ring_burst_error(error)
+
+    def expire_ring_burst_on_safe_menu(self) -> None:
+        if not (
+            getattr(self, "ring_burst_active", False)
+            and getattr(self, "ring_burst_selection_expired", False)
+        ):
+            return
+        burst_origin = getattr(self, "ring_burst_origin", None)
+        self.reset_ring_burst_state()
+        self.write_status(
+            "RING POWER EXPIRED | Robotnik screen restored"
+        )
+        try:
+            self.hide_story_announcement()
+        except Exception as error:
+            self.recover_ring_ui_error("timeout return cleanup", error)
+        self.restore_ring_burst_origin_screen(burst_origin)
+
     def reset_ring_burst_state(
         self,
         clear_normal_lock: bool = False,
     ) -> None:
+        self.cancel_ring_power_selection_timer()
+        self.cancel_ring_power_countdown()
+        self.cancel_announcement_energy_animation()
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
         self.ring_burst_origin = None
+        self.ring_burst_selection_deadline = None
+        self.ring_burst_selection_expired = False
+        self.ring_power_last_countdown_seconds = None
         self.ring_power_announcement_visible = False
         if clear_normal_lock:
             self.normal_ring_lock_active = False
@@ -4222,6 +4472,7 @@ class ChaosHeistApp:
         duration_seconds: Optional[float],
         allow_guard_overlay: bool = False,
         timeout_callback=None,
+        energy_present_count: Optional[int] = None,
     ) -> bool:
         if getattr(self, "active_ring_announcement_kind", None) == "milestone":
             return False
@@ -4236,6 +4487,11 @@ class ChaosHeistApp:
             return False
 
         self.hide_story_announcement()
+        self.set_announcement_energy_meter(
+            energy_present_count or 0,
+            visible=energy_present_count is not None,
+            emphasis=energy_present_count is not None,
+        )
         banner_x, banner_y, banner_width, banner_height = (
             self.configure_announcement_content(
                 title,
@@ -4347,7 +4603,11 @@ class ChaosHeistApp:
             duration = RING_MILESTONE_ANNOUNCEMENT_SECONDS
         elif announcement_kind == "burst":
             title = RING_BURST_TITLE
-            detail = f"{RING_BURST_MESSAGE}\nTOTAL RINGS: {self.ring_count}"
+            detail = (
+                f"{RING_BURST_MESSAGE}\n"
+                f"TIME LEFT: {self.ring_power_seconds_remaining()} SECONDS\n"
+                f"TOTAL RINGS: {self.ring_count}"
+            )
             color = "#66ff99"
             duration = None
         else:
@@ -4359,7 +4619,10 @@ class ChaosHeistApp:
         # Normal Mode announcements are intentionally non-blocking, so the
         # current shrine energy is useful context. Story/Robotnik screens have
         # a dedicated graphical meter and do not duplicate this text.
-        if getattr(self, "guard_mode", None) == "normal":
+        if (
+            getattr(self, "guard_mode", None) == "normal"
+            and announcement_kind != "burst"
+        ):
             accepted_count = getattr(self, "accepted_count", None)
             if accepted_count is None:
                 energy_text = "CHAOS ENERGY: --"
@@ -4499,6 +4762,15 @@ class ChaosHeistApp:
         title, detail, color, duration = self.ring_announcement_content(
             announcement_kind
         )
+        burst_energy_count = None
+        if announcement_kind == "burst":
+            try:
+                burst_energy_count = max(
+                    0,
+                    min(TOTAL_EMERALDS, int(self.accepted_count or 0)),
+                )
+            except (AttributeError, TypeError, ValueError):
+                burst_energy_count = 0
 
         # Ring totals are permitted over Big Box or our own Robotnik screen.
         # Never create this window over an emulator: GroovyMAME and RetroArch
@@ -4514,6 +4786,7 @@ class ChaosHeistApp:
                 if announcement_kind == "milestone"
                 else None
             ),
+            energy_present_count=burst_energy_count,
         ):
             return
 
@@ -4523,6 +4796,11 @@ class ChaosHeistApp:
             self.play_act_clear_sound()
         if announcement_kind == "burst":
             self.ring_power_announcement_visible = True
+            self.start_ring_power_selection_window()
+            self.animate_announcement_energy_meter(
+                burst_energy_count or 0,
+                TOTAL_EMERALDS,
+            )
             # The ring insertion that caused this announcement also produces
             # a joystick-edge event. Ignore that same scan so the new banner
             # cannot disappear immediately. The sequence check is important:
@@ -4695,20 +4973,7 @@ class ChaosHeistApp:
         """Compatibility wrapper retained for older tests and diagnostics."""
         self.maybe_show_pending_ring_announcement()
 
-    def consume_ring_burst_on_return(self) -> None:
-        if not self.ring_burst_active:
-            return
-
-        burst_origin = getattr(self, "ring_burst_origin", None)
-        self.reset_ring_burst_state()
-        self.write_status("RING BURST CONSUMED | Big Box returned")
-        # The persistent Ring Power banner belongs to the one-game access
-        # period. Never leave it above the restored Robotnik screen.
-        try:
-            self.hide_story_announcement()
-        except Exception as error:
-            self.recover_ring_ui_error("return cleanup", error)
-
+    def restore_ring_burst_origin_screen(self, burst_origin) -> None:
         if not self.guard_active:
             return
 
@@ -4737,12 +5002,35 @@ class ChaosHeistApp:
             )
             self.maybe_show_pending_overlay()
 
+    def consume_ring_burst_on_return(self) -> None:
+        if not self.ring_burst_active:
+            return
+
+        burst_origin = getattr(self, "ring_burst_origin", None)
+        self.reset_ring_burst_state()
+        self.write_status("RING BURST CONSUMED | Big Box returned")
+        # The persistent Ring Power banner belongs to the one-game access
+        # period. Never leave it above the restored Robotnik screen.
+        try:
+            self.hide_story_announcement()
+        except Exception as error:
+            self.recover_ring_ui_error("return cleanup", error)
+
+        self.restore_ring_burst_origin_screen(burst_origin)
+
     def handle_ring_burst_foreground(self) -> None:
         if not self.ring_burst_active or not self.guard_active:
             return
 
         self.update_overlay_gate()
         now = time.monotonic()
+        if (
+            getattr(self, "ring_burst_selection_deadline", None) is not None
+            and getattr(self, "ring_burst_game_seen_since", 0.0) == 0.0
+            and now >= self.ring_burst_selection_deadline
+        ):
+            self.handle_ring_power_selection_timeout()
+            return
         if self.foreground_process_name in EMULATOR_PROCESS_NAMES:
             # No small topmost window is ever allowed to survive into a game,
             # even if the joystick edge that normally dismisses Ring Power was
@@ -4761,7 +5049,10 @@ class ChaosHeistApp:
                         "emulator transition",
                         error,
                     )
+            if getattr(self, "ring_burst_selection_expired", False):
+                return
             if self.ring_burst_game_seen_since == 0.0:
+                self.cancel_ring_power_selection_for_game()
                 self.ring_burst_game_seen_since = now
                 self.write_status("RING BURST GAME LAUNCH DETECTED")
             if (
@@ -4787,6 +5078,11 @@ class ChaosHeistApp:
         )
         if big_box_ready and energy_restored_without_game:
             self.consume_ring_burst_on_return()
+            return
+
+        if getattr(self, "ring_burst_selection_expired", False):
+            if big_box_ready:
+                self.expire_ring_burst_on_safe_menu()
             return
 
         if (
@@ -4994,9 +5290,15 @@ class ChaosHeistApp:
             return f"{mode_name} MODE SELECTED — GUARD OFF", "#9e9e9e"
 
         if self.ring_burst_active:
+            if getattr(self, "ring_burst_selection_expired", False):
+                return "RING POWER EXPIRED — RETURNING TO LOCK", "#ffcc66"
             if self.ring_burst_game_seen_since:
                 return "RING POWER — GAME ACCESS IN USE", "#66ff99"
-            return "RING POWER — ONE GAME READY", "#66ff99"
+            remaining = self.ring_power_seconds_remaining()
+            return (
+                f"RING POWER — SELECT A GAME ({remaining}s)",
+                "#66ff99",
+            )
 
         if self.completion_in_progress:
             return "SONIC VICTORY SCREEN", "#66ccff"

@@ -424,6 +424,111 @@ class GuardLogicTests(unittest.TestCase):
         self.assertIsNone(shown[0][3])
         self.assertTrue(guard.ring_power_announcement_visible)
 
+    def test_ring_power_announcement_has_selection_message_and_countdown(self):
+        guard = self.make_guard()
+        guard.ring_count = 8
+        guard.ring_burst_selection_deadline = 160.0
+
+        with patch.object(time, "monotonic", return_value=100.0):
+            title, detail, _color, duration = (
+                guard.ring_announcement_content("burst")
+            )
+
+        self.assertEqual(title, guard_module.RING_BURST_TITLE)
+        self.assertIn(guard_module.RING_BURST_MESSAGE, detail)
+        self.assertIn("TIME LEFT: 60 SECONDS", detail)
+        self.assertNotIn("ONE GAME OF CHAOS POWER CHARGED", detail)
+        self.assertIsNone(duration)
+
+    def test_ring_power_banner_starts_meter_from_current_energy(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.ring_count = 9
+        guard.accepted_count = 3
+        guard.pending_ring_milestone = False
+        guard.pending_ring_announcement = "burst"
+        guard.ring_power_announcement_visible = False
+        guard.write_status = lambda *args, **kwargs: None
+        guard.root = MagicMock()
+        shown = []
+        animation = []
+        guard.show_plain_announcement = (
+            lambda *args, **kwargs: shown.append((args, kwargs)) or True
+        )
+        guard.animate_announcement_energy_meter = (
+            lambda previous, current: animation.append((previous, current))
+        )
+
+        with patch.object(time, "monotonic", return_value=100.0):
+            guard.maybe_show_pending_ring_announcement()
+
+        self.assertEqual(shown[0][1]["energy_present_count"], 3)
+        self.assertEqual(animation, [(3, guard_module.TOTAL_EMERALDS)])
+        self.assertEqual(
+            guard.ring_burst_selection_deadline,
+            100.0 + guard_module.RING_POWER_SELECTION_SECONDS,
+        )
+
+    def test_ring_power_game_selection_cancels_countdown(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.guard_active = True
+        guard.ring_burst_game_seen = False
+        guard.ring_burst_game_seen_since = 0.0
+        guard.ring_burst_selection_deadline = 160.0
+        guard.ring_power_selection_after_id = "deadline"
+        guard.ring_power_countdown_after_id = "countdown"
+        guard.foreground_process_name = "retroarch.exe"
+        guard.update_overlay_gate = lambda: False
+        guard.write_status = lambda *args, **kwargs: None
+        guard.root = MagicMock()
+
+        with patch.object(time, "monotonic", return_value=100.0):
+            guard.handle_ring_burst_foreground()
+
+        self.assertEqual(guard.ring_burst_game_seen_since, 100.0)
+        self.assertIsNone(guard.ring_burst_selection_deadline)
+        self.assertFalse(guard.ring_burst_selection_expired)
+        self.assertIsNone(guard.ring_power_selection_after_id)
+        self.assertIsNone(guard.ring_power_countdown_after_id)
+
+    def test_ring_power_timeout_waits_for_safe_menu_before_restoring_lock(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.guard_active = True
+        guard.ring_burst_game_seen_since = 0.0
+        guard.ring_burst_selection_deadline = 100.0
+        guard.active_ring_announcement_kind = "burst"
+        guard.ring_power_announcement_visible = True
+        guard.ring_burst_origin = "story_robotnik"
+        guard.foreground_process_name = "retroarch.exe"
+        guard.update_overlay_gate = lambda: False
+        guard.hide_story_announcement = lambda: None
+        guard.write_status = lambda *args, **kwargs: None
+        guard.root = MagicMock()
+
+        with patch.object(time, "monotonic", return_value=100.0):
+            guard.handle_ring_power_selection_timeout()
+
+        self.assertTrue(guard.ring_burst_active)
+        self.assertTrue(guard.ring_burst_selection_expired)
+        self.assertFalse(guard.ring_power_announcement_visible)
+
+        guard.foreground_process_name = guard_module.BIG_BOX_PROCESS_NAME
+        guard.overlay_gate_state = "BIGBOX_READY"
+        guard.update_overlay_gate = lambda: True
+        guard.guard_mode = "story"
+        guard.accepted_count = 0
+        pending = []
+        guard.maybe_show_pending_overlay = lambda: pending.append(True)
+
+        with patch.object(time, "monotonic", return_value=101.0):
+            guard.handle_ring_burst_foreground()
+
+        self.assertFalse(guard.ring_burst_active)
+        self.assertEqual(guard.pending_overlay_missing, guard_module.TOTAL_EMERALDS)
+        self.assertEqual(pending, [True])
+
     def test_joystick_press_dismisses_ring_power_and_reveals_pending_count(self):
         guard = self.make_guard()
         guard.ring_power_announcement_visible = True
