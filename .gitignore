@@ -8,8 +8,11 @@ __pycache__/
 # Local runtime state and logs
 ring-counter.json
 guard-status.txt
+chaos-heist-status.txt
 guard-events.log
 guard-bootstrap.log
+chaos-heist-events.log
+chaos-heist-bootstrap.log
 *.log
 
 # Build and packaging output

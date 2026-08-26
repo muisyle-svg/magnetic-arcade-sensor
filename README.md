@@ -1,14 +1,10 @@
-# Magnetic Arcade Guard — Story/Normal Edition
+# ChaosHeist — Production Story/Normal Edition
 
-This is an experimental version kept completely separate from the known-good guard. It has its own source folder, build folder, EXE name, and distribution folder.
+ChaosHeist is the production version of the seven-emerald arcade experience. It includes Story Mode, Normal Mode, persistent ring counting, one-game Ring Power access, the 50-ring prize announcement, and the ESP32-controlled Master Emerald lighting effects.
 
-The frozen release remains at:
+On the development computer, superseded local builds were preserved on August 25, 2026 at:
 
-`C:\Users\Projector\Documents\RFIDlock\versions\stable-pre-story-mode`
-
-Its portable ZIP is:
-
-`C:\Users\Projector\Documents\RFIDlock\versions\MagnetArcadeGuard-stable-pre-story-mode.zip`
+`C:\Users\Projector\Documents\RFIDlock\Archive\2026-08-25-pre-ChaosHeist`
 
 ## Modes
 
@@ -19,7 +15,7 @@ Story Mode arms only after the guard has observed all seven emeralds in place. S
 - Removing emeralds 1–6 shows a centered, briefly flashing, non-blocking theft banner over a full-screen Big Box menu. Big Box remains usable and the banner does not take keyboard or joystick focus.
 - The shutdown story cards use larger monitor-aware text, while still shrinking or wrapping to stay inside the arcade display.
 - Each partial theft chooses a different sound from the configured reaction clips; the same clip is never chosen twice in a row.
-- Removing the seventh emerald starts the full takeover only after Big Box is the stable full-screen foreground. It pauses Big Box, mutes its audio, and runs a roughly ten-second staged power failure over the frozen menu: fluorescent flicker, worsening glitches and blackouts, then a classic CRT line-to-dot collapse. The four optional clips `flourescent-lights-buzzing.mp3`, `lantern-buzzes-fades.mp3`, `lantern-whines-buzzing-dies.mp3`, and `tv-off.mp3` play in that order before the shutdown narration continues.
+- Removing the seventh emerald starts the full takeover only after Big Box is the stable full-screen foreground. It pauses Big Box, mutes its audio, and runs a roughly ten-second staged power failure over the frozen menu: fluorescent flicker, worsening glitches and blackouts, then a classic CRT line-to-dot collapse. The four synchronized clips `flourescent-lights-buzzing.mp3`, `lantern-buzzes-fades.mp3`, `lantern-whines-buzzing-dies.mp3`, and `tv-off.mp3` play in that order before the shutdown narration continues.
 - The final theft uses the dedicated `no-he-s-got-the-last-emerald.mp3` clip. Before the cinematic, the Eggman reveal screen only says `SO EGGMAN'S BEHIND THIS, HUH?` and plays its matching voice clip.
 - The first shutdown narration card also plays `i-m-afraid-our-little-game-ends-now.mp3`.
 - After the cinematic, the Robotnik recovery screen shows the number recovered while the separate Chaos Energy meter updates as each emerald returns.
@@ -46,10 +42,13 @@ activation. Human-numbered joystick button 10 is treated as the coin/ring
 input. The guard reads it through the Windows joystick API, so it does not
 need focus and does not compete with cinematic playback. A short 90 ms
 anti-bounce interval prevents one coin-switch pulse from counting twice while
-still allowing rings to be entered quickly.
+still allowing rings to be entered quickly. The same debounce also spans both
+USB encoders, so one electrical pulse reported by two identical devices cannot
+be counted twice.
 
 - Every ring is counted, including while the guard is dormant or deactivated.
-- The persistent total is stored in `%LOCALAPPDATA%\MagnetArcadeGuard\ring-counter.json`, with an automatically maintained `ring-counter.backup.json`. If the primary file is corrupt, the guard preserves a timestamped copy, recovers from the backup when possible, and shows a warning in the operator panel instead of silently losing the total.
+- The persistent total is stored in `%LOCALAPPDATA%\ChaosHeist\ring-counter.json`, with the previous valid generation in `ring-counter.backup.json`. On first production launch, ChaosHeist validates and imports one existing ring total from `%LOCALAPPDATA%\MagnetArcadeGuard`, writes a durable migration marker, and never imports the legacy files again. If the primary file is corrupt, the guard preserves a timestamped copy, recovers from the backup or an interrupted atomic save when possible, and shows a warning in the operator panel instead of silently losing the total.
+- Rapid deposits update the on-screen total immediately. Durable ring-state writes are serialized and coalesced on a background worker so a slow disk or antivirus scan cannot stall sensor and joystick handling; an orderly shutdown performs a final synchronous save.
 - Every deposit queues a non-activating `RING COLLECTED!` announcement showing
   the new persistent total. Ring Power and 50-ring announcements also include
   that total. In Normal Mode, these announcements also show the current Chaos
@@ -58,28 +57,31 @@ still allowing rings to be entered quickly.
   foreground or over the guard's own Robotnik recovery screen. A ring deposited
   during MAME, GroovyMAME, RetroArch, or another game is still counted
   immediately, but its latest total waits until Big Box or the guard screen is
-  safely visible. The guard never creates a ring-count window over a running
-  emulator.
+  safely visible. If a game starts while a small notice is already visible,
+  the notice and its sound are removed immediately. The guard never leaves a
+  ring-count window over a running emulator.
 - When the Robotnik screen is active, one ring hides the takeover and gives a
   one-game Ring Power burst. The Ring Power banner remains visible until the
   next joystick button press, or is removed automatically as soon as an
   emulator takes the foreground; rings inserted during that game are counted
   but never extend the burst.
 - In Normal Mode, the same burst is available when all seven emeralds are
-  missing. After the permitted game returns to Big Box, the Robotnik lock
-  screen is restored in either mode while any emeralds are still absent. In
-  Normal Mode it closes immediately once all seven are returned.
+  missing. After the permitted game returns to Big Box, Story Mode restores
+  Robotnik while any emeralds are still absent; Normal Mode restores the lock
+  only if all seven remain absent. Returning even one emerald ends Normal
+  Mode's zero-energy lock and any unused Ring Power pass.
 - The burst remains available while the menu is idle. It becomes consumed after
   an emulator has actually become foreground and Big Box has safely returned;
   even a very brief game launch is treated as using the burst. A launch that
   never reaches an emulator remains available for another attempt.
   The Robotnik screen is then restored if emeralds are still missing.
-- At the first total of 50 rings, the non-blocking message `50 RINGS!` and
-  `Find Alex for your prize!` is shown for at least 10 seconds when Big Box is
+- At the first total of 50 rings, the non-blocking message `50 Rings!` and
+  `You've earned a Medallion!` is shown for at least 10 seconds when Big Box is
   safely visible. If a game is active at that moment, the message remains
-  pending and is shown the next time Big Box returns. If its ten-second display
-  is interrupted by a game, mode switch, emerald event, or shutdown, it is
-  re-queued instead of being marked delivered. That pending prize message is
+  pending and is shown the next time Big Box returns. Sensor and mode changes
+  wait behind its ten-second priority interval. If a game interrupts the
+  display, the card and act-clear sound are removed, and the full announcement
+  is re-queued instead of being marked delivered. Its pending state is
   persisted, so closing or restarting the guard cannot lose it.
 
 ## LED energy meter
@@ -115,7 +117,7 @@ No hardware changes are required for this version.
 
 Power every KY-003 from `3V3`, share ground, and leave `D0` and `D9` unconnected. The sketch is configured for the existing common-anode LED. Use a separate resistor on each connected color leg; 330 ohms is the safer default and 220 ohms is brighter.
 
-Upload `magnet_test\magnet_test.ino` with Arduino IDE set to `XIAO_ESP32C3` and **Tools > USB CDC On Boot > Enabled**.
+Upload `ChaosHeistController\ChaosHeistController.ino` with Arduino IDE set to `XIAO_ESP32C3` and **Tools > USB CDC On Boot > Enabled**.
 
 ## Fail-open behavior
 
@@ -133,9 +135,13 @@ does not disable healthy emerald monitoring, and a failed ring-input worker is
 automatically restarted with bounded backoff. If the core serial worker itself
 stops, reactivation is blocked with a visible restart-app message instead of
 waiting forever for sensor data that cannot arrive. Mode selection waits for
-any previous input/audio cleanup to finish before reactivating.
+any previous input/audio cleanup to finish before reactivating. If a serial
+port remains open but no valid controller message arrives after activation,
+the guard disables itself after a 15-second startup grace period.
 
-Only one guard instance can run at a time.
+Only one guard instance can run at a time. ChaosHeist also holds the former
+MagnetArcadeGuard lock, so an old executable accidentally left in Windows
+Startup cannot run beside the production app.
 
 ## Operator controls
 
@@ -158,13 +164,13 @@ The panel is an ordinary resizable/minimizable Windows window. Big Box and the t
 
 Status files are written to:
 
-- `%LOCALAPPDATA%\MagnetArcadeGuard\guard-status.txt`
-- `%LOCALAPPDATA%\MagnetArcadeGuard\guard-events.log`
-- `%LOCALAPPDATA%\MagnetArcadeGuard\ring-counter.json`
+- `%LOCALAPPDATA%\ChaosHeist\chaos-heist-status.txt`
+- `%LOCALAPPDATA%\ChaosHeist\chaos-heist-events.log`
+- `%LOCALAPPDATA%\ChaosHeist\ring-counter.json`
 
 ## Configuration
 
-Keep `guard-config.json` beside `MagnetArcadeGuardRings.exe`.
+Keep `chaos-heist-config.json` beside `ChaosHeist.exe`. A legacy `guard-config.json` is still accepted when the new filename is absent, so an older arcade-PC configuration can be migrated safely. The active filename is recorded in the event log. A malformed new config never falls through to an older legacy config: the guard stays disabled/fail-open, ring counting continues, and the error is shown in the panel. Unknown setting names are reported as warnings so spelling mistakes are visible.
 
 - `default_mode`: `story` or `normal`.
 - `total_emeralds`: must remain `7`; a different value disables the guard because the installed firmware and sensor assembly are fixed at seven inputs.
@@ -184,44 +190,57 @@ Keep `guard-config.json` beside `MagnetArcadeGuardRings.exe`.
 - `music_volume` and `sound_effect_volume`: values from `0.0` to `1.0`.
 - `removal_sound_files`: list of partial-theft sounds; the guard randomly chooses without repeating the previous clip.
 - `last_emerald_removal_sound_file`: dedicated sound for the seventh and final theft.
-- `power_loss_lights_sound_file`, `power_loss_buzz_fades_sound_file`, `power_loss_buzz_dies_sound_file`, and `power_loss_tv_off_sound_file`: optional staged sounds for the final Story Mode power failure. Their built-in timing is 2.347, 3.968, 2.005, and 2.051 seconds respectively.
+- `power_loss_lights_sound_file`, `power_loss_buzz_fades_sound_file`, `power_loss_buzz_dies_sound_file`, and `power_loss_tv_off_sound_file`: required staged sounds for the final Story Mode power failure. Their built-in timing is 2.347, 3.968, 2.005, and 2.051 seconds respectively.
 - `final_completion_sound_file`: sound played after the victory music and Super Sonic animation.
+- `act_clear_sound_file`: exact 50-ring prize sound filename; the production media set uses `16-act-clear.mp3`.
 - `ring_joystick_button`: human-numbered joystick button used for rings; default `10`.
 - `ring_debounce_ms`: short anti-bounce interval; default `90` ms.
 - `ring_game_commit_seconds`: how long an emulator must remain active before one Ring Power use is committed; default `3.0` seconds. Returning to Big Box restores the Robotnik screen if it granted the burst.
-- `ring_announcement_seconds`: how long ordinary ring-count messages remain visible; default `5.0`.
+- `ring_announcement_seconds`: how long ordinary ring-count messages remain visible; default `3.0`.
 - `ring_milestone_announcement_seconds`: how long the 50-ring prize message must remain visible before it is acknowledged; minimum and default `10.0`.
 - `cinematic_max_fps`: maximum cinematic display rate; default `15` to keep audio and video synchronized on the arcade PC.
 
-Other GIF, MP3, and MP4 files beside the EXE also override their bundled copies when their configured filenames match.
+Other GIF, MP3, and MP4 files beside the EXE also override their bundled copies when their configured filenames match. The configured cinematic, shutdown sequence, ring, prize, emerald, victory, Robotnik, and removal assets are mandatory for a production build; the build stops with the exact missing filenames instead of silently producing an incomplete EXE.
 
-## Build this separate version
+## Build ChaosHeist
 
 From PowerShell on the development computer:
 
 ```powershell
-Set-Location "C:\Users\Projector\Documents\RFIDlock\RingEnabledVersion"
-.\build_story_guard.cmd
+Set-Location "C:\Users\Projector\Documents\RFIDlock\ChaosHeist"
+.\build_chaos_heist.cmd
 ```
 
 To install or refresh the pinned build dependencies first:
 
 ```powershell
-.\build_story_guard.cmd -InstallDependencies
+.\build_chaos_heist.cmd -InstallDependencies
 ```
+
+The production build uses 64-bit Python 3.14 and the exact versions in
+`requirements.txt`. The script verifies every pin, runs `pip check`, compiles
+the source, runs the complete unit suite, builds the EXE, and then runs the
+packaged `--self-test` to verify bundled imports, Tk, configuration, and media.
 
 The portable files are created only at:
 
-- `dist-ring-enabled\MagnetArcadeGuardRings.exe`
-- `dist-ring-enabled\guard-config.json`
-- `dist-ring-enabled\MagnetArcadeGuardRings-test.zip` (EXE, config, firmware, version note, and this guide)
+- `dist-chaos-heist\ChaosHeist.exe`
+- `dist-chaos-heist\chaos-heist-config.json`
+- `dist-chaos-heist\ChaosHeist-1.0.0-windows-x64.zip`
+- `dist-chaos-heist\ChaosHeist-1.0.0-windows-x64.zip.sha256`
+- `dist-chaos-heist\ChaosHeist-production.zip` (a convenient copy of the tested versioned archive)
 
 The arcade PC does not need Python installed.
 
-## Revert to the stable version
+Before replacing the arcade copy, close any old MagnetArcadeGuard process and
+remove its old Windows Startup shortcut. Extract the production ZIP into a new
+`ChaosHeist` folder, keep the config beside the EXE, and start only
+`ChaosHeist.exe`. The included `SHA256SUMS.txt` verifies the files inside the
+archive; the adjacent `.sha256` verifies the complete versioned ZIP.
 
-1. Close `MagnetArcadeGuardRings.exe`.
-2. Run `MagnetArcadeGuard.exe` from `versions\stable-pre-story-mode` instead.
-3. If the stable firmware is also desired, upload `versions\stable-pre-story-mode\magnet_test.ino`.
+## Archived versions
 
-The separate names allow both versions to remain on the arcade PC without replacing each other.
+The legacy root build, separate Story Mode build, stable pre-Story snapshot,
+and previous Ring Enabled build artifacts are retained under
+`C:\Users\Projector\Documents\RFIDlock\Archive\2026-08-25-pre-ChaosHeist`.
+The Git repository also keeps the historical branches and commits.

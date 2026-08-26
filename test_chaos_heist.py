@@ -7,13 +7,13 @@ import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 
-import magnet_arcade_guard as guard_module
+import chaos_heist as guard_module
 
 
 class GuardLogicTests(unittest.TestCase):
     def make_guard(self):
-        return guard_module.MagnetArcadeGuard.__new__(
-            guard_module.MagnetArcadeGuard
+        return guard_module.ChaosHeistApp.__new__(
+            guard_module.ChaosHeistApp
         )
 
     def test_config_boolean_understands_string_false(self):
@@ -33,6 +33,67 @@ class GuardLogicTests(unittest.TestCase):
             guard_module.config_number("invalid", 100, 25, 1000),
             100,
         )
+        self.assertEqual(
+            guard_module.config_number(float("nan"), 100, 25, 1000),
+            100,
+        )
+
+    def test_new_config_takes_precedence_over_legacy_config(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_directory = Path(temporary_directory)
+            (config_directory / guard_module.CONFIG_FILENAME).write_text(
+                '{"default_mode": "normal"}\n',
+                encoding="utf-8",
+            )
+            (config_directory / guard_module.LEGACY_CONFIG_FILENAME).write_text(
+                '{"default_mode": "story", "auto_activate": true}\n',
+                encoding="utf-8",
+            )
+
+            config, active_path, errors, warnings = (
+                guard_module.load_runtime_config_details(config_directory)
+            )
+
+            self.assertEqual(config["default_mode"], "normal")
+            self.assertFalse(config["auto_activate"])
+            self.assertEqual(active_path.name, guard_module.CONFIG_FILENAME)
+            self.assertEqual(errors, [])
+            self.assertEqual(warnings, [])
+
+    def test_malformed_new_config_does_not_fall_back_to_legacy(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_directory = Path(temporary_directory)
+            (config_directory / guard_module.CONFIG_FILENAME).write_text(
+                "{not json",
+                encoding="utf-8",
+            )
+            (config_directory / guard_module.LEGACY_CONFIG_FILENAME).write_text(
+                '{"auto_activate": true}\n',
+                encoding="utf-8",
+            )
+
+            config, active_path, errors, _warnings = (
+                guard_module.load_runtime_config_details(config_directory)
+            )
+
+            self.assertFalse(config["auto_activate"])
+            self.assertEqual(active_path.name, guard_module.CONFIG_FILENAME)
+            self.assertIn("could not be read", errors[0])
+
+    def test_unknown_config_setting_is_reported(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_directory = Path(temporary_directory)
+            (config_directory / guard_module.CONFIG_FILENAME).write_text(
+                '{"totla_emeralds": 7}\n',
+                encoding="utf-8",
+            )
+
+            _config, _active_path, errors, warnings = (
+                guard_module.load_runtime_config_details(config_directory)
+            )
+
+            self.assertEqual(errors, [])
+            self.assertIn("totla_emeralds", warnings[0])
 
     def test_emulator_process_names_are_normalized_and_configurable(self):
         self.assertEqual(
@@ -75,6 +136,23 @@ class GuardLogicTests(unittest.TestCase):
     def test_ring_button_number_maps_to_windows_button_mask(self):
         self.assertEqual(guard_module.joystick_button_mask(10), 1 << 9)
         self.assertEqual(guard_module.joystick_button_mask(1), 1)
+
+    def test_ring_debounce_suppresses_cross_encoder_duplicate(self):
+        now = 10.0
+        self.assertFalse(
+            guard_module.ring_press_is_accepted(
+                now,
+                0.0,
+                now - guard_module.RING_DEBOUNCE_SECONDS / 2,
+            )
+        )
+        self.assertTrue(
+            guard_module.ring_press_is_accepted(
+                now,
+                0.0,
+                now - guard_module.RING_DEBOUNCE_SECONDS * 2,
+            )
+        )
 
     def test_joystick_direction_counts_as_a_dismiss_input(self):
         centered = MagicMock(
@@ -541,6 +619,107 @@ class GuardLogicTests(unittest.TestCase):
                 {"total_rings": 49.5, "milestones_shown": []}
             )
 
+    def test_ring_state_rejects_unknown_future_version(self):
+        with self.assertRaisesRegex(ValueError, "unsupported ring state"):
+            guard_module.parse_ring_state_payload(
+                {
+                    "version": guard_module.RING_STATE_VERSION + 1,
+                    "total_rings": 50,
+                    "milestones_shown": [],
+                }
+            )
+
+    def test_legacy_ring_state_migrates_once_as_a_consistent_pair(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            legacy_directory = base / "legacy"
+            target_directory = base / "new"
+            legacy_directory.mkdir()
+            (legacy_directory / "ring-counter.json").write_text(
+                json.dumps(
+                    {
+                        "version": guard_module.RING_STATE_VERSION,
+                        "total_rings": 42,
+                        "milestones_shown": [],
+                        "milestones_pending": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                guard_module,
+                "local_app_data_directory",
+                return_value=legacy_directory,
+            ):
+                message = guard_module.migrate_legacy_persistent_state(
+                    target_directory
+                )
+
+                self.assertIn("Migrated", message)
+                primary = json.loads(
+                    (target_directory / "ring-counter.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                backup = json.loads(
+                    (target_directory / "ring-counter.backup.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(primary, backup)
+                self.assertEqual(primary["total_rings"], 42)
+
+                primary["total_rings"] = 0
+                guard_module.write_json_atomic(
+                    target_directory / "ring-counter.json",
+                    primary,
+                )
+                (target_directory / "ring-counter.backup.json").unlink()
+                second_message = (
+                    guard_module.migrate_legacy_persistent_state(
+                        target_directory
+                    )
+                )
+
+            self.assertEqual(second_message, "")
+            retained = json.loads(
+                (target_directory / "ring-counter.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(retained["total_rings"], 0)
+            self.assertFalse(
+                (target_directory / "ring-counter.backup.json").exists()
+            )
+
+    def test_ring_backup_keeps_previous_valid_generation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_directory = Path(temporary_directory)
+            guard = self.make_guard()
+            guard.ring_counter_path = state_directory / "ring-counter.json"
+            guard.ring_counter_backup_path = (
+                state_directory / "ring-counter.backup.json"
+            )
+            guard.ring_milestones_shown = set()
+            guard.ring_milestones_pending = set()
+            guard.ring_state_warning = ""
+            guard.write_status = lambda *args, **kwargs: None
+
+            guard.ring_count = 1
+            guard.save_ring_state()
+            guard.ring_count = 2
+            guard.save_ring_state()
+
+            primary = json.loads(
+                guard.ring_counter_path.read_text(encoding="utf-8")
+            )
+            backup = json.loads(
+                guard.ring_counter_backup_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(primary["total_rings"], 2)
+            self.assertEqual(backup["total_rings"], 1)
+
     def test_corrupt_primary_ring_state_recovers_from_backup(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_directory = Path(temporary_directory)
@@ -755,6 +934,25 @@ class GuardLogicTests(unittest.TestCase):
         self.assertFalse(guard.normal_ring_lock_active)
         self.assertIsNone(guard.pending_overlay_missing)
 
+    def test_normal_ring_burst_ends_when_any_energy_returns_at_big_box(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_game_seen = False
+        guard.ring_burst_game_seen_since = 0.0
+        guard.ring_burst_origin = "normal_all_missing"
+        guard.guard_active = True
+        guard.guard_mode = "normal"
+        guard.accepted_count = 1
+        guard.foreground_process_name = guard_module.BIG_BOX_PROCESS_NAME
+        guard.overlay_gate_state = "BIGBOX_READY"
+        guard.update_overlay_gate = lambda: True
+        consumed = []
+        guard.consume_ring_burst_on_return = lambda: consumed.append(True)
+
+        guard.handle_ring_burst_foreground()
+
+        self.assertEqual(consumed, [True])
+
     def test_normal_ring_lock_releases_immediately_when_all_are_returned(self):
         guard = self.make_guard()
         guard.ring_burst_active = False
@@ -770,6 +968,53 @@ class GuardLogicTests(unittest.TestCase):
         self.assertFalse(guard.normal_ring_lock_active)
         self.assertIsNone(guard.pending_overlay_missing)
         self.assertEqual(events, ["hide", "sound"])
+
+    def test_power_loss_fails_open_if_big_box_cannot_be_paused(self):
+        guard = self.make_guard()
+        guard.overlay_visible = False
+        guard.hide_story_announcement = lambda: None
+        guard.capture_return_window = lambda: None
+        guard.prepare_overlay_monitor = lambda: None
+        guard.suspend_return_process = lambda: False
+        faults = []
+        guard.fault_disable_guard = faults.append
+
+        self.assertFalse(guard.show_power_loss_takeover())
+        self.assertEqual(faults, ["Could not safely pause Big Box"])
+
+    def test_power_loss_fails_open_if_big_box_audio_cannot_be_muted(self):
+        guard = self.make_guard()
+        guard.overlay_visible = True
+        guard.hide_story_announcement = lambda: None
+        guard.mute_other_audio = lambda: False
+        faults = []
+        guard.fault_disable_guard = faults.append
+
+        self.assertFalse(guard.show_power_loss_takeover())
+        self.assertEqual(faults, ["Could not mute background audio"])
+
+    def test_topmost_watchdog_keeps_black_root_hidden_during_power_loss(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.overlay_visible = True
+        guard.overlay_kind = "story_power_loss"
+        guard.root = MagicMock()
+
+        guard.keep_window_on_top()
+
+        guard.root.withdraw.assert_called_once_with()
+        guard.root.overrideredirect.assert_not_called()
+        guard.root.after.assert_called_once_with(500, guard.keep_window_on_top)
+
+    def test_stale_takeover_callbacks_do_nothing_after_guard_is_disabled(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.guard_active = False
+
+        self.assertFalse(
+            guard.show_text_takeover("TITLE", "MESSAGE", "story_shutdown")
+        )
+        self.assertIsNone(guard.show_missing_overlay(7))
 
     def test_emulator_foreground_always_hides_ring_power_banner(self):
         guard = self.make_guard()
@@ -832,6 +1077,37 @@ class GuardLogicTests(unittest.TestCase):
             guard_module.RING_MILESTONE,
             guard.ring_milestones_shown,
         )
+
+    def test_emulator_transition_requeues_and_hides_active_milestone(self):
+        guard = self.make_guard()
+        guard.active_ring_announcement_kind = "milestone"
+        guard.pending_ring_milestone = False
+        guard.pending_ring_announcement = None
+        guard.ring_milestones_pending = set()
+        guard.ring_milestones_shown = set()
+        guard.ring_power_announcement_visible = False
+        guard.announcement_after_id = "timer"
+        guard.root = MagicMock()
+        guard.announcement_window = MagicMock()
+        guard.hide_announcement_flash = MagicMock()
+        guard.set_announcement_energy_meter = MagicMock()
+        guard.stop_event_sound = MagicMock()
+        guard.save_ring_state = MagicMock()
+        guard.write_status = MagicMock()
+
+        guard.defer_announcement_for_emulator()
+
+        self.assertIsNone(guard.active_ring_announcement_kind)
+        self.assertTrue(guard.pending_ring_milestone)
+        self.assertEqual(guard.pending_ring_announcement, "milestone")
+        self.assertIn(
+            guard_module.RING_MILESTONE,
+            guard.ring_milestones_pending,
+        )
+        guard.root.after_cancel.assert_called_once_with("timer")
+        guard.announcement_window.withdraw.assert_called_once_with()
+        guard.stop_event_sound.assert_called_once_with()
+        guard.save_ring_state.assert_called_once_with()
 
     def test_noncritical_ring_worker_failure_does_not_become_guard_fault(self):
         guard = self.make_guard()
@@ -1195,6 +1471,54 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(guard.last_valid_message, 10.0)
         self.assertEqual(guard.last_serial_message_at, 10.0)
 
+    def test_silent_controller_times_out_after_activation(self):
+        guard = self.make_guard()
+        guard.running = False
+        guard.guard_active = True
+        guard.reader_connected = False
+        guard.activation_started_at = 100.0
+        reasons = []
+        guard.handle_disconnect = reasons.append
+
+        with patch.object(
+            time,
+            "monotonic",
+            return_value=(
+                100.0
+                + guard_module.INITIAL_CONNECTION_TIMEOUT_SECONDS
+                + 0.1
+            ),
+        ):
+            guard.connection_watchdog()
+
+        self.assertEqual(
+            reasons,
+            ["ESP32 did not respond after guard activation"],
+        )
+
+    def test_controller_startup_grace_period_does_not_disable_early(self):
+        guard = self.make_guard()
+        guard.running = False
+        guard.guard_active = True
+        guard.reader_connected = False
+        guard.activation_started_at = 100.0
+        guard.handle_disconnect = self.fail
+
+        with patch.object(time, "monotonic", return_value=101.0):
+            guard.connection_watchdog()
+
+    def test_ready_message_clears_controller_startup_deadline(self):
+        guard = self.make_guard()
+        guard.guard_active = True
+        guard.reader_connected = False
+        guard.controller_lost = True
+        guard.activation_started_at = 100.0
+
+        with patch.object(time, "monotonic", return_value=101.0):
+            guard.handle_serial_message("MAGNET_LOCK:READY")
+
+        self.assertEqual(guard.activation_started_at, 0.0)
+
     def test_invalid_sensor_count_configuration_blocks_activation(self):
         guard = self.make_guard()
         guard.guard_mode = "normal"
@@ -1361,6 +1685,7 @@ class GuardLogicTests(unittest.TestCase):
         guard.show_normal_warning = (
             lambda previous, current: warnings.append((previous, current))
         )
+        guard.show_normal_restored_announcement = lambda count: True
         guard.play_emerald_sound = lambda: returns.append(True)
 
         guard.handle_normal_count_change(4, 5)
@@ -1376,6 +1701,7 @@ class GuardLogicTests(unittest.TestCase):
         finished = []
         returns = []
         guard.finish_normal_warning = lambda: finished.append(True)
+        guard.show_normal_restored_announcement = lambda count: True
         guard.play_emerald_sound = lambda: returns.append(True)
 
         guard.handle_normal_count_change(3, 4)
@@ -1468,6 +1794,20 @@ class GuardLogicTests(unittest.TestCase):
             ],
         )
 
+    def test_normal_return_sound_waits_for_a_safe_menu_announcement(self):
+        guard = self.make_guard()
+        guard.overlay_kind = None
+        guard.normal_warning_trigger_count = None
+        guard.normal_ring_lock_active = False
+        guard.ring_burst_active = False
+        guard.defer_count_change_for_milestone = lambda *args: False
+        guard.show_normal_restored_announcement = lambda count: False
+        guard.play_emerald_sound = MagicMock()
+
+        guard.handle_normal_count_change(3, 4)
+
+        guard.play_emerald_sound.assert_not_called()
+
     def test_energy_meter_text_shows_master_energy_and_progress(self):
         guard = self.make_guard()
 
@@ -1542,23 +1882,36 @@ class GuardLogicTests(unittest.TestCase):
 
     def test_single_instance_mutex_rejects_second_copy(self):
         guard_module.configure_windows_runtime()
-        first_handle, first_allowed = (
+        first_handles, first_allowed = (
             guard_module.acquire_single_instance_mutex()
         )
-        second_handle, second_allowed = (
+        second_handles, second_allowed = (
             guard_module.acquire_single_instance_mutex()
         )
         try:
-            self.assertTrue(first_handle)
+            self.assertEqual(len(first_handles), 2)
             self.assertTrue(first_allowed)
-            self.assertTrue(second_handle)
+            self.assertEqual(second_handles, ())
             self.assertFalse(second_allowed)
         finally:
-            kernel32 = guard_module.ctypes.windll.kernel32
-            if second_handle:
-                kernel32.CloseHandle(second_handle)
-            if first_handle:
-                kernel32.CloseHandle(first_handle)
+            guard_module.release_mutex_handles(second_handles)
+            guard_module.release_mutex_handles(first_handles)
+
+    def test_legacy_guard_mutex_blocks_chaos_heist(self):
+        guard_module.configure_windows_runtime()
+        kernel32 = guard_module.ctypes.windll.kernel32
+        legacy_handle = kernel32.CreateMutexW(
+            None,
+            False,
+            guard_module.SINGLE_INSTANCE_MUTEX_NAMES[0],
+        )
+        try:
+            handles, allowed = guard_module.acquire_single_instance_mutex()
+            self.assertEqual(handles, ())
+            self.assertFalse(allowed)
+        finally:
+            if legacy_handle:
+                kernel32.CloseHandle(legacy_handle)
 
 
 if __name__ == "__main__":

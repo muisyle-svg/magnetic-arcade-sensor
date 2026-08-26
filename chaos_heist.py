@@ -1,5 +1,6 @@
 import ctypes
 import json
+import math
 import os
 import queue
 import random
@@ -13,9 +14,23 @@ from pathlib import Path
 from typing import Optional
 
 
+APP_NAME = "ChaosHeist"
+APP_DISPLAY_NAME = "Chaos Heist"
+APP_VERSION = "1.0.0"
+APP_DATA_DIRECTORY_NAME = "ChaosHeist"
+LEGACY_APP_DATA_DIRECTORY_NAME = "MagnetArcadeGuard"
+CONFIG_FILENAME = "chaos-heist-config.json"
+LEGACY_CONFIG_FILENAME = "guard-config.json"
+LEGACY_MIGRATION_MARKER_FILENAME = "legacy-migration-v1.json"
+
+
 def bootstrap_event(message: str) -> None:
     """Record packaged startup stages before the main logger is available."""
-    if os.environ.get("MAGNET_GUARD_BOOT_TRACE") == "1":
+    trace_enabled = (
+        os.environ.get("CHAOS_HEIST_BOOT_TRACE") == "1"
+        or os.environ.get("MAGNET_GUARD_BOOT_TRACE") == "1"
+    )
+    if trace_enabled:
         print(
             f"BOOTSTRAP frozen={getattr(sys, 'frozen', False)!r} "
             f"pid={os.getpid()} {message}",
@@ -32,8 +47,8 @@ def bootstrap_event(message: str) -> None:
         )
         path = (
             local_app_data
-            / "MagnetArcadeGuard"
-            / "guard-bootstrap.log"
+            / APP_DATA_DIRECTORY_NAME
+            / "chaos-heist-bootstrap.log"
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as log_file:
@@ -111,12 +126,23 @@ DEFAULT_CONFIG = {
     "music_volume": 0.75,
     "sound_effect_volume": 1.0,
     "ring_sound_file": "ring.mp3",
-    "act_clear_sound_file": "act-clear.mp3",
+    "act_clear_sound_file": "16-act-clear.mp3",
     "removal_sound_files": [
         "ohh-no-the-chaos-emerald.mp3",
         "ohh-no.mp3",
         "ohh-now-what.mp3",
         "stop.mp3",
+        "you-must-be-kidding.mp3",
+        "you-can-t-get-away-with-this.mp3",
+        "something-horrible-is-happening-amy.mp3",
+        "scream-4-tails.mp3",
+        "problem-tails.mp3",
+        "oh-no-tails.mp3",
+        "oh-no (2)-sonic.mp3",
+        "oh-no (1)-knuckles.mp3",
+        "no-amy.mp3",
+        "hey-amy.mp3",
+        "hey-2-knuckles.mp3",
     ],
     "last_emerald_removal_sound_file": (
         "no-he-s-got-the-last-emerald.mp3"
@@ -148,6 +174,7 @@ DEFAULT_CONFIG = {
     "ring_debounce_ms": 90,
     "ring_game_commit_seconds": 3.0,
     "ring_announcement_seconds": 3.0,
+    "ring_milestone_announcement_seconds": 10.0,
     "emulator_process_names": list(DEFAULT_EMULATOR_PROCESS_NAMES),
     "cinematic_max_fps": 15,
     "cinematic_video_file": (
@@ -163,20 +190,227 @@ def application_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
-def load_runtime_config() -> dict:
-    config = dict(DEFAULT_CONFIG)
-    config_path = application_directory() / "guard-config.json"
+def local_app_data_directory(directory_name: str) -> Path:
+    local_app_data = Path(
+        os.environ.get(
+            "LOCALAPPDATA",
+            str(Path.home() / "AppData" / "Local"),
+        )
+    )
+    return local_app_data / directory_name
+
+
+def write_json_atomic(destination: Path, payload: dict) -> None:
+    """Atomically replace a small JSON state file."""
+    temporary_path = destination.with_name(destination.name + ".tmp")
+    temporary_path.write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(destination)
+
+
+def normalized_ring_state_payload(
+    state: tuple[int, set[int], set[int]],
+) -> dict:
+    total, shown, pending = state
+    return {
+        "version": RING_STATE_VERSION,
+        "total_rings": total,
+        "milestones_shown": sorted(shown),
+        "milestones_pending": sorted(pending),
+    }
+
+
+def migrate_legacy_persistent_state(target_directory: Path) -> str:
+    """Import one validated legacy ring state exactly once."""
+    legacy_directory = local_app_data_directory(
+        LEGACY_APP_DATA_DIRECTORY_NAME
+    )
+    if legacy_directory == target_directory:
+        return ""
+
+    marker_path = target_directory / LEGACY_MIGRATION_MARKER_FILENAME
+    if marker_path.is_file():
+        return ""
+
     try:
-        loaded = json.loads(config_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            config.update(loaded)
-    except (FileNotFoundError, OSError, ValueError, TypeError):
-        pass
-    return config
+        target_directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        return f"Could not create ChaosHeist data directory: {error}"
+
+    target_primary = target_directory / "ring-counter.json"
+    target_backup = target_directory / "ring-counter.backup.json"
+    migration_result = "no legacy ring state found"
+
+    # Any new-format state wins. This prevents a deleted backup or an
+    # operator reset from resurrecting an obsolete legacy count later.
+    if target_primary.exists() or target_backup.exists():
+        migration_result = "existing ChaosHeist ring state retained"
+    elif legacy_directory.is_dir():
+        legacy_state = None
+        legacy_source = None
+        for filename in ("ring-counter.json", "ring-counter.backup.json"):
+            legacy_path = legacy_directory / filename
+            if not legacy_path.is_file():
+                continue
+            try:
+                loaded = json.loads(legacy_path.read_text(encoding="utf-8"))
+                legacy_state = parse_ring_state_payload(loaded)
+                legacy_source = filename
+                break
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+
+        if legacy_state is None:
+            migration_result = "legacy ring state was unreadable"
+        else:
+            payload = normalized_ring_state_payload(legacy_state)
+            try:
+                write_json_atomic(target_primary, payload)
+                write_json_atomic(target_backup, payload)
+            except OSError as error:
+                return "Legacy ring-state migration failed: " + str(error)
+            migration_result = f"migrated from {legacy_source}"
+
+    marker_payload = {
+        "version": 1,
+        "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "result": migration_result,
+    }
+    try:
+        write_json_atomic(marker_path, marker_payload)
+    except OSError as error:
+        return "Legacy ring-state migration marker failed: " + str(error)
+
+    if migration_result.startswith("migrated"):
+        return "Migrated legacy ring state to ChaosHeist."
+    if migration_result == "legacy ring state was unreadable":
+        return (
+            "Legacy ring state was unreadable; ChaosHeist started with its "
+            "own ring state."
+        )
+    return ""
 
 
-RUNTIME_CONFIG = load_runtime_config()
-CONFIG_VALIDATION_ERRORS = []
+def load_runtime_config_details(
+    config_directory: Optional[Path] = None,
+) -> tuple[dict, Optional[Path], list[str], list[str]]:
+    """Load one config file and retain actionable diagnostics."""
+    config = dict(DEFAULT_CONFIG)
+    directory = config_directory or application_directory()
+    errors = []
+    warnings = []
+    active_path = None
+
+    for config_name in (CONFIG_FILENAME, LEGACY_CONFIG_FILENAME):
+        config_path = directory / config_name
+        if not config_path.exists():
+            continue
+        active_path = config_path
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as error:
+            errors.append(
+                f"{config_name} could not be read: "
+                + str(error).replace("\n", " ")[:160]
+            )
+            break
+        if not isinstance(loaded, dict):
+            errors.append(f"{config_name} must contain a JSON object")
+            break
+
+        unknown_keys = sorted(set(loaded) - set(DEFAULT_CONFIG))
+        if unknown_keys:
+            warnings.append(
+                f"{config_name} has unknown settings: "
+                + ", ".join(unknown_keys)
+            )
+        config.update(loaded)
+        if config_name == LEGACY_CONFIG_FILENAME:
+            warnings.append(
+                f"Using legacy {LEGACY_CONFIG_FILENAME}; rename it to "
+                f"{CONFIG_FILENAME}."
+            )
+        break
+
+    return config, active_path, errors, warnings
+
+
+def load_runtime_config() -> dict:
+    return load_runtime_config_details()[0]
+
+
+(
+    RUNTIME_CONFIG,
+    ACTIVE_CONFIG_PATH,
+    CONFIG_LOAD_ERRORS,
+    CONFIG_WARNINGS,
+) = load_runtime_config_details()
+CONFIG_VALIDATION_ERRORS = list(CONFIG_LOAD_ERRORS)
+
+
+def validate_runtime_config_shape(config: dict) -> tuple[list[str], list[str]]:
+    """Catch unsafe types while leaving harmless tuning values fail-soft."""
+    errors = []
+    warnings = []
+    required_filename_keys = (
+        "ring_sound_file",
+        "act_clear_sound_file",
+        "last_emerald_removal_sound_file",
+        "story_shutdown_sound_file",
+        "power_loss_lights_sound_file",
+        "power_loss_buzz_fades_sound_file",
+        "power_loss_buzz_dies_sound_file",
+        "power_loss_tv_off_sound_file",
+        "final_completion_sound_file",
+        "cinematic_video_file",
+    )
+    for key in required_filename_keys:
+        value = config.get(key)
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or Path(value.strip()).name != value.strip()
+        ):
+            errors.append(f"{key} must be a non-empty filename")
+
+    removal_files = config.get("removal_sound_files")
+    if (
+        not isinstance(removal_files, list)
+        or not removal_files
+        or any(
+            not isinstance(value, str) or not value.strip()
+            or Path(value.strip()).name != value.strip()
+            for value in removal_files
+        )
+    ):
+        errors.append(
+            "removal_sound_files must be a non-empty list of filenames"
+        )
+
+    default_mode_value = config.get("default_mode")
+    if (
+        not isinstance(default_mode_value, str)
+        or default_mode_value.strip().lower() not in {"story", "normal"}
+    ):
+        warnings.append("default_mode is invalid; using story")
+    if not isinstance(config.get("auto_activate"), (bool, str, int, float)):
+        warnings.append("auto_activate is invalid; using false")
+    if not isinstance(config.get("serial_port"), str):
+        warnings.append("serial_port is invalid; using automatic detection")
+    if not isinstance(config.get("emulator_process_names"), list):
+        warnings.append(
+            "emulator_process_names is invalid; using built-in emulator names"
+        )
+    return errors, warnings
+
+
+CONFIG_SHAPE_ERRORS, CONFIG_SHAPE_WARNINGS = (
+    validate_runtime_config_shape(RUNTIME_CONFIG)
+)
+CONFIG_VALIDATION_ERRORS.extend(CONFIG_SHAPE_ERRORS)
+CONFIG_WARNINGS.extend(CONFIG_SHAPE_WARNINGS)
 try:
     configured_total_value = RUNTIME_CONFIG["total_emeralds"]
     if isinstance(configured_total_value, bool):
@@ -222,6 +456,8 @@ def config_number(
         number = float(value)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(number):
+        return default
     return max(minimum, min(maximum, number))
 
 
@@ -261,12 +497,27 @@ def joystick_direction_active(joystick_state) -> bool:
     return axis_moved or pov_active
 
 
+def ring_press_is_accepted(
+    now: float,
+    device_last_press_at: float,
+    global_last_press_at: float,
+) -> bool:
+    """Debounce switch chatter and duplicate reports across encoders."""
+    return (
+        now - device_last_press_at >= RING_DEBOUNCE_SECONDS
+        and now - global_last_press_at >= RING_DEBOUNCE_SECONDS
+    )
+
+
 AUTO_ACTIVATE = config_boolean(
     RUNTIME_CONFIG.get("auto_activate", False),
 )
-PREFERRED_SERIAL_PORT = str(
-    RUNTIME_CONFIG.get("serial_port", "")
-).strip()
+configured_serial_port = RUNTIME_CONFIG.get("serial_port", "")
+PREFERRED_SERIAL_PORT = (
+    configured_serial_port.strip()
+    if isinstance(configured_serial_port, str)
+    else ""
+)
 
 # The display overlay is intentionally limited to the Big Box frontend. A
 # MAME/GroovyMAME or RetroArch fullscreen surface can own the display mode,
@@ -282,6 +533,7 @@ BAUD_RATE = 115200
 # declaring a healthy ESP32 disconnected. Only validated READY/COUNT messages
 # refresh it; malformed protocol-like traffic must not defeat fail-open.
 CONNECTION_TIMEOUT_SECONDS = 5.0
+INITIAL_CONNECTION_TIMEOUT_SECONDS = 15.0
 RECONNECT_DELAY_SECONDS = 1.0
 STABLE_COUNT_SECONDS = config_number(
     RUNTIME_CONFIG.get("sensor_stable_ms", 60),
@@ -464,6 +716,18 @@ def parse_ring_state_payload(payload) -> tuple[int, set[int], set[int]]:
     if not isinstance(payload, dict):
         raise ValueError("ring state must be a JSON object")
 
+    version_value = payload.get("version", 1)
+    if isinstance(version_value, bool):
+        raise ValueError("ring state version must be an integer")
+    if isinstance(version_value, float) and not version_value.is_integer():
+        raise ValueError("ring state version must be an integer")
+    try:
+        version = int(version_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("ring state version must be an integer") from error
+    if version not in {1, RING_STATE_VERSION}:
+        raise ValueError(f"unsupported ring state version: {version}")
+
     total_value = payload.get("total_rings", 0)
     if isinstance(total_value, bool):
         raise ValueError("total_rings must be a non-negative integer")
@@ -516,8 +780,8 @@ RING_AUDIO_NAME = str(
     RUNTIME_CONFIG.get("ring_sound_file", "ring.mp3")
 ).strip() or "ring.mp3"
 ACT_CLEAR_AUDIO_NAME = str(
-    RUNTIME_CONFIG.get("act_clear_sound_file", "act-clear.mp3")
-).strip() or "act-clear.mp3"
+    RUNTIME_CONFIG.get("act_clear_sound_file", "16-act-clear.mp3")
+).strip() or "16-act-clear.mp3"
 configured_removal_audio_names = RUNTIME_CONFIG.get(
     "removal_sound_files",
 )
@@ -584,8 +848,11 @@ CINEMATIC_VIDEO_NAME = (
 
 SOURCE_ASSET_DIRECTORY = Path(
     os.environ.get(
-        "MAGNET_GUARD_ASSET_DIR",
-        str(Path(__file__).resolve().parents[2] / "Emerald"),
+        "CHAOS_HEIST_ASSET_DIR",
+        os.environ.get(
+            "MAGNET_GUARD_ASSET_DIR",
+            str(Path(__file__).resolve().parents[2] / "Emerald"),
+        ),
     )
 )
 ORIGINAL_BACKGROUND_IMAGE_PATH = (
@@ -762,7 +1029,14 @@ STILL_ACTIVE = 259
 INFINITE = 0xFFFFFFFF
 ERROR_ALREADY_EXISTS = 183
 CREATE_NO_WINDOW = 0x08000000
-SINGLE_INSTANCE_MUTEX_NAME = "Local\\MagnetArcadeGuard.SingleInstance"
+# Hold both identities during the product rename. This is intentionally not a
+# clean break: an old MagnetArcadeGuard executable left in Windows Startup must
+# never run beside ChaosHeist and compete for serial, joystick, audio, or Big
+# Box control.
+SINGLE_INSTANCE_MUTEX_NAMES = (
+    "Local\\MagnetArcadeGuard.SingleInstance",
+    "Local\\ChaosHeist.SingleInstance",
+)
 JOYERR_NOERROR = 0
 JOY_RETURNX = 0x00000001
 JOY_RETURNY = 0x00000002
@@ -1016,24 +1290,38 @@ def run_resume_watchdog(
             pass
 
 
+def release_mutex_handles(handles) -> None:
+    kernel32 = ctypes.windll.kernel32
+    for handle in tuple(handles or ()):
+        if not handle:
+            continue
+        try:
+            kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def acquire_single_instance_mutex():
     kernel32 = ctypes.windll.kernel32
-    handle = kernel32.CreateMutexW(
-        None,
-        False,
-        SINGLE_INSTANCE_MUTEX_NAME,
-    )
-    if not handle:
-        return None, False
+    handles = []
+    for mutex_name in SINGLE_INSTANCE_MUTEX_NAMES:
+        handle = kernel32.CreateMutexW(None, False, mutex_name)
+        if not handle:
+            release_mutex_handles(handles)
+            return None, False
+        already_running = kernel32.GetLastError() == ERROR_ALREADY_EXISTS
+        if already_running:
+            kernel32.CloseHandle(handle)
+            release_mutex_handles(handles)
+            return (), False
+        handles.append(handle)
+    return tuple(handles), True
 
-    already_running = kernel32.GetLastError() == ERROR_ALREADY_EXISTS
-    return handle, not already_running
 
-
-class MagnetArcadeGuard:
-    def __init__(self, instance_mutex_handle=None) -> None:
+class ChaosHeistApp:
+    def __init__(self, instance_mutex_handles=()) -> None:
         bootstrap_event("creating Tk root")
-        self.instance_mutex_handle = instance_mutex_handle
+        self.instance_mutex_handles = tuple(instance_mutex_handles or ())
         self.resume_watchdog_process = None
         self.resume_watchdog_cancel_path = None
         self.shutdown_started = False
@@ -1041,7 +1329,7 @@ class MagnetArcadeGuard:
         self.root = tk.Tk()
         bootstrap_event("Tk root created")
         self.root.report_callback_exception = self.handle_tk_exception
-        self.root.title("Magnetic Arcade Guard")
+        self.root.title(APP_DISPLAY_NAME)
         self.root.configure(background="black")
         # Use an explicit borderless window instead of Tk's fullscreen mode.
         # Tk can retain a stale fullscreen size after a game changes display
@@ -1055,7 +1343,7 @@ class MagnetArcadeGuard:
         self.guard_active = False
         self.guard_mode = DEFAULT_GUARD_MODE
         self.activation_generation = 0
-        self.last_fault = ""
+        self.last_fault = "; ".join(CONFIG_VALIDATION_ERRORS)[:160]
         self.overlay_visible = False
         self.overlay_kind: Optional[str] = None
         self.completion_in_progress = False
@@ -1150,6 +1438,10 @@ class MagnetArcadeGuard:
         self.joystick_button_states = {}
         self.joystick_direction_states = {}
         self.ring_last_press_at = {}
+        self.ring_global_last_press_at = 0.0
+        self.ring_persistence_queue = queue.Queue(maxsize=1)
+        self.ring_persistence_stop_event = threading.Event()
+        self.ring_persistence_thread = None
         self.ring_burst_active = False
         self.ring_burst_game_seen = False
         self.ring_burst_game_seen_since = 0.0
@@ -1165,35 +1457,31 @@ class MagnetArcadeGuard:
         self.milestone_deferred_count_change = False
         self.milestone_deferred_previous_count: Optional[int] = None
         self.ring_state_warning = ""
-        self.service_warning = ""
+        self.service_warning = "; ".join(CONFIG_WARNINGS)[:160]
         self.serial_worker_failed = False
         self.pending_guard_activation = False
         self.activation_retry_after_id = None
-        local_app_data = Path(
-            os.environ.get(
-                "LOCALAPPDATA",
-                str(Path.home() / "AppData" / "Local"),
-            )
+        app_data_directory = local_app_data_directory(
+            APP_DATA_DIRECTORY_NAME
         )
+        migration_message = migrate_legacy_persistent_state(
+            app_data_directory
+        )
+        if migration_message:
+            self.service_warning = "; ".join(
+                part
+                for part in (self.service_warning, migration_message)
+                if part
+            )[:160]
         self.status_path = (
-            local_app_data
-            / "MagnetArcadeGuard"
-            / "guard-status.txt"
+            app_data_directory / "chaos-heist-status.txt"
         )
         self.event_log_path = (
-            local_app_data
-            / "MagnetArcadeGuard"
-            / "guard-events.log"
+            app_data_directory / "chaos-heist-events.log"
         )
-        self.ring_counter_path = (
-            local_app_data
-            / "MagnetArcadeGuard"
-            / "ring-counter.json"
-        )
+        self.ring_counter_path = app_data_directory / "ring-counter.json"
         self.ring_counter_backup_path = (
-            local_app_data
-            / "MagnetArcadeGuard"
-            / "ring-counter.backup.json"
+            app_data_directory / "ring-counter.backup.json"
         )
         (
             self.ring_count,
@@ -1213,6 +1501,7 @@ class MagnetArcadeGuard:
         self.last_good_port = PREFERRED_SERIAL_PORT
         self.last_valid_message = 0.0
         self.last_serial_message_at = 0.0
+        self.activation_started_at = 0.0
         self.pending_count: Optional[int] = None
         self.pending_count_since = 0.0
         self.accepted_count: Optional[int] = None
@@ -1518,6 +1807,17 @@ class MagnetArcadeGuard:
         self.messages: queue.Queue[tuple[str, str, int]] = queue.Queue()
         self.create_announcement_window()
 
+        self.ring_persistence_thread = threading.Thread(
+            target=self.worker_entry,
+            args=(
+                "ring persistence",
+                self.ring_persistence_worker,
+                False,
+            ),
+            daemon=True,
+        )
+        self.ring_persistence_thread.start()
+
         if AV_AVAILABLE and self.cinematic_video_path.exists():
             self.cinematic_prepare_state = "preparing"
             self.cinematic_prepare_started_at = time.monotonic()
@@ -1581,6 +1881,16 @@ class MagnetArcadeGuard:
         self.update_control_panel()
         self.root.after(250, self.control_panel_heartbeat)
         self.write_status("RUNNING | DORMANT")
+        self.write_status(
+            "CONFIG LOADED | "
+            + (
+                str(ACTIVE_CONFIG_PATH)
+                if ACTIVE_CONFIG_PATH is not None
+                else "built-in defaults"
+            )
+        )
+        for warning in CONFIG_WARNINGS:
+            self.write_status("CONFIG WARNING | " + warning)
         bootstrap_event("operator panel ready")
 
         if AUTO_ACTIVATE:
@@ -2886,6 +3196,46 @@ class MagnetArcadeGuard:
             except (AttributeError, tk.TclError):
                 pass
 
+    def defer_announcement_for_emulator(self) -> None:
+        """Remove every small topmost window before an emulator takes over."""
+        active_kind = getattr(
+            self,
+            "active_ring_announcement_kind",
+            None,
+        )
+        if active_kind == "milestone":
+            # The prize has not received its guaranteed safe-menu display.
+            # Keep it durable and replay the full announcement after the game.
+            self.pending_ring_milestone = True
+            self.pending_ring_announcement = "milestone"
+            self.ring_milestones_pending.add(RING_MILESTONE)
+            self.save_ring_state()
+
+        self.active_ring_announcement_kind = None
+        self.ring_power_announcement_visible = False
+        if self.announcement_after_id is not None:
+            try:
+                self.root.after_cancel(self.announcement_after_id)
+            except (AttributeError, tk.TclError):
+                pass
+            self.announcement_after_id = None
+        self.hide_announcement_flash()
+        self.set_announcement_energy_meter(0, visible=False)
+        if self.announcement_window:
+            try:
+                self.announcement_window.withdraw()
+            except tk.TclError:
+                pass
+        self.stop_event_sound()
+        suffix = (
+            " | 50-ring prize re-queued"
+            if active_kind == "milestone"
+            else ""
+        )
+        self.write_status(
+            "ANNOUNCEMENT DEFERRED | emulator foreground" + suffix
+        )
+
     # --------------------------------------------------
     # In-overlay cinematic playback
     # --------------------------------------------------
@@ -3341,6 +3691,7 @@ class MagnetArcadeGuard:
         self.joystick_button_states.clear()
         self.joystick_direction_states.clear()
         self.ring_last_press_at.clear()
+        self.ring_global_last_press_at = 0.0
         self.ring_input_thread = threading.Thread(
             target=self.worker_entry,
             args=("ring input", self.ring_input_worker, False),
@@ -3402,7 +3753,36 @@ class MagnetArcadeGuard:
         primary_exists = self.ring_counter_path.exists()
         if primary_exists:
             try:
-                return self.read_ring_state_file(self.ring_counter_path)
+                primary_state = self.read_ring_state_file(
+                    self.ring_counter_path
+                )
+                try:
+                    self.read_ring_state_file(self.ring_counter_backup_path)
+                except (
+                    FileNotFoundError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    if self.ring_counter_backup_path.exists():
+                        self.preserve_corrupt_ring_state(
+                            self.ring_counter_backup_path
+                        )
+                    try:
+                        self.write_ring_state_file(
+                            self.ring_counter_backup_path,
+                            normalized_ring_state_payload(primary_state),
+                        )
+                        self.ring_state_warning = (
+                            "Ring-counter backup was repaired from the "
+                            "valid primary."
+                        )
+                    except OSError:
+                        self.ring_state_warning = (
+                            "Ring-counter backup is unavailable."
+                        )
+                return primary_state
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 preserved = self.preserve_corrupt_ring_state(
                     self.ring_counter_path
@@ -3456,49 +3836,146 @@ class MagnetArcadeGuard:
                     " Backup ring counter was also unreadable."
                 )
 
+        temporary_path = self.ring_counter_path.with_name(
+            self.ring_counter_path.name + ".tmp"
+        )
+        if temporary_path.is_file():
+            try:
+                recovered = self.read_ring_state_file(temporary_path)
+                recovered_payload = normalized_ring_state_payload(recovered)
+                self.write_ring_state_file(
+                    self.ring_counter_path,
+                    recovered_payload,
+                )
+                self.write_ring_state_file(
+                    self.ring_counter_backup_path,
+                    recovered_payload,
+                )
+                temporary_path.unlink(missing_ok=True)
+                self.ring_state_warning += (
+                    " Recovered the interrupted ring-counter save."
+                )
+                return recovered
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                self.preserve_corrupt_ring_state(temporary_path)
+
         if primary_exists or backup_exists:
             self.ring_state_warning += " Ring total started at 0."
         return 0, set(), set()
 
     def write_ring_state_file(self, destination: Path, payload: dict) -> None:
-        temporary_path = destination.with_name(destination.name + ".tmp")
-        temporary_path.write_text(
-            json.dumps(payload, indent=2) + "\n",
-            encoding="utf-8",
+        write_json_atomic(destination, payload)
+
+    def persist_ring_state_payload(self, payload: dict) -> None:
+        """Write a new primary while retaining the prior valid generation."""
+        previous_payload = None
+        if self.ring_counter_path.is_file():
+            try:
+                previous_state = self.read_ring_state_file(
+                    self.ring_counter_path
+                )
+                previous_payload = normalized_ring_state_payload(
+                    previous_state
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                previous_payload = None
+
+        # Keep the last known-good generation as the backup. On the very
+        # first save, initialize both files to the same validated payload.
+        self.write_ring_state_file(
+            self.ring_counter_backup_path,
+            previous_payload or payload,
         )
-        temporary_path.replace(destination)
+        self.write_ring_state_file(self.ring_counter_path, payload)
+
+    def ring_persistence_worker(self) -> None:
+        """Coalesce rapid deposits so disk latency never stalls Tk input."""
+        while True:
+            try:
+                payload = self.ring_persistence_queue.get(timeout=0.25)
+            except queue.Empty:
+                if self.ring_persistence_stop_event.is_set():
+                    return
+                continue
+
+            if payload is None:
+                return
+
+            # Only the newest snapshot matters. A burst of rings should
+            # produce immediate UI updates and one durable final total, not a
+            # queue of stale writes that blocks sensor handling for seconds.
+            while True:
+                try:
+                    newer_payload = self.ring_persistence_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if newer_payload is None:
+                    self.ring_persistence_stop_event.set()
+                    break
+                payload = newer_payload
+
+            try:
+                self.persist_ring_state_payload(payload)
+                self.messages.put(("RING_STATE_SAVED", "", -1))
+            except OSError as error:
+                self.messages.put(
+                    (
+                        "RING_STATE_SAVE_FAILED",
+                        str(error).replace("\n", " ")[:160],
+                        -1,
+                    )
+                )
+
+            if self.ring_persistence_stop_event.is_set():
+                return
 
     def save_ring_state(self) -> None:
-        payload = {
-            "version": RING_STATE_VERSION,
-            "total_rings": self.ring_count,
-            "milestones_shown": sorted(self.ring_milestones_shown),
-            "milestones_pending": sorted(self.ring_milestones_pending),
-        }
+        payload = normalized_ring_state_payload(
+            (
+                self.ring_count,
+                self.ring_milestones_shown,
+                self.ring_milestones_pending,
+            )
+        )
+
+        persistence_thread = getattr(
+            self,
+            "ring_persistence_thread",
+            None,
+        )
+        persistence_queue = getattr(
+            self,
+            "ring_persistence_queue",
+            None,
+        )
+        if (
+            persistence_thread is not None
+            and persistence_thread.is_alive()
+            and persistence_queue is not None
+            and not self.ring_persistence_stop_event.is_set()
+        ):
+            try:
+                persistence_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                persistence_queue.put_nowait(payload)
+                return
+            except queue.Full:
+                # The writer took the previous item between get/put. Falling
+                # through to a synchronous save is rare and preserves data.
+                pass
+
         try:
             self.ring_counter_path.parent.mkdir(
                 parents=True,
                 exist_ok=True,
             )
-            self.write_ring_state_file(self.ring_counter_path, payload)
+            self.persist_ring_state_payload(payload)
         except OSError:
             self.ring_state_warning = "Primary ring-counter save failed."
             self.write_status(
                 "RING COUNTER SAVE FAILED | total="
-                + str(self.ring_count),
-                event=False,
-            )
-            return
-
-        try:
-            self.write_ring_state_file(
-                self.ring_counter_backup_path,
-                payload,
-            )
-        except OSError:
-            self.ring_state_warning = "Ring-counter backup save failed."
-            self.write_status(
-                "RING COUNTER BACKUP FAILED | total="
                 + str(self.ring_count),
                 event=False,
             )
@@ -3577,12 +4054,17 @@ class MagnetArcadeGuard:
                     if (
                         ring_pressed
                         and not was_ring_pressed
-                        and now - last_press_at >= RING_DEBOUNCE_SECONDS
+                        and ring_press_is_accepted(
+                            now,
+                            last_press_at,
+                            self.ring_global_last_press_at,
+                        )
                     ):
                         # Queue the generic press first. This guarantees the
                         # coin edge cannot race with and immediately dismiss
                         # the Ring Power banner that the same scan creates.
                         self.ring_last_press_at[joystick_id] = now
+                        self.ring_global_last_press_at = now
                         self.messages.put(("RING", str(joystick_id), -1))
                     self.joystick_button_states[joystick_id] = buttons
                     self.joystick_direction_states[joystick_id] = (
@@ -3606,6 +4088,7 @@ class MagnetArcadeGuard:
                 self.ring_joystick_error = str(error)[:120]
                 self.joystick_button_states.clear()
                 self.joystick_direction_states.clear()
+                self.ring_global_last_press_at = 0.0
                 if self.ring_input_stop_event.wait(0.5):
                     break
                 continue
@@ -4297,10 +4780,15 @@ class MagnetArcadeGuard:
             self.foreground_process_name == BIG_BOX_PROCESS_NAME
             and self.overlay_gate_state == "BIGBOX_READY"
         )
-        if (
-            big_box_ready
-            and self.accepted_count == TOTAL_EMERALDS
-        ):
+        energy_restored_without_game = (
+            self.accepted_count == TOTAL_EMERALDS
+            or (
+                getattr(self, "ring_burst_origin", None)
+                == "normal_all_missing"
+                and (self.accepted_count or 0) > 0
+            )
+        )
+        if big_box_ready and energy_restored_without_game:
             self.consume_ring_burst_on_return()
             return
 
@@ -4352,7 +4840,7 @@ class MagnetArcadeGuard:
 
     def create_control_panel(self) -> None:
         self.control_window = tk.Toplevel(self.root)
-        self.control_window.title("Magnetic Arcade Guard — Ring Edition")
+        self.control_window.title("Chaos Heist Control")
         panel_width = max(520, min(680, self.screen_width - 20))
         panel_height = max(380, min(445, self.screen_height - 40))
         panel_x = min(40, max(0, (self.screen_width - panel_width) // 2))
@@ -4381,7 +4869,7 @@ class MagnetArcadeGuard:
 
         tk.Label(
             self.control_window,
-            text="MAGNETIC ARCADE GUARD",
+            text="CHAOS HEIST",
             font=("Arial", 18, "bold"),
             foreground="white",
             background="#202020",
@@ -4583,7 +5071,7 @@ class MagnetArcadeGuard:
                 f"{RING_JOYSTICK_BUTTON}, {round(RING_DEBOUNCE_SECONDS * 1000)}ms debounce"
             )
         ring_data_text = (
-            "WARNING - check guard-events.log"
+            "WARNING - check chaos-heist-events.log"
             if self.ring_state_warning
             else "primary + backup OK"
         )
@@ -5216,6 +5704,22 @@ class MagnetArcadeGuard:
                 self.maybe_show_pending_overlay()
 
             if self.running:
+                announcement_is_visible = (
+                    getattr(self, "active_ring_announcement_kind", None)
+                    is not None
+                    or getattr(self, "announcement_after_id", None)
+                    is not None
+                    or getattr(
+                        self,
+                        "ring_power_announcement_visible",
+                        False,
+                    )
+                )
+                if (
+                    announcement_is_visible
+                    and self.emulator_owns_foreground()
+                ):
+                    self.defer_announcement_for_emulator()
                 try:
                     self.maybe_show_pending_ring_announcement()
                 except Exception as error:
@@ -5740,6 +6244,8 @@ class MagnetArcadeGuard:
         message: str,
         overlay_kind: str,
     ) -> bool:
+        if not self.running or not self.guard_active:
+            return False
         if getattr(self, "active_ring_announcement_kind", None) == "milestone":
             self.milestone_deferred_count_change = True
             return False
@@ -5929,19 +6435,12 @@ class MagnetArcadeGuard:
             self.capture_return_window()
             self.prepare_overlay_monitor()
             if not self.suspend_return_process():
-                # The power-loss presentation is short and visual. If the
-                # optional process pause fails, keep the effect rather than
-                # skipping it or turning a presentation problem into a guard
-                # failure. The normal overlay path still protects input once
-                # its takeover is established.
-                self.write_status(
-                    "POWER LOSS VISUAL ONLY | Big Box pause unavailable"
-                )
+                self.fault_disable_guard("Could not safely pause Big Box")
+                return False
 
         if not self.mute_other_audio():
-            self.write_status(
-                "POWER LOSS VISUAL ONLY | background audio mute unavailable"
-            )
+            self.fault_disable_guard("Could not mute background audio")
+            return False
 
         self.cancel_completion()
         self.stop_music()
@@ -6269,10 +6768,14 @@ class MagnetArcadeGuard:
             self.play_last_emerald_removal_sound()
             return
 
-        # The visual effect is optional. If it cannot be shown, preserve the
-        # original story path so a presentation failure never strands the
-        # heist between the final sensor event and its narration.
-        if self.show_story_shutdown_narration():
+        # A visual-only failure may still use the ordinary story screen, but
+        # a safety failure disables the guard and must never be resurrected by
+        # this stale transition callback.
+        if (
+            self.guard_active
+            and self.guard_mode == "story"
+            and self.show_story_shutdown_narration()
+        ):
             self.play_last_emerald_removal_sound()
 
     def show_story_question(self) -> None:
@@ -6441,6 +6944,8 @@ class MagnetArcadeGuard:
         *,
         message: Optional[str] = None,
     ) -> None:
+        if not self.running or not self.guard_active:
+            return
         if getattr(self, "active_ring_announcement_kind", None) == "milestone":
             self.milestone_deferred_count_change = True
             return
@@ -7146,17 +7651,30 @@ class MagnetArcadeGuard:
 
     def keep_window_on_top(self) -> None:
         if self.running and self.overlay_visible:
-            try:
-                self.root.overrideredirect(True)
-                x, y, width, height = self.overlay_monitor_bounds
-                expected_rect = (x, y, x + width, y + height)
-                if self.get_window_rect(self.root.winfo_id()) != expected_rect:
-                    self.apply_overlay_bounds(show=True)
-                self.root.attributes("-topmost", True)
-                self.set_overlay_z_order(True)
-                self.root.lift()
-            except tk.TclError:
-                pass
+            if self.overlay_kind == "story_power_loss":
+                # This effect deliberately leaves the frozen Big Box menu
+                # visible beneath separate non-activating filter windows. The
+                # normal topmost watchdog must not resurrect the hidden black
+                # root window halfway through the shutdown animation.
+                try:
+                    self.root.withdraw()
+                except tk.TclError:
+                    pass
+            else:
+                try:
+                    self.root.overrideredirect(True)
+                    x, y, width, height = self.overlay_monitor_bounds
+                    expected_rect = (x, y, x + width, y + height)
+                    if (
+                        self.get_window_rect(self.root.winfo_id())
+                        != expected_rect
+                    ):
+                        self.apply_overlay_bounds(show=True)
+                    self.root.attributes("-topmost", True)
+                    self.set_overlay_z_order(True)
+                    self.root.lift()
+                except tk.TclError:
+                    pass
 
         if self.running:
             self.root.after(500, self.keep_window_on_top)
@@ -7335,6 +7853,7 @@ class MagnetArcadeGuard:
             self.reader_connected = True
             self.controller_lost = False
             now = time.monotonic()
+            self.activation_started_at = 0.0
             self.last_valid_message = now
             self.last_serial_message_at = now
             return
@@ -7342,6 +7861,7 @@ class MagnetArcadeGuard:
         self.reader_connected = True
         self.controller_lost = False
         now = time.monotonic()
+        self.activation_started_at = 0.0
         self.last_valid_message = now
         self.last_serial_message_at = now
         self.overlay_gate_state = "MONITORING"
@@ -7600,8 +8120,8 @@ class MagnetArcadeGuard:
                 is not None
             ):
                 self.finish_normal_warning()
-            self.play_emerald_sound()
-            self.show_normal_restored_announcement(current_count)
+            if self.show_normal_restored_announcement(current_count):
+                self.play_emerald_sound()
             return
 
         if (
@@ -7634,6 +8154,7 @@ class MagnetArcadeGuard:
         self.controller_lost = True
         self.pending_count = None
         self.last_serial_message_at = 0.0
+        self.activation_started_at = 0.0
         self.fault_disable_guard(reason or "ESP32 disconnected")
 
     def process_messages(self) -> None:
@@ -7664,6 +8185,20 @@ class MagnetArcadeGuard:
 
                 if message_type == "JOYSTICK_PRESS":
                     self.handle_joystick_press(value)
+                    continue
+
+                if message_type == "RING_STATE_SAVED":
+                    self.ring_state_warning = ""
+                    continue
+
+                if message_type == "RING_STATE_SAVE_FAILED":
+                    self.ring_state_warning = (
+                        "Ring-counter save failed: " + value
+                    )[:160]
+                    self.write_status(
+                        "RING COUNTER SAVE FAILED | " + value,
+                        event=False,
+                    )
                     continue
 
                 if message_type == "SERVICE_FAULT":
@@ -7727,11 +8262,20 @@ class MagnetArcadeGuard:
             self.root.after(50, self.process_messages)
 
     def connection_watchdog(self) -> None:
-        if self.guard_active and self.reader_connected:
-            elapsed = time.monotonic() - self.last_serial_message_at
-
-            if elapsed > CONNECTION_TIMEOUT_SECONDS:
-                self.handle_disconnect("ESP32 heartbeat timed out")
+        if self.guard_active:
+            now = time.monotonic()
+            if self.reader_connected:
+                elapsed = now - self.last_serial_message_at
+                if elapsed > CONNECTION_TIMEOUT_SECONDS:
+                    self.handle_disconnect("ESP32 heartbeat timed out")
+            elif (
+                self.activation_started_at
+                and now - self.activation_started_at
+                > INITIAL_CONNECTION_TIMEOUT_SECONDS
+            ):
+                self.handle_disconnect(
+                    "ESP32 did not respond after guard activation"
+                )
 
         if self.running:
             self.root.after(250, self.connection_watchdog)
@@ -7883,6 +8427,7 @@ class MagnetArcadeGuard:
         self.last_fault = ""
         self.pending_count = None
         self.last_serial_message_at = 0.0
+        self.activation_started_at = time.monotonic()
         self.accepted_count = None
         self.pending_overlay_missing = None
         self.pending_normal_warning = None
@@ -7929,6 +8474,7 @@ class MagnetArcadeGuard:
         self.controller_lost = True
         self.pending_count = None
         self.accepted_count = None
+        self.activation_started_at = 0.0
         self.pending_overlay_missing = None
         self.pending_normal_warning = None
         self.story_armed = False
@@ -8087,6 +8633,39 @@ class MagnetArcadeGuard:
             and self.ring_input_thread is not threading.current_thread()
         ):
             self.ring_input_thread.join(timeout=0.75)
+
+        self.ring_persistence_stop_event.set()
+        persistence_queue = getattr(
+            self,
+            "ring_persistence_queue",
+            None,
+        )
+        if persistence_queue is not None:
+            try:
+                persistence_queue.put_nowait(None)
+            except queue.Full:
+                # Let the queued latest snapshot finish; the worker observes
+                # the stop event immediately afterward.
+                pass
+        persistence_thread = getattr(
+            self,
+            "ring_persistence_thread",
+            None,
+        )
+        if (
+            persistence_thread
+            and persistence_thread.is_alive()
+            and persistence_thread is not threading.current_thread()
+        ):
+            persistence_thread.join(timeout=2.0)
+        if not persistence_thread or not persistence_thread.is_alive():
+            # Guarantee the final in-memory count on an orderly shutdown,
+            # even when several rings arrived during one coalesced write.
+            self.save_ring_state()
+        else:
+            self.write_status(
+                "CLEANUP WARNING | ring persistence did not stop in time"
+            )
         self.guard_active = False
         self.activation_generation += 1
         self.overlay_visible = False
@@ -8152,14 +8731,10 @@ class MagnetArcadeGuard:
             except pygame.error:
                 pass
 
-        if self.instance_mutex_handle:
-            try:
-                ctypes.windll.kernel32.CloseHandle(
-                    self.instance_mutex_handle
-                )
-            except (AttributeError, OSError, ValueError):
-                pass
-            self.instance_mutex_handle = None
+        release_mutex_handles(
+            getattr(self, "instance_mutex_handles", ())
+        )
+        self.instance_mutex_handles = ()
 
     def run(self) -> None:
         try:
@@ -8173,6 +8748,87 @@ def show_message_box(message: str, title: str) -> None:
         ctypes.windll.user32.MessageBoxW(None, message, title, 0x10)
     except AttributeError:
         pass
+
+
+def locate_self_test_asset(asset_name: str) -> Optional[Path]:
+    candidates = [application_directory() / asset_name]
+    bundled_directory = getattr(sys, "_MEIPASS", None)
+    if bundled_directory:
+        candidates.append(Path(bundled_directory) / asset_name)
+    candidates.extend(
+        (
+            Path(__file__).resolve().parent / asset_name,
+            SOURCE_ASSET_DIRECTORY / asset_name,
+        )
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def run_self_test() -> int:
+    """Exercise packaged imports, Tk, config, and required media safely."""
+    problems = list(CONFIG_VALIDATION_ERRORS)
+    if os.name != "nt":
+        problems.append("ChaosHeist requires Windows")
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        problems.append("ChaosHeist requires 64-bit Python/Windows")
+    for available, description in (
+        (PIL_AVAILABLE, "Pillow image support"),
+        (AV_AVAILABLE, "PyAV cinematic support"),
+        (PYGAME_AVAILABLE, "pygame audio support"),
+        (PYCAW_AVAILABLE, "Windows audio-session support"),
+    ):
+        if not available:
+            problems.append(description + " unavailable")
+
+    required_assets = tuple(
+        dict.fromkeys(
+            (
+                BACKGROUND_IMAGE_NAME,
+                COMPLETION_IMAGE_NAME,
+                SUPERSONIC_IMAGE_NAME,
+                COMPLETION_AUDIO_NAME,
+                MISSING_AUDIO_NAME,
+                EMERALD_AUDIO_NAME,
+                RING_AUDIO_NAME,
+                ACT_CLEAR_AUDIO_NAME,
+                *REMOVAL_AUDIO_NAMES,
+                LAST_EMERALD_REMOVAL_AUDIO_NAME,
+                STORY_SHUTDOWN_AUDIO_NAME,
+                *POWER_LOSS_AUDIO_NAMES.values(),
+                FINAL_COMPLETION_AUDIO_NAME,
+                EGGMAN_REVEAL_AUDIO_NAME,
+                CINEMATIC_VIDEO_NAME,
+            )
+        )
+    )
+    missing_assets = [
+        name for name in required_assets if locate_self_test_asset(name) is None
+    ]
+    if missing_assets:
+        problems.append("missing media: " + ", ".join(missing_assets))
+
+    try:
+        test_root = tk.Tk()
+        test_root.withdraw()
+        test_root.update_idletasks()
+        test_root.destroy()
+    except tk.TclError as error:
+        problems.append("Tk startup failed: " + str(error))
+
+    if problems:
+        print("CHAOSHEIST_SELF_TEST:FAIL")
+        for problem in problems:
+            print("- " + problem)
+        return 1
+
+    print(
+        f"CHAOSHEIST_SELF_TEST:PASS version={APP_VERSION} "
+        f"assets={len(required_assets)}"
+    )
+    return 0
 
 
 def main() -> int:
@@ -8194,25 +8850,27 @@ def main() -> int:
             sys.argv[4],
         )
 
-    mutex_handle, is_first_instance = acquire_single_instance_mutex()
-    if not mutex_handle:
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        return run_self_test()
+
+    mutex_handles, is_first_instance = acquire_single_instance_mutex()
+    if mutex_handles is None:
         show_message_box(
             "The guard could not create its safety lock and did not start.",
-            "Magnetic Arcade Guard",
+            APP_DISPLAY_NAME,
         )
         return 1
     if not is_first_instance:
-        ctypes.windll.kernel32.CloseHandle(mutex_handle)
         show_message_box(
-            "Magnetic Arcade Guard is already running.",
-            "Magnetic Arcade Guard",
+            "Chaos Heist is already running.",
+            APP_DISPLAY_NAME,
         )
         return 0
 
     app = None
     try:
         bootstrap_event("single-instance lock acquired")
-        app = MagnetArcadeGuard(mutex_handle)
+        app = ChaosHeistApp(mutex_handles)
         bootstrap_event("entering main loop")
         app.run()
         return 0
@@ -8234,12 +8892,12 @@ def main() -> int:
             )
             app.cleanup_runtime()
         else:
-            ctypes.windll.kernel32.CloseHandle(mutex_handle)
+            release_mutex_handles(mutex_handles)
         show_message_box(
             "The guard stopped because of an error. The guard is disabled, "
             "and Big Box should remain usable.\n\n"
             + str(error),
-            "Magnetic Arcade Guard",
+            APP_DISPLAY_NAME,
         )
         return 1
 

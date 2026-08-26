@@ -11,7 +11,7 @@
   "music_volume": 0.75,
   "sound_effect_volume": 1.0,
   "ring_sound_file": "ring.mp3",
-  "act_clear_sound_file": "act-clear.mp3",
+  "act_clear_sound_file": "16-act-clear.mp3",
   "removal_sound_files": [
     "ohh-no-the-chaos-emerald.mp3",
     "ohh-no.mp3",

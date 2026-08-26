@@ -1,6 +1,7 @@
-MAGNETIC ARCADE GUARD - RING COUNTER BUILD
+CHAOSHEIST - PRODUCTION BUILD
 
-Build family: Ring-enabled Story/Normal Mode
+Build family: Story/Normal Mode with Ring Power
+Version: 1.0.0
 Update: 2026-08-25
 
 Latest change: the final Story Mode power failure now unfolds over about ten
@@ -31,7 +32,7 @@ messages.
 
 The final Story Mode emerald removal now announces zero Chaos Energy with the
 segmented meter at 0, plays the final-emerald voice line immediately, and then
-uses a short image-free simulated power-loss sequence over the frozen Big Box
+uses a long image-free simulated power-loss sequence over the frozen Big Box
 menu before the existing heist narration begins. The menu remains visible
 through the flashes and dimming until the final blackout. Robotnik's lock
 screen remains reserved for after the Sonic cinematic. The seven-sensor
@@ -72,5 +73,30 @@ timer is not reset by additional rings. Regular ring notices are shorter,
 dismissible with any joystick button or direction, and Story Mode keeps the
 ring-required footer on every Robotnik missing-emerald state.
 
-The frozen stable release remains at:
-..\versions\stable-pre-story-mode\
+This production promotion renames the application, executable, source,
+configuration, build output, logs, and persistent-data directory to
+ChaosHeist. Existing ring totals are validated and migrated exactly once from
+the former local app-data directory. ChaosHeist deliberately keeps both its
+new single-instance lock and the former guard lock so old and new executables
+cannot run together. Superseded local builds are preserved in the dated
+pre-ChaosHeist archive.
+
+The production reliability pass adds malformed-config fail-open diagnostics,
+unknown-setting warnings, explicit ring-state version checks, recovery from an
+interrupted atomic save, previous-generation backups, serialized/coalesced
+background persistence for rapid rings, cross-encoder ring debounce, a final
+shutdown flush, exact build-environment checks, deterministic media/Tk
+preflight, Windows version metadata, packaged self-test, versioned release
+archives, and SHA-256 manifests.
+
+The final adversarial pass also makes a silent controller time out during
+activation, ends an unused Normal Mode Ring Power pass when any Chaos Energy
+returns, rejects stale takeover callbacks after deactivation, and aborts the
+power-loss sequence fail-open if Big Box cannot be paused or muted safely.
+The topmost watchdog also keeps the black application root hidden throughout
+the menu-backed CRT failure effect instead of being able to cover that effect.
+Small announcements are now forcibly removed when an emulator takes the
+foreground; an interrupted 50-ring prize is saved and replayed in full at the
+next safe Big Box menu.
+Normal Mode also suppresses the emerald-return sound when its corresponding
+safe-menu notice cannot be displayed, preventing shrine effects over games.
