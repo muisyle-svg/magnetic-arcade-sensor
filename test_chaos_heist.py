@@ -594,6 +594,50 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(rendered[1][1]["blink_segment_index"], 5)
         self.assertEqual(rendered[2][1]["blink_segment_index"], 0)
 
+    def test_ring_power_meter_percentage_drains_linearly_between_segments(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_selection_expired = False
+        guard.ring_burst_game_seen_since = 0.0
+        guard.ring_burst_selection_deadline = 135.0
+        guard.ring_power_selection_started_at = 100.0
+        guard.overlay_monitor_bounds = (0, 0, 640, 480)
+        guard.ring_power_meter_canvas = MagicMock()
+        rendered = []
+        guard.render_segmented_energy_meter = (
+            lambda canvas, present_count, **kwargs: rendered.append(
+                (present_count, kwargs)
+            )
+        )
+
+        for now in (100.0, 102.5, 105.0, 110.0, 135.0):
+            guard.render_ring_power_countdown_meter(now=now)
+
+        self.assertEqual(
+            [entry[0] for entry in rendered],
+            [7, 7, 6, 5, 0],
+        )
+        self.assertAlmostEqual(
+            rendered[0][1]["display_percent"],
+            100.0,
+        )
+        self.assertAlmostEqual(
+            rendered[1][1]["display_percent"],
+            92.857,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            rendered[2][1]["display_percent"],
+            85.714,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            rendered[3][1]["display_percent"],
+            71.428,
+            places=2,
+        )
+        self.assertEqual(rendered[4][1]["display_percent"], 0.0)
+
     def test_ring_power_meter_stays_when_text_banner_is_dismissed(self):
         guard = self.make_guard()
         guard.ring_burst_active = True
@@ -618,6 +662,31 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertFalse(guard.ring_power_announcement_visible)
         self.assertTrue(guard.ring_power_meter_visible)
+
+    def test_cinematic_display_uses_a_fresh_tk_image_each_frame(self):
+        if not guard_module.PIL_AVAILABLE:
+            self.skipTest("Pillow is not available")
+        guard = self.make_guard()
+        guard.cinematic_photo = None
+        guard.background_label = MagicMock()
+        frame = guard_module.Image.new("RGB", (8, 6), "black")
+        created = []
+
+        def make_photo(image):
+            photo = MagicMock()
+            created.append((photo, image.copy()))
+            return photo
+
+        with patch.object(
+            guard_module.ImageTk,
+            "PhotoImage",
+            side_effect=make_photo,
+        ):
+            guard.display_cinematic_frame(frame, 1.0)
+            guard.display_cinematic_frame(frame, 1.1)
+
+        self.assertEqual(len(created), 2)
+        self.assertEqual(guard.background_label.configure.call_count, 2)
 
     def test_ring_power_timeout_waits_for_safe_menu_before_restoring_lock(self):
         guard = self.make_guard()

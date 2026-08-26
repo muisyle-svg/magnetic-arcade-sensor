@@ -56,8 +56,10 @@ be counted twice.
 - Ring Power shows the current segmented Chaos Energy meter, rapidly fills it
   to full, and gives 35 seconds to launch a game. The meter itself is the
   countdown: each of its seven segments blinks for five seconds and then goes
-  dark. Selecting a game cancels the countdown immediately; returning to Big
-  Box then restores the Robotnik lock as usual. If no game is selected before
+  dark, while the percentage readout decreases continuously and reaches the
+  exact segment percentage at each boundary. Selecting a game cancels the
+  countdown immediately; returning to Big Box then restores the Robotnik lock
+  as usual. If no game is selected before
   the countdown expires, the Robotnik lock returns without covering an active
   game. The instructional text can be dismissed independently, but the meter
   remains until a game starts or the deadline expires.

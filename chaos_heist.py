@@ -2074,9 +2074,22 @@ class ChaosHeistApp:
                 pass
             self.energy_animation_after_id = None
 
-    def energy_meter_text(self, present_count: int) -> str:
+    def energy_meter_text(
+        self,
+        present_count: int,
+        *,
+        display_percent: Optional[float] = None,
+    ) -> str:
         present_count = max(0, min(TOTAL_EMERALDS, int(present_count)))
-        percent = round(present_count * 100 / TOTAL_EMERALDS)
+        if display_percent is None:
+            percent = round(present_count * 100 / TOTAL_EMERALDS)
+        else:
+            try:
+                percent = round(
+                    max(0.0, min(100.0, float(display_percent)))
+                )
+            except (TypeError, ValueError):
+                percent = round(present_count * 100 / TOTAL_EMERALDS)
         return f"MASTER EMERALD POWER  {percent}%"
 
     def energy_meter_color(self, present_count: int) -> str:
@@ -2124,6 +2137,7 @@ class ChaosHeistApp:
         meter_height: Optional[int] = None,
         blink_segment_index: Optional[int] = None,
         blink_on: bool = True,
+        display_percent: Optional[float] = None,
     ) -> tuple[int, int]:
         """Draw the same labeled, color-coded meter on any Tk canvas.
 
@@ -2141,7 +2155,10 @@ class ChaosHeistApp:
             42,
             min(62, int(monitor_height * 0.11)),
         )
-        text = self.energy_meter_text(present_count)
+        text = self.energy_meter_text(
+            present_count,
+            display_percent=display_percent,
+        )
         base_size = max(10, min(18, int(monitor_height * 0.034)))
         if emphasis:
             base_size += 2
@@ -2356,19 +2373,36 @@ class ChaosHeistApp:
         if now is None:
             now = time.monotonic()
         elapsed = max(0.0, float(now) - started_at)
+        segment_seconds = max(0.001, RING_POWER_SEGMENT_SECONDS)
+        elapsed_energy = min(
+            float(TOTAL_EMERALDS),
+            elapsed / segment_seconds,
+        )
         phase = min(
-            TOTAL_EMERALDS - 1,
-            int(elapsed / RING_POWER_SEGMENT_SECONDS),
+            TOTAL_EMERALDS,
+            int(elapsed_energy),
         )
         remaining_segments = TOTAL_EMERALDS - phase
+        remaining_energy = max(
+            0.0,
+            float(TOTAL_EMERALDS) - elapsed_energy,
+        )
+        remaining_percent = (
+            remaining_energy * 100.0 / TOTAL_EMERALDS
+        )
         self.render_segmented_energy_meter(
             canvas,
             remaining_segments,
             emphasis=True,
             meter_width=self.ring_power_meter_size()[0],
             meter_height=self.ring_power_meter_size()[1],
-            blink_segment_index=remaining_segments - 1,
+            blink_segment_index=(
+                remaining_segments - 1
+                if remaining_segments > 0
+                else None
+            ),
             blink_on=getattr(self, "ring_power_meter_blink_on", True),
+            display_percent=remaining_percent,
         )
 
     def animate_ring_power_meter_fill(
@@ -3807,6 +3841,12 @@ class ChaosHeistApp:
         self.overlay_kind = "cinematic"
         self.hide_energy_meter()
         self.hide_story_question_message()
+        # No power-loss filter or CRT/glitch surface may survive into the
+        # video. Those windows are independent of the full-screen root, so
+        # explicitly withdraw them at the handoff as well as during normal
+        # power-loss cleanup.
+        self.hide_announcement_flash()
+        self.hide_power_loss_crt()
         self.title_label.configure(text="")
         self.count_label.configure(text="")
         self.animation_generation += 1
@@ -3864,21 +3904,17 @@ class ChaosHeistApp:
             black_frame = Image.new("RGB", frame_image.size, "black")
             frame_image = Image.blend(black_frame, frame_image, alpha)
 
-        if (
-            self.cinematic_photo is None
-            or self.cinematic_photo.width() != frame_image.width
-            or self.cinematic_photo.height() != frame_image.height
-        ):
-            self.cinematic_photo = ImageTk.PhotoImage(frame_image)
-            self.background_label.configure(
-                image=self.cinematic_photo,
-                background="black",
-            )
-        else:
-            # Reuse one Tcl image instead of allocating and destroying a new
-            # display object for every frame. This is faster and prevents stale
-            # image fragments from surviving a frame swap on the CRT PC.
-            self.cinematic_photo.paste(frame_image)
+        # Install a fresh Tk photo for every frame. Reusing PhotoImage.paste()
+        # was efficient on a desktop display but can leave partial dirty
+        # rectangles on the arcade CRT path; the symptom is two solid,
+        # partial-height black bars over otherwise clean video. The source
+        # frame is already bounded to the configured cinematic FPS, so this
+        # more conservative swap is preferable to risking stale pixels.
+        self.cinematic_photo = ImageTk.PhotoImage(frame_image)
+        self.background_label.configure(
+            image=self.cinematic_photo,
+            background="black",
+        )
 
     def poll_cinematic_playback(self) -> None:
         self.cinematic_after_id = None
