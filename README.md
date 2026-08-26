@@ -51,13 +51,13 @@ be counted twice.
 - Rapid deposits update the on-screen total immediately. Durable ring-state writes are serialized and coalesced on a background worker so a slow disk or antivirus scan cannot stall sensor and joystick handling; an orderly shutdown performs a final synchronous save.
 - Every deposit queues a non-activating `RING COLLECTED!` announcement showing
   the new persistent total. Ring Power and 50-ring announcements also include
-  that total. In Normal Mode, these announcements also show the current Chaos
-  Energy percentage; the Robotnik screen keeps energy in its graphical meter.
+  that total. The Chaos Energy meter is reserved for the relevant emerald and
+  Ring Power presentations rather than being repeated on ring-count notices.
 - Ring Power shows the current segmented Chaos Energy meter, rapidly fills it
   to full, and gives 35 seconds to launch a game. The meter itself is the
   countdown: each of its seven segments blinks for five seconds and then goes
-  dark, while the percentage readout decreases continuously and reaches the
-  exact segment percentage at each boundary. Selecting a game cancels the
+  dark, while the percentage readout decreases continuously and independently
+  across the full 35 seconds. Selecting a game cancels the
   countdown immediately; returning to Big Box then restores the Robotnik lock
   as usual. If no game is selected before
   the countdown expires, the Robotnik lock returns without covering an active

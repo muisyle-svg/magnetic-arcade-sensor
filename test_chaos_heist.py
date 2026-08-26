@@ -421,7 +421,7 @@ class GuardLogicTests(unittest.TestCase):
         self.assertIn("TOTAL RINGS: 12", shown[0][1])
         self.assertIsNone(guard.pending_ring_announcement)
 
-    def test_normal_ring_announcement_includes_current_chaos_energy(self):
+    def test_normal_ring_announcement_omits_chaos_energy_text(self):
         guard = self.make_guard()
         guard.running = True
         guard.guard_mode = "normal"
@@ -439,7 +439,21 @@ class GuardLogicTests(unittest.TestCase):
 
         guard.maybe_show_pending_ring_announcement()
 
-        self.assertIn("CHAOS ENERGY: 43%", shown[0])
+        self.assertNotIn("CHAOS ENERGY", shown[0])
+
+    def test_emerald_announcement_energy_meter_still_uses_segments(self):
+        guard = self.make_guard()
+        guard.announcement_energy_canvas = MagicMock()
+        guard.overlay_monitor_bounds = (0, 0, 640, 480)
+        guard.render_segmented_energy_meter = MagicMock()
+
+        guard.set_announcement_energy_meter(3, visible=True)
+
+        guard.render_segmented_energy_meter.assert_called_once()
+        self.assertEqual(
+            guard.render_segmented_energy_meter.call_args.args[1],
+            3,
+        )
 
     def test_pending_milestone_can_replace_ring_power_at_safe_menu(self):
         guard = self.make_guard()
@@ -464,7 +478,7 @@ class GuardLogicTests(unittest.TestCase):
         guard.maybe_show_pending_ring_announcement()
 
         self.assertEqual(shown[0][0], guard_module.RING_MILESTONE_TITLE)
-        self.assertIn("CHAOS ENERGY: 100%", shown[0][1])
+        self.assertNotIn("CHAOS ENERGY", shown[0][1])
         self.assertTrue(guard.pending_ring_milestone)
         self.assertEqual(guard.active_ring_announcement_kind, "milestone")
 

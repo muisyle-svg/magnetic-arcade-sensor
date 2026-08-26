@@ -3188,6 +3188,21 @@ class ChaosHeistApp:
                     fill=color,
                     outline="",
                 )
+            # A few narrow vertical tears make the failure look less like a
+            # uniform brightness fade without touching the menu underneath.
+            # These belong only to the shutdown effect; the cinematic itself
+            # is rendered by a separate surface.
+            for index in range(3):
+                tear_x = (tick * (43 + index * 11) + 73 * index) % width
+                tear_width = 1 + ((tick + index) % 5)
+                canvas.create_rectangle(
+                    tear_x,
+                    0,
+                    min(width, tear_x + tear_width),
+                    height,
+                    fill="#ffffff" if (tick + index) % 2 else "#111111",
+                    outline="",
+                )
             canvas.update_idletasks()
         except tk.TclError:
             return
@@ -4987,25 +5002,6 @@ class ChaosHeistApp:
             detail = f"TOTAL RINGS: {self.ring_count}"
             color = "#ffdd55"
             duration = RING_ANNOUNCEMENT_SECONDS
-
-        # Normal Mode announcements are intentionally non-blocking, so the
-        # current shrine energy is useful context. Story/Robotnik screens have
-        # a dedicated graphical meter and do not duplicate this text.
-        if (
-            getattr(self, "guard_mode", None) == "normal"
-            and announcement_kind != "burst"
-        ):
-            accepted_count = getattr(self, "accepted_count", None)
-            if accepted_count is None:
-                energy_text = "CHAOS ENERGY: --"
-            else:
-                energy_percent = round(
-                    max(0, min(TOTAL_EMERALDS, accepted_count))
-                    * 100
-                    / TOTAL_EMERALDS
-                )
-                energy_text = f"CHAOS ENERGY: {energy_percent}%"
-            detail = f"{detail}\n{energy_text}"
 
         return title, detail, color, duration
 
