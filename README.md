@@ -28,7 +28,7 @@ Changes made while MAME, GroovyMAME, or RetroArch is active never try to draw ov
 
 Normal Mode reacts only to a new downward sensor transition while Big Box is the usable full-screen foreground.
 
-- It displays a non-blocking banner: `A Chaos Emerald Was Stolen!` followed by `Hey! Put that back! We already did the thing!` and plays one of the randomized removal voice clips.
+- It displays a non-blocking banner: `A Chaos Emerald Was Stolen!` followed by `Hey! Put that back!` and plays one of the randomized removal voice clips.
 - It returns to the normal Big Box view after 10 seconds even if the emerald is still missing.
 - It returns immediately if any emerald is put back first.
 - A missing count present when the mode starts does not trigger it, and a steady missing count does not retrigger it.

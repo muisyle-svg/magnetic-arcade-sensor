@@ -1709,6 +1709,13 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(finished, [True])
         self.assertEqual(returns, [True])
 
+    def test_normal_warning_text_is_concise(self):
+        self.assertEqual(
+            guard_module.NORMAL_WARNING_MESSAGE,
+            "Hey! Put that back!",
+        )
+        self.assertNotIn("We already did the thing", guard_module.NORMAL_WARNING_MESSAGE)
+
     def test_normal_mode_removal_plays_random_voice_after_banner(self):
         guard = self.make_guard()
         guard.overlay_kind = None

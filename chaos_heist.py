@@ -907,7 +907,7 @@ COMPLETION_MESSAGE = (
 )
 GAME_ON_MESSAGE = "EMERALDS FOUND! GAME ON!"
 RESTORED_MESSAGE = "ALL CHAOS EMERALDS RESTORED!"
-NORMAL_WARNING_MESSAGE = "Hey! Put that back! We already did the thing!"
+NORMAL_WARNING_MESSAGE = "Hey! Put that back!"
 NORMAL_ALL_MISSING_MESSAGE = (
     "You'll need a Ring if there's no Chaos Energy!"
 )
@@ -3044,10 +3044,7 @@ class ChaosHeistApp:
             color = "#ff5555"
         elif event_kind == "normal":
             title = STORY_REMOVAL_OVERLAY_TITLE
-            detail = (
-                "Hey! Put that back!\n"
-                "We already did the thing!"
-            )
+            detail = NORMAL_WARNING_MESSAGE
             color = "#ffcc66"
         elif event_kind == "restored_normal":
             title = NORMAL_RESTORED_TITLE
