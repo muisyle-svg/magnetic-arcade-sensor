@@ -661,7 +661,9 @@ RING_MILESTONE_ANNOUNCEMENT_SECONDS = config_number(
 )
 RING_MILESTONE = 50
 RING_MILESTONE_TITLE = "50 Rings!"
-RING_MILESTONE_MESSAGE = "You've earned a Medallion!"
+RING_MILESTONE_MESSAGE = (
+    "Sonic holds the KEY to your prize... if it hasn't already been taken!"
+)
 RING_COUNT_TITLE = "RING COLLECTED!"
 RING_BURST_TITLE = "RING POWER!"
 RING_BURST_MESSAGE = "This won't last long, quick play a game!"
@@ -926,13 +928,11 @@ NORMAL_RESTORED_TITLE = "EMERALD RESTORED!"
 STORY_REMOVAL_OVERLAY_TITLE = "A Chaos Emerald Was Stolen!"
 STORY_SHUTDOWN_TITLE = "ROBOTNIK'S CHAOS HEIST!"
 STORY_SHUTDOWN_MESSAGE = (
-    "Robotnik has stolen the Chaos Emeralds and taken them back to his fortress!"
+    "Robotnik has stolen the Chaos Emeralds\n"
+    "and taken them back to his fortress!"
 )
 STORY_QUESTION_TITLE = "THE ARCADE HAS LOST ITS CHAOS ENERGY!"
-STORY_QUESTION_MESSAGE = (
-    "Where can we find someone fast enough to fight Robotnik\n"
-    "and bring the Chaos Emeralds home?"
-)
+STORY_QUESTION_MESSAGE = "Only Sonic can save us!"
 STORY_EGGMAN_TITLE = "SO EGGMAN'S BEHIND THIS, HUH?"
 STORY_EGGMAN_MESSAGE = ""
 POWER_LOSS_AUDIO_STEPS = (
@@ -1547,6 +1547,10 @@ class ChaosHeistApp:
         self.control_story_button = None
         self.control_normal_button = None
         self.control_reset_rings_button = None
+        self.story_question_message_frame = None
+        self.story_question_prefix_label = None
+        self.story_question_sonic_label = None
+        self.story_question_suffix_label = None
         self.announcement_window = None
         self.announcement_title_label = None
         self.announcement_detail_label = None
@@ -1820,6 +1824,42 @@ class ChaosHeistApp:
         )
         self.count_label.place(anchor="center")
         self.position_counter()
+
+        # The question card uses three labels so only the word "Sonic" can
+        # be colored blue while the rest of the story message remains white.
+        self.story_question_message_frame = tk.Frame(
+            self.root,
+            background="#000000",
+            takefocus=0,
+        )
+        self.story_question_prefix_label = tk.Label(
+            self.story_question_message_frame,
+            text="Only ",
+            foreground="white",
+            background="#000000",
+            takefocus=0,
+        )
+        self.story_question_sonic_label = tk.Label(
+            self.story_question_message_frame,
+            text="Sonic",
+            foreground="#2f8cff",
+            background="#000000",
+            takefocus=0,
+        )
+        self.story_question_suffix_label = tk.Label(
+            self.story_question_message_frame,
+            text=" can save us!",
+            foreground="white",
+            background="#000000",
+            takefocus=0,
+        )
+        for label in (
+            self.story_question_prefix_label,
+            self.story_question_sonic_label,
+            self.story_question_suffix_label,
+        ):
+            label.pack(side="left", padx=0, pady=0)
+        self.story_question_message_frame.place_forget()
 
         self.energy_canvas = tk.Canvas(
             self.root,
@@ -2497,13 +2537,14 @@ class ChaosHeistApp:
         max_size: int,
         min_size: int,
         available_width: Optional[int] = None,
+        width_fraction: float = 0.82,
     ) -> int:
         # Leave extra horizontal margin for CRT overscan and the arcade
         # monitor's visible bezel area.
         target_width = available_width or self.screen_width
         available_width = max(
             1,
-            int(target_width * 0.82),
+            int(target_width * max(0.10, min(0.98, width_fraction))),
         )
 
         text_lines = [
@@ -3720,6 +3761,7 @@ class ChaosHeistApp:
         self.cancel_cinematic()
         self.overlay_kind = "cinematic"
         self.hide_energy_meter()
+        self.hide_story_question_message()
         self.title_label.configure(text="")
         self.count_label.configure(text="")
         self.animation_generation += 1
@@ -6784,6 +6826,15 @@ class ChaosHeistApp:
                 return
             self.schedule_audio_watchdog()
 
+    def hide_story_question_message(self) -> None:
+        frame = getattr(self, "story_question_message_frame", None)
+        if frame is None:
+            return
+        try:
+            frame.place_forget()
+        except tk.TclError:
+            pass
+
     def show_text_takeover(
         self,
         title: str,
@@ -6826,55 +6877,79 @@ class ChaosHeistApp:
             "story_question",
             "story_eggman",
         }
+        story_question = overlay_kind == "story_question"
         title_max_size = self.title_font_size
         message_max_size = self.count_font_size
         title_min_size = 12
         message_min_size = 12
+        story_width_fraction = 0.82
         if story_takeover:
             # The story cards are meant to be read from across the arcade.
-            # Their limits are based on the actual target monitor, then the
-            # normal width fitting still prevents any clipping.
+            # Their limits are based on the actual target monitor. The wider
+            # card area and explicit line breaks let the cards use the largest
+            # readable fonts that still respect CRT overscan.
             title_max_size = max(
                 title_max_size,
-                int(monitor_height * 0.12),
+                int(monitor_height * 0.20),
             )
             message_max_size = max(
                 message_max_size,
-                int(monitor_height * 0.11),
+                int(monitor_height * 0.20),
             )
             title_min_size = 14
             message_min_size = 14
+            story_width_fraction = 0.88
 
         title_size = self.fit_font_size(
             tuple(title.splitlines()) or (title,),
             max_size=title_max_size,
             min_size=title_min_size,
             available_width=monitor_width,
+            width_fraction=story_width_fraction,
         )
         message_size = self.fit_font_size(
             tuple(message.splitlines()) or (message,),
             max_size=message_max_size,
             min_size=message_min_size,
             available_width=monitor_width,
+            width_fraction=story_width_fraction,
         )
+        self.hide_story_question_message()
         self.title_label.configure(
             text=title,
             foreground="white",
             font=("Arial", title_size, "bold"),
-            wraplength=max(1, int(monitor_width * 0.80)),
+            wraplength=max(1, int(monitor_width * story_width_fraction)),
             justify="center",
         )
-        self.count_label.configure(
-            text=message,
-            foreground="white",
-            font=("Arial", message_size, "bold"),
-            wraplength=max(1, int(monitor_width * 0.80)),
-            justify="center",
-        )
+        if story_question:
+            self.count_label.configure(text="")
+            self.count_label.place_forget()
+            story_font = ("Arial", message_size, "bold")
+            for label in (
+                self.story_question_prefix_label,
+                self.story_question_sonic_label,
+                self.story_question_suffix_label,
+            ):
+                label.configure(font=story_font)
+            self.story_question_message_frame.update_idletasks()
+        else:
+            self.count_label.configure(
+                text=message,
+                foreground="white",
+                font=("Arial", message_size, "bold"),
+                wraplength=max(1, int(monitor_width * story_width_fraction)),
+                justify="center",
+            )
         self.title_label.update_idletasks()
-        self.count_label.update_idletasks()
+        if not story_question:
+            self.count_label.update_idletasks()
         title_height = self.title_label.winfo_reqheight()
-        message_height = self.count_label.winfo_reqheight()
+        message_height = (
+            self.story_question_message_frame.winfo_reqheight()
+            if story_question
+            else self.count_label.winfo_reqheight()
+        )
         vertical_gap = max(12, int(monitor_height * 0.035))
         total_height = title_height + message_height + vertical_gap
         top_y = max(10, (monitor_height - total_height) / 2)
@@ -6883,11 +6958,18 @@ class ChaosHeistApp:
             y=top_y + title_height / 2,
             anchor="center",
         )
-        self.count_label.place(
-            x=monitor_width / 2,
-            y=top_y + title_height + vertical_gap + message_height / 2,
-            anchor="center",
-        )
+        if story_question:
+            self.story_question_message_frame.place(
+                x=monitor_width / 2,
+                y=top_y + title_height + vertical_gap + message_height / 2,
+                anchor="center",
+            )
+        else:
+            self.count_label.place(
+                x=monitor_width / 2,
+                y=top_y + title_height + vertical_gap + message_height / 2,
+                anchor="center",
+            )
 
         if not self.reveal_overlay_window():
             self.fault_disable_guard("Overlay could not cover the display")
@@ -7524,6 +7606,7 @@ class ChaosHeistApp:
             )
         self.overlay_visible = True
         self.overlay_kind = "robotnik"
+        self.hide_story_question_message()
         _, _, monitor_width, _ = self.overlay_monitor_bounds
         display_message = message or self.missing_text(missing_count)
         count_size = self.fit_font_size(
@@ -7562,6 +7645,7 @@ class ChaosHeistApp:
 
         cleanup_steps = [
             ("announcement", self.hide_story_announcement),
+            ("story question message", self.hide_story_question_message),
             ("audio watchdog", self.cancel_audio_watchdog),
             ("energy meter", self.hide_energy_meter),
             ("control panel", lambda: self.set_control_panel_visible(False)),
@@ -7719,6 +7803,7 @@ class ChaosHeistApp:
 
         self.overlay_visible = True
         self.overlay_kind = "completion"
+        self.hide_story_question_message()
         self.title_label.configure(
             text=COMPLETION_MESSAGE,
             foreground="white",

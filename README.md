@@ -13,7 +13,7 @@ On the development computer, superseded local builds were preserved on August 25
 Story Mode arms only after the guard has observed all seven emeralds in place. Starting the guard with an emerald already absent does nothing until all seven are restored and a later removal occurs.
 
 - Removing emeralds 1–6 shows a centered, briefly flashing, non-blocking theft banner over a full-screen Big Box menu. Big Box remains usable and the banner does not take keyboard or joystick focus.
-- The shutdown story cards use larger monitor-aware text, while still shrinking or wrapping to stay inside the arcade display.
+- The shutdown story cards use the largest monitor-aware text that fits, while still shrinking or wrapping to stay inside the arcade display. The cards read `ROBOTNIK'S CHAOS HEIST!` / `Robotnik has stolen the Chaos Emeralds and taken them back to his fortress!`, `THE ARCADE HAS LOST ITS CHAOS ENERGY!` / `Only Sonic can save us!` (with `Sonic` in blue), and `SO EGGMAN'S BEHIND THIS, HUH?`.
 - Each partial theft chooses a different sound from the configured reaction clips; the same clip is never chosen twice in a row.
 - Removing the seventh emerald starts the full takeover only after Big Box is the stable full-screen foreground. It pauses Big Box, mutes its audio, and runs a roughly ten-second staged power failure over the frozen menu: fluorescent flicker, worsening glitches and blackouts, then a classic CRT line-to-dot collapse. The four synchronized clips `flourescent-lights-buzzing.mp3`, `lantern-buzzes-fades.mp3`, `lantern-whines-buzzing-dies.mp3`, and `tv-off.mp3` play in that order before the shutdown narration continues.
 - The final theft uses the dedicated `no-he-s-got-the-last-emerald.mp3` clip. Before the cinematic, the Eggman reveal screen only says `SO EGGMAN'S BEHIND THIS, HUH?` and plays its matching voice clip.
@@ -84,7 +84,7 @@ be counted twice.
   never reaches an emulator remains available for another attempt.
   The Robotnik screen is then restored if emeralds are still missing.
 - At the first total of 50 rings, the non-blocking message `50 Rings!` and
-  `You've earned a Medallion!` is shown for at least 10 seconds when Big Box is
+  `Sonic holds the KEY to your prize... if it hasn't already been taken!` is shown for at least 10 seconds when Big Box is
   safely visible. If a game is active at that moment, the message remains
   pending and is shown the next time Big Box returns. Sensor and mode changes
   wait behind its ten-second priority interval. If a game interrupts the

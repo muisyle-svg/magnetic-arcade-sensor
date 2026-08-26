@@ -1570,7 +1570,10 @@ class GuardLogicTests(unittest.TestCase):
 
     def test_story_intro_text_does_not_assume_sonic_has_been_recruited(self):
         self.assertNotIn("SONIC!", guard_module.STORY_QUESTION_TITLE)
-        self.assertNotIn("SONIC", guard_module.STORY_QUESTION_MESSAGE)
+        self.assertEqual(
+            guard_module.STORY_QUESTION_MESSAGE,
+            "Only Sonic can save us!",
+        )
         self.assertEqual(guard_module.STORY_EGGMAN_MESSAGE, "")
 
     def test_removal_sound_selection_excludes_previous_sound(self):
