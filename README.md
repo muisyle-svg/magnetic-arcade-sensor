@@ -61,6 +61,10 @@ be counted twice.
   the countdown expires, the Robotnik lock returns without covering an active
   game. The instructional text can be dismissed independently, but the meter
   remains until a game starts or the deadline expires.
+- While Ring Power is waiting, a later ring briefly replaces only the
+  instructional text with the current ring total. The independent energy
+  countdown keeps its original deadline and continues draining; a milestone
+  prize still has priority and is never interrupted.
 - Ring announcements are shown only while full-screen Big Box is safely in the
   foreground or over the guard's own Robotnik recovery screen. A ring deposited
   during MAME, GroovyMAME, RetroArch, or another game is still counted
@@ -208,6 +212,13 @@ Keep `chaos-heist-config.json` beside `ChaosHeist.exe`. A legacy `guard-config.j
 - `ring_announcement_seconds`: how long ordinary ring-count messages remain visible; default `3.0`.
 - `ring_milestone_announcement_seconds`: how long the 50-ring prize message must remain visible before it is acknowledged; minimum and default `10.0`.
 - `cinematic_max_fps`: maximum cinematic display rate; default `15` to keep audio and video synchronized on the arcade PC.
+
+ChaosHeist plays all configured audio through pygame's mixer; it never opens
+MP3 files with the Windows default player. If Groove Music nevertheless steals
+the foreground during an active guard presentation, the watchdog minimizes it
+without closing it and records the event in the status log. Cinematic frames
+are copied to tightly packed RGB images before resizing for Tk, avoiding
+decoder-stride artifacts on arcade displays.
 
 Other GIF, MP3, and MP4 files beside the EXE also override their bundled copies when their configured filenames match. The configured cinematic, shutdown sequence, ring, prize, emerald, victory, Robotnik, and removal assets are mandatory for a production build; the build stops with the exact missing filenames instead of silently producing an incomplete EXE.
 

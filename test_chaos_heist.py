@@ -108,6 +108,37 @@ class GuardLogicTests(unittest.TestCase):
             frozenset({"fallback.exe"}),
         )
 
+    def test_external_audio_player_process_names_are_recognized(self):
+        self.assertTrue(
+            guard_module.is_external_audio_player_process(
+                r"C:\\Program Files\\WindowsApps\\Music.UI.exe"
+            )
+        )
+        self.assertTrue(
+            guard_module.is_external_audio_player_process("groovemusic.exe")
+        )
+        self.assertFalse(
+            guard_module.is_external_audio_player_process("bigbox.exe")
+        )
+
+    def test_external_audio_player_is_minimized_without_being_closed(self):
+        guard = self.make_guard()
+        guard.running = True
+        guard.guard_active = True
+        guard.audio_presentation_is_active = lambda: True
+        guard.get_window_process_name = lambda _window: "music.ui.exe"
+        guard.write_status = lambda *args, **kwargs: None
+        user32 = guard_module.ctypes.windll.user32
+
+        with (
+            patch.object(user32, "GetForegroundWindow", return_value=123),
+            patch.object(user32, "IsIconic", return_value=False),
+            patch.object(user32, "ShowWindow", return_value=True) as show,
+        ):
+            self.assertTrue(guard.suppress_external_audio_player())
+
+        show.assert_called_once_with(123, guard_module.SW_MINIMIZE)
+
     def test_protocol_parser_rejects_malformed_heartbeat_traffic(self):
         self.assertEqual(
             guard_module.parse_magnet_protocol_message(
@@ -284,6 +315,40 @@ class GuardLogicTests(unittest.TestCase):
         self.assertEqual(guard.ring_count, 9)
         self.assertTrue(guard.ring_burst_active)
         self.assertEqual(announcements, ["count"])
+
+    def test_ring_count_notice_can_replace_burst_text_without_rearming_meter(self):
+        guard = self.make_guard()
+        guard.ring_count = 12
+        guard.ring_burst_active = True
+        guard.ring_burst_selection_deadline = 135.0
+        guard.active_ring_announcement_kind = "burst"
+        guard.ring_power_announcement_visible = True
+        guard.hide_story_announcement = MagicMock()
+        guard.write_status = lambda *args, **kwargs: None
+
+        guard.request_ring_announcement("count")
+
+        guard.hide_story_announcement.assert_called_once_with()
+        self.assertEqual(guard.pending_ring_announcement, "count")
+        self.assertTrue(guard.ring_burst_active)
+        self.assertEqual(guard.ring_burst_selection_deadline, 135.0)
+
+    def test_ring_count_notice_ignores_the_ring_input_that_created_it(self):
+        guard = self.make_guard()
+        guard.active_ring_announcement_kind = "count"
+        guard.joystick_press_sequence = 7
+        guard.ring_count_ignore_press_sequence = 7
+        guard.running = False
+        guard.hide_story_announcement = MagicMock()
+        guard.write_status = lambda *args, **kwargs: None
+
+        guard.handle_joystick_press(7)
+
+        guard.hide_story_announcement.assert_not_called()
+
+        guard.handle_joystick_press(8)
+
+        guard.hide_story_announcement.assert_called_once_with()
 
     def test_fiftieth_ring_queues_milestone_once(self):
         guard = self.make_guard()
@@ -2025,7 +2090,9 @@ class GuardLogicTests(unittest.TestCase):
         and guard_module.ORIGINAL_CINEMATIC_VIDEO_PATH.is_file(),
         "Sonic cinematic asset or decoder is not available",
     )
-    def test_cinematic_frame_can_be_scaled_directly_to_rgb(self):
+    def test_cinematic_frame_is_copied_before_pillow_scaling(self):
+        if not guard_module.PIL_AVAILABLE:
+            self.skipTest("Pillow is not available")
         with guard_module.av.open(
             str(guard_module.ORIGINAL_CINEMATIC_VIDEO_PATH)
         ) as container:
@@ -2033,11 +2100,8 @@ class GuardLogicTests(unittest.TestCase):
                 stream for stream in container.streams if stream.type == "video"
             )
             frame = next(container.decode(video_stream))
-            image = frame.reformat(
-                width=640,
-                height=480,
-                format="rgb24",
-            ).to_image()
+            guard = self.make_guard()
+            image = guard.prepare_cinematic_frame_image(frame, (640, 480))
 
         self.assertEqual(image.mode, "RGB")
         self.assertEqual(image.size, (640, 480))

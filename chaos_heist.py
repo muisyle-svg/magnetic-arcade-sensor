@@ -112,6 +112,17 @@ DEFAULT_EMULATOR_PROCESS_NAMES = (
     "retroarch.exe",
 )
 
+# ChaosHeist never uses Windows file associations for sound playback. These
+# are only a containment list for the rare case where Groove Music or its
+# legacy executable steals the foreground while the guard is presenting an
+# active sound/overlay.
+EXTERNAL_AUDIO_PLAYER_PROCESS_NAMES = frozenset(
+    {
+        "groovemusic.exe",
+        "music.ui.exe",
+    }
+)
+
 
 DEFAULT_CONFIG = {
     "total_emeralds": FIRMWARE_TOTAL_EMERALDS,
@@ -479,6 +490,15 @@ def config_process_names(value, defaults) -> frozenset[str]:
         normalized.add(process_name)
 
     return frozenset(normalized or defaults)
+
+
+def is_external_audio_player_process(process_name: str) -> bool:
+    """Identify a Windows media player that should not cover the guard."""
+    if not isinstance(process_name, str):
+        return False
+    return Path(process_name.strip()).name.lower() in (
+        EXTERNAL_AUDIO_PLAYER_PROCESS_NAMES
+    )
 
 
 def joystick_button_mask(human_button_number: int) -> int:
@@ -1031,6 +1051,7 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 SW_SHOWNOACTIVATE = 4
+SW_MINIMIZE = 6
 CURSOR_SHOWING = 0x00000001
 PROCESS_SUSPEND_RESUME = 0x0800
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -1474,6 +1495,7 @@ class ChaosHeistApp:
         self.ring_power_ignore_until = 0.0
         self.joystick_press_sequence = 0
         self.ring_power_ignore_press_sequence = 0
+        self.ring_count_ignore_press_sequence = 0
         self.pending_ring_milestone = False
         self.pending_ring_announcement: Optional[str] = None
         self.active_ring_announcement_kind: Optional[str] = None
@@ -3648,6 +3670,30 @@ class ChaosHeistApp:
             self.cinematic_prepare_state = "error"
             self.cinematic_prepare_error = str(error).replace("\n", " ")[:160]
 
+    def prepare_cinematic_frame_image(self, frame, target_size: tuple[int, int]):
+        """Detach a decoded frame before scaling it for Tk.
+
+        PyAV frames can expose padded YUV/RGB planes whose lifetime and stride
+        are tied to the decoder. Converting them directly with ``reformat``
+        and handing the result to a long-lived Tk image has produced the
+        characteristic black vertical dashes on some arcade PCs. A copied
+        Pillow RGB image gives Tk tightly packed, stable pixels. BILINEAR is
+        intentionally used here: the cinematic is prebuffered and the arcade
+        PC needs predictable frame time more than an expensive resize filter.
+        """
+        source_image = frame.to_image().convert("RGB").copy()
+        if source_image.size == target_size:
+            source_image.load()
+            return source_image
+
+        resampling = getattr(Image, "Resampling", Image).BILINEAR
+        display_image = source_image.resize(
+            target_size,
+            resample=resampling,
+        )
+        display_image.load()
+        return display_image.copy()
+
     def decode_cinematic_frames(self, generation: int) -> None:
         try:
             with av.open(str(self.cinematic_video_path)) as container:
@@ -3694,15 +3740,14 @@ class ChaosHeistApp:
                         max(1, int(frame.width * scale)),
                         max(1, int(frame.height * scale)),
                     )
-                    # Let FFmpeg/PyAV scale directly into a tightly packed RGB
-                    # frame. This avoids the padded-buffer artifacts seen as
-                    # vertical black dashes and is much cheaper than a second
-                    # full-frame Pillow resize.
-                    frame_image = frame.reformat(
-                        width=target_size[0],
-                        height=target_size[1],
-                        format="rgb24",
-                    ).to_image()
+                    # Detach from PyAV's frame buffers before Tk sees the
+                    # image. This avoids stride/padding artifacts and keeps
+                    # decoder-owned memory from being reused underneath a
+                    # queued display frame.
+                    frame_image = self.prepare_cinematic_frame_image(
+                        frame,
+                        target_size,
+                    )
 
                     while not self.cinematic_cancel_event.is_set():
                         try:
@@ -4986,21 +5031,29 @@ class ChaosHeistApp:
                 "RING ANNOUNCEMENT HELD | 50-RING PRIZE ACTIVE"
             )
             return
-        if (
-            announcement_kind != "milestone"
-            and getattr(self, "ring_burst_active", False)
-            and getattr(self, "ring_burst_selection_deadline", None)
-            is not None
-        ):
-            # Once the independent meter is running, later rings must not
-            # replace or restart its countdown. The persistent total is still
-            # recorded by handle_ring_entry, and a milestone may interrupt
-            # this branch because it has higher presentation priority.
+
+        active_kind = getattr(self, "active_ring_announcement_kind", None)
+        if active_kind == "burst" and announcement_kind == "count":
+            # Ring Power's segmented meter/countdown is a separate window.
+            # Let a later ring briefly use the text banner without changing
+            # the burst deadline, restarting its meter animation, or
+            # consuming the one-game pass.
+            self.pending_ring_announcement = "count"
+            self.ring_count_ignore_press_sequence = getattr(
+                self,
+                "joystick_press_sequence",
+                0,
+            )
+            self.write_status(
+                "RING COUNT PRIORITIZED OVER RING POWER TEXT | "
+                f"total={self.ring_count}"
+            )
+            self.hide_story_announcement()
             return
+
         current = getattr(self, "pending_ring_announcement", None)
         if priorities.get(announcement_kind, 0) >= priorities.get(current, 0):
             self.pending_ring_announcement = announcement_kind
-        active_kind = getattr(self, "active_ring_announcement_kind", None)
         if active_kind is not None:
             active_priority = priorities.get(active_kind, 0)
             pending_priority = priorities.get(
@@ -5037,8 +5090,10 @@ class ChaosHeistApp:
         )
         if (
             getattr(self, "ring_power_announcement_visible", False)
-            and not self.pending_ring_milestone
+            and announcement_kind not in {"count", "milestone"}
         ):
+            # The separate Ring Power meter remains visible, but a normal
+            # ring-count notice is allowed to use the text banner briefly.
             return
         if getattr(self, "active_ring_announcement_kind", None) is not None:
             return
@@ -5140,6 +5195,32 @@ class ChaosHeistApp:
             return
 
         if active_kind == "count":
+            try:
+                event_sequence = (
+                    int(press_sequence)
+                    if press_sequence is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                event_sequence = None
+            ignored_sequence = getattr(
+                self,
+                "ring_count_ignore_press_sequence",
+                0,
+            )
+            current_sequence = getattr(
+                self,
+                "joystick_press_sequence",
+                0,
+            )
+            if (
+                event_sequence is not None
+                and event_sequence <= ignored_sequence
+            ) or (
+                event_sequence is None
+                and current_sequence <= ignored_sequence
+            ):
+                return
             try:
                 self.hide_story_announcement()
                 self.write_status("RING COUNT ANNOUNCEMENT DISMISSED | joystick")
@@ -5701,6 +5782,77 @@ class ChaosHeistApp:
         # never withdraws, restores, or unminimizes the panel on its own.
         return
 
+    def audio_presentation_is_active(self) -> bool:
+        """Return whether ChaosHeist currently owns an audio presentation."""
+        if (
+            getattr(self, "overlay_visible", False)
+            or getattr(self, "cinematic_after_id", None) is not None
+            or getattr(self, "active_ring_announcement_kind", None)
+            is not None
+            or getattr(self, "ring_power_meter_visible", False)
+        ):
+            return True
+
+        # Missing/completion music is intentionally persistent while its
+        # screen is active. A short event sound also counts as a presentation
+        # so a media-player window cannot appear over a ring or emerald cue.
+        if getattr(self, "music_mode", None) in {"missing", "completion"}:
+            return True
+        try:
+            return bool(self.event_channel_busy())
+        except Exception:
+            return False
+
+    def suppress_external_audio_player(self) -> bool:
+        """Minimize Groove if it unexpectedly steals the guard's foreground.
+
+        pygame's mixer is the only supported audio path in ChaosHeist. This
+        containment is for Windows machines where an unrelated file
+        association, media key, or shell integration launches Groove while a
+        guard cue is playing. It does not close processes and does not touch
+        unrelated foreground applications.
+        """
+        if not (
+            getattr(self, "running", False)
+            and getattr(self, "guard_active", False)
+            and self.audio_presentation_is_active()
+        ):
+            return False
+
+        try:
+            user32 = ctypes.windll.user32
+            foreground_window = user32.GetForegroundWindow()
+        except (AttributeError, OSError):
+            return False
+        if not foreground_window:
+            return False
+
+        process_name = self.get_window_process_name(foreground_window)
+        if not is_external_audio_player_process(process_name):
+            self.last_external_audio_player_name = ""
+            return False
+
+        try:
+            if user32.IsIconic(foreground_window):
+                return False
+            minimized = bool(
+                user32.ShowWindow(foreground_window, SW_MINIMIZE)
+            )
+        except (AttributeError, OSError):
+            return False
+
+        if process_name != getattr(
+            self,
+            "last_external_audio_player_name",
+            "",
+        ):
+            self.write_status(
+                "UNEXPECTED AUDIO PLAYER HIDDEN | "
+                f"process={process_name}"
+            )
+            self.last_external_audio_player_name = process_name
+        return minimized
+
     def update_control_panel_visibility(self) -> None:
         try:
             foreground_window = ctypes.windll.user32.GetForegroundWindow()
@@ -6255,6 +6407,16 @@ class ChaosHeistApp:
 
     def foreground_watchdog(self) -> None:
         try:
+            if self.running and self.guard_active:
+                try:
+                    self.suppress_external_audio_player()
+                except Exception as error:
+                    # Audio-player containment is deliberately noncritical:
+                    # a failure here must never disable a working guard.
+                    self.write_status(
+                        "AUDIO PLAYER CONTAINMENT RECOVERED | "
+                        + str(error).replace("\n", " ")[:120]
+                    )
             if self.running and self.guard_active:
                 if (
                     self.ring_power_announcement_visible
