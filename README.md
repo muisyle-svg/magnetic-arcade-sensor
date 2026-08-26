@@ -210,7 +210,7 @@ Keep `chaos-heist-config.json` beside `ChaosHeist.exe`. A legacy `guard-config.j
 - `ring_joystick_button`: human-numbered joystick button used for rings; default `10`.
 - `ring_debounce_ms`: short anti-bounce interval; default `90` ms.
 - `ring_game_commit_seconds`: how long an emulator must remain active before one Ring Power use is committed; default `3.0` seconds. Returning to Big Box restores the Robotnik screen if it granted the burst.
-- `ring_power_selection_seconds`: how long Ring Power waits for a game to be selected; default `35.0` seconds. The on-screen countdown is the seven-segment Chaos Energy meter: one segment blinks for each five-second phase, then goes dark. The meter is independent from the dismissible Ring Power text and disappears as soon as an emulator is detected.
+- `ring_power_selection_seconds`: how long Ring Power waits for a game to be selected; default `35.0` seconds. The decorative seven-segment Chaos Energy meter still changes phase every five seconds, while its numeric percentage drains continuously and linearly from 100% to 0% across the full 35 seconds. The meter is independent from the dismissible Ring Power text and disappears as soon as an emulator is detected.
 - `ring_announcement_seconds`: how long ordinary ring-count messages remain visible; default `3.0`.
 - `ring_milestone_announcement_seconds`: how long the 50-ring prize message must remain visible before it is acknowledged; minimum and default `10.0`.
 - `cinematic_max_fps`: maximum cinematic display rate; default `15` to keep audio and video synchronized on the arcade PC.
@@ -219,8 +219,9 @@ ChaosHeist plays all configured audio through pygame's mixer; it never opens
 MP3 files with the Windows default player. If Groove Music nevertheless steals
 the foreground during an active guard presentation, the watchdog minimizes it
 without closing it and records the event in the status log. Cinematic frames
-are copied to tightly packed RGB images before resizing for Tk, avoiding
-decoder-stride artifacts on arcade displays.
+are copied row-by-row into tightly packed RGB images before resizing for Tk,
+removing decoder padding that can appear as vertical artifacts on arcade
+displays.
 
 Other GIF, MP3, and MP4 files beside the EXE also override their bundled copies when their configured filenames match. The configured cinematic, shutdown sequence, ring, prize, emerald, victory, Robotnik, and removal assets are mandatory for a production build; the build stops with the exact missing filenames instead of silently producing an incomplete EXE.
 

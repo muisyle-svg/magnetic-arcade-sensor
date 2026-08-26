@@ -638,6 +638,31 @@ class GuardLogicTests(unittest.TestCase):
         )
         self.assertEqual(rendered[4][1]["display_percent"], 0.0)
 
+    def test_ring_power_percentage_uses_deadline_not_segment_start_time(self):
+        guard = self.make_guard()
+        guard.ring_burst_active = True
+        guard.ring_burst_selection_expired = False
+        guard.ring_burst_game_seen_since = 0.0
+        guard.ring_burst_selection_deadline = 135.0
+        # Deliberately make this disagree with the deadline. The percentage
+        # must still represent 32.5 seconds remaining out of 35 seconds.
+        guard.ring_power_selection_started_at = 90.0
+        guard.overlay_monitor_bounds = (0, 0, 640, 480)
+        guard.ring_power_meter_canvas = MagicMock()
+        rendered = []
+        guard.render_segmented_energy_meter = (
+            lambda canvas, present_count, **kwargs: rendered.append(kwargs)
+        )
+
+        guard.render_ring_power_countdown_meter(now=102.5)
+
+        self.assertEqual(len(rendered), 1)
+        self.assertAlmostEqual(
+            rendered[0]["display_percent"],
+            92.857,
+            places=2,
+        )
+
     def test_ring_power_meter_stays_when_text_banner_is_dismissed(self):
         guard = self.make_guard()
         guard.ring_burst_active = True
@@ -2174,6 +2199,49 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(image.mode, "RGB")
         self.assertEqual(image.size, (640, 480))
+
+    def test_cinematic_frame_copy_removes_decoder_row_padding(self):
+        if not guard_module.PIL_AVAILABLE:
+            self.skipTest("Pillow is not available")
+
+        class PaddedPlane:
+            line_size = 8
+
+            def __bytes__(self):
+                # Two RGB pixels per row plus two bytes of decoder padding.
+                return bytes(
+                    (
+                        255, 0, 0, 0, 255, 0, 99, 99,
+                        0, 0, 255, 255, 255, 0, 88, 88,
+                    )
+                )
+
+        class RGBFrame:
+            width = 2
+            height = 2
+            planes = (PaddedPlane(),)
+
+        class PaddedFrame:
+            def reformat(self, format):
+                self.asserted_format = format
+                return RGBFrame()
+
+            def to_image(self):
+                raise AssertionError("the padded RGB path should be used")
+
+        frame = PaddedFrame()
+        guard = self.make_guard()
+        image = guard.prepare_cinematic_frame_image(frame, (2, 2))
+
+        self.assertEqual(frame.asserted_format, "rgb24")
+        self.assertEqual(
+            [
+                image.getpixel((x, y))
+                for y in range(image.height)
+                for x in range(image.width)
+            ],
+            [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)],
+        )
 
     def test_resume_watchdog_honors_cancel_before_resuming(self):
         guard_module.configure_windows_runtime()

@@ -2354,7 +2354,13 @@ class ChaosHeistApp:
         self.ring_power_meter_filling = False
 
     def render_ring_power_countdown_meter(self, now=None) -> None:
-        """Render the seven five-second Ring Power countdown phases."""
+        """Render the Ring Power countdown with a linear numeric percentage.
+
+        The segment display is intentionally discrete, but the percentage is
+        calculated directly from the selection deadline. Keeping those two
+        values separate prevents the numeric readout from inheriting any
+        segment-boundary timing or rounding behavior.
+        """
         if not (
             getattr(self, "ring_burst_active", False)
             and getattr(self, "ring_burst_selection_deadline", None) is not None
@@ -2372,7 +2378,8 @@ class ChaosHeistApp:
             started_at = deadline - RING_POWER_SELECTION_SECONDS
         if now is None:
             now = time.monotonic()
-        elapsed = max(0.0, float(now) - started_at)
+        now = float(now)
+        elapsed = max(0.0, now - started_at)
         segment_seconds = max(0.001, RING_POWER_SEGMENT_SECONDS)
         elapsed_energy = min(
             float(TOTAL_EMERALDS),
@@ -2383,13 +2390,15 @@ class ChaosHeistApp:
             int(elapsed_energy),
         )
         remaining_segments = TOTAL_EMERALDS - phase
-        remaining_energy = max(
+        total_seconds = max(0.001, float(RING_POWER_SELECTION_SECONDS))
+        remaining_seconds = max(
             0.0,
-            float(TOTAL_EMERALDS) - elapsed_energy,
+            min(
+                total_seconds,
+                float(self.ring_burst_selection_deadline) - now,
+            ),
         )
-        remaining_percent = (
-            remaining_energy * 100.0 / TOTAL_EMERALDS
-        )
+        remaining_percent = remaining_seconds * 100.0 / total_seconds
         self.render_segmented_energy_meter(
             canvas,
             remaining_segments,
@@ -3179,19 +3188,6 @@ class ChaosHeistApp:
                     fill=color,
                     outline="",
                 )
-            # A few narrow vertical tears make the failure look less like a
-            # uniform brightness fade without touching the menu underneath.
-            for index in range(3):
-                tear_x = (tick * (43 + index * 11) + 73 * index) % width
-                tear_width = 1 + ((tick + index) % 5)
-                canvas.create_rectangle(
-                    tear_x,
-                    0,
-                    min(width, tear_x + tear_width),
-                    height,
-                    fill="#ffffff" if (tick + index) % 2 else "#111111",
-                    outline="",
-                )
             canvas.update_idletasks()
         except tk.TclError:
             return
@@ -3708,14 +3704,32 @@ class ChaosHeistApp:
         """Detach a decoded frame before scaling it for Tk.
 
         PyAV frames can expose padded YUV/RGB planes whose lifetime and stride
-        are tied to the decoder. Converting them directly with ``reformat``
-        and handing the result to a long-lived Tk image has produced the
-        characteristic black vertical dashes on some arcade PCs. A copied
-        Pillow RGB image gives Tk tightly packed, stable pixels. BILINEAR is
-        intentionally used here: the cinematic is prebuffered and the arcade
-        PC needs predictable frame time more than an expensive resize filter.
+        are tied to the decoder. The RGB plane is therefore copied row by row
+        into a tightly packed Pillow image before Tk sees it. This explicitly
+        removes any decoder padding instead of relying on the version-specific
+        behavior of PyAV's ``to_image`` conversion. BILINEAR is intentionally
+        used here: the cinematic is prebuffered and the arcade PC needs
+        predictable frame time more than an expensive resize filter.
         """
-        source_image = frame.to_image().convert("RGB").copy()
+        try:
+            rgb_frame = frame.reformat(format="rgb24")
+            rgb_plane = rgb_frame.planes[0]
+            row_width = rgb_frame.width * 3
+            row_stride = rgb_plane.line_size
+            plane_bytes = bytes(rgb_plane)
+            packed_bytes = b"".join(
+                plane_bytes[row * row_stride:row * row_stride + row_width]
+                for row in range(rgb_frame.height)
+            )
+            source_image = Image.frombytes(
+                "RGB",
+                (rgb_frame.width, rgb_frame.height),
+                packed_bytes,
+            )
+        except (AttributeError, IndexError, TypeError, ValueError):
+            # Keep compatibility with unusual PyAV frame implementations
+            # while still detaching their memory before any resize.
+            source_image = frame.to_image().convert("RGB").copy()
         if source_image.size == target_size:
             source_image.load()
             return source_image
