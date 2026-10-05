@@ -101,6 +101,8 @@ try:
 except ImportError:
     PYCAW_AVAILABLE = False
 
+import garage_games_mode as garage_games
+
 bootstrap_event("module imports complete")
 
 
@@ -187,6 +189,10 @@ DEFAULT_CONFIG = {
     "ring_power_selection_seconds": 35.0,
     "ring_announcement_seconds": 3.0,
     "ring_milestone_announcement_seconds": 10.0,
+    "garage_games_ring_goal": garage_games.DEFAULT_RING_GOAL,
+    "garage_games_zero_confirm_seconds": (
+        garage_games.DEFAULT_ZERO_CONFIRM_SECONDS
+    ),
     "emulator_process_names": list(DEFAULT_EMULATOR_PROCESS_NAMES),
     "cinematic_max_fps": 15,
     "cinematic_video_file": (
@@ -404,7 +410,8 @@ def validate_runtime_config_shape(config: dict) -> tuple[list[str], list[str]]:
     default_mode_value = config.get("default_mode")
     if (
         not isinstance(default_mode_value, str)
-        or default_mode_value.strip().lower() not in {"story", "normal"}
+        or default_mode_value.strip().lower()
+        not in {"story", "normal", "garage"}
     ):
         warnings.append("default_mode is invalid; using story")
     if not isinstance(config.get("auto_activate"), (bool, str, int, float)):
@@ -679,6 +686,30 @@ RING_MILESTONE_ANNOUNCEMENT_SECONDS = config_number(
     10.0,
     60.0,
 )
+GARAGE_RING_GOAL = int(
+    config_number(
+        RUNTIME_CONFIG.get(
+            "garage_games_ring_goal",
+            garage_games.DEFAULT_RING_GOAL,
+        ),
+        garage_games.DEFAULT_RING_GOAL,
+        1,
+        999,
+    )
+)
+GARAGE_ZERO_CONFIRM_SECONDS = config_number(
+    RUNTIME_CONFIG.get(
+        "garage_games_zero_confirm_seconds",
+        garage_games.DEFAULT_ZERO_CONFIRM_SECONDS,
+    ),
+    garage_games.DEFAULT_ZERO_CONFIRM_SECONDS,
+    0.2,
+    10.0,
+)
+GARAGE_STATE_VERSION = 1
+GARAGE_VICTORY_MESSAGE = "EVENT COMPLETE!"
+GARAGE_RING_COLOR = "#ffd23f"
+GARAGE_WARNING_COLOR = "#ffcc33"
 RING_MILESTONE = 50
 RING_MILESTONE_TITLE = "50 Rings!"
 RING_MILESTONE_MESSAGE = (
@@ -704,9 +735,10 @@ CINEMATIC_FINISH_GRACE_SECONDS = 20.0
 configured_default_mode = str(
     RUNTIME_CONFIG.get("default_mode", "story")
 ).strip().lower()
+GUARD_MODES = ("story", "normal", "garage")
 DEFAULT_GUARD_MODE = (
     configured_default_mode
-    if configured_default_mode in {"story", "normal"}
+    if configured_default_mode in GUARD_MODES
     else "story"
 )
 try:
@@ -1531,6 +1563,29 @@ class ChaosHeistApp:
         self.ring_counter_backup_path = (
             app_data_directory / "ring-counter.backup.json"
         )
+        # Garage Games mode: one competitor's emerald-and-ring event at a
+        # time. Its ring counter is separate from the lifetime ring total.
+        self.garage_state_path = (
+            app_data_directory / "garage-games-run.json"
+        )
+        self.garage = garage_games.GarageRunController(
+            ring_goal=GARAGE_RING_GOAL,
+            zero_confirm_seconds=GARAGE_ZERO_CONFIRM_SECONDS,
+        )
+        self.garage_station_mac = ""
+        self.garage_station_radio = ""
+        self.garage_ident_status = ""
+        self.garage_link_seen_at = 0.0
+        self.garage_last_run = None
+        self.garage_view_key = None
+        self.garage_state_queue = queue.Queue(maxsize=1)
+        self.garage_state_stop_event = threading.Event()
+        self.garage_state_thread = None
+        self.garage_state_warning = ""
+        self.serial_device = None
+        self.serial_device_lock = threading.Lock()
+        self.serial_write_queue = queue.Queue(maxsize=32)
+        self.load_garage_state()
         (
             self.ring_count,
             self.ring_milestones_shown,
@@ -1572,6 +1627,8 @@ class ChaosHeistApp:
         self.control_story_button = None
         self.control_normal_button = None
         self.control_reset_rings_button = None
+        self.control_garage_button = None
+        self.control_garage_ident_button = None
         self.story_question_message_frame = None
         self.story_question_prefix_label = None
         self.story_question_sonic_label = None
@@ -1894,6 +1951,14 @@ class ChaosHeistApp:
         )
         self.energy_canvas.place_forget()
 
+        self.garage_ring_canvas = tk.Canvas(
+            self.root,
+            background="#000000",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self.garage_ring_canvas.place_forget()
+
         # Render the cinematic on its own opaque full-monitor surface. The
         # normal Label is intentionally not reused: repeatedly replacing a
         # Label image can leave partial repaint artifacts on some arcade
@@ -1926,6 +1991,22 @@ class ChaosHeistApp:
             daemon=True,
         )
         self.ring_persistence_thread.start()
+
+        self.garage_state_thread = threading.Thread(
+            target=self.worker_entry,
+            args=(
+                "Garage Games state",
+                self.garage_state_worker,
+                False,
+            ),
+            daemon=True,
+        )
+        self.garage_state_thread.start()
+        threading.Thread(
+            target=self.worker_entry,
+            args=("ESP32 command", self.serial_writer_worker, False),
+            daemon=True,
+        ).start()
 
         if AV_AVAILABLE and self.cinematic_video_path.exists():
             self.cinematic_prepare_state = "preparing"
@@ -1982,6 +2063,7 @@ class ChaosHeistApp:
         self.root.after(250, self.foreground_watchdog)
         self.root.after(500, self.keep_window_on_top)
         self.root.after(100, self.status_heartbeat)
+        self.root.after(100, self.garage_heartbeat)
 
         # Start dormant. Ctrl + Alt + F10 selects and activates Story Mode;
         # Ctrl + Alt + F12 activates the currently selected mode.
@@ -5062,6 +5144,14 @@ class ChaosHeistApp:
             f"RING ENTERED | total={self.ring_count}",
         )
 
+        if self.garage_mode_active():
+            # The lifetime total above still counts every coin. The event's
+            # own counter only advances during its ring stage, and Ring Power
+            # and ring banners stay out of the way of the event screen.
+            self.garage.handle_ring()
+            self.apply_garage_updates()
+            return
+
         burst_started = False
         burst_origin = None
         if not self.ring_burst_active:
@@ -5356,6 +5446,8 @@ class ChaosHeistApp:
         )
 
     def request_ring_announcement(self, announcement_kind: str) -> None:
+        if self.garage_mode_active():
+            return
         priorities = {"count": 1, "burst": 2, "milestone": 3}
         if getattr(self, "active_ring_announcement_kind", None) == "milestone":
             self.write_status(
@@ -5407,6 +5499,10 @@ class ChaosHeistApp:
         self.maybe_show_pending_ring_announcement()
 
     def maybe_show_pending_ring_announcement(self) -> None:
+        if self.garage_mode_active():
+            # A prize reached during the event stays pending and is shown
+            # after leaving Garage Games mode.
+            return
         if (
             not self.running
             or getattr(self, "active_ring_announcement_kind", None)
@@ -5835,7 +5931,7 @@ class ChaosHeistApp:
         self.control_window = tk.Toplevel(self.root)
         self.control_window.title("Chaos Heist Control")
         panel_width = max(520, min(680, self.screen_width - 20))
-        panel_height = max(380, min(445, self.screen_height - 40))
+        panel_height = max(380, min(540, self.screen_height - 40))
         panel_x = min(40, max(0, (self.screen_width - panel_width) // 2))
         panel_y = min(20, max(0, (self.screen_height - panel_height) // 2))
         self.control_window.geometry(
@@ -5963,6 +6059,32 @@ class ChaosHeistApp:
             pady=(8, 0),
         )
 
+        self.control_garage_button = tk.Button(
+            button_frame,
+            text="GARAGE GAMES MODE",
+            width=24,
+            command=self.select_garage_mode,
+        )
+        self.control_garage_button.grid(
+            row=3,
+            column=0,
+            padx=6,
+            pady=(8, 0),
+        )
+
+        self.control_garage_ident_button = tk.Button(
+            button_frame,
+            text="SEND ID TO GARAGE GAMES",
+            width=24,
+            command=self.send_garage_station_identity,
+        )
+        self.control_garage_ident_button.grid(
+            row=3,
+            column=1,
+            padx=6,
+            pady=(8, 0),
+        )
+
         tk.Label(
             self.control_window,
             text=(
@@ -5978,7 +6100,11 @@ class ChaosHeistApp:
         ).pack(pady=(10, 0))
 
     def get_control_state(self) -> tuple[str, str]:
-        mode_name = "STORY" if self.guard_mode == "story" else "NORMAL"
+        mode_name = {
+            "story": "STORY",
+            "normal": "NORMAL",
+            "garage": "GARAGE GAMES",
+        }.get(self.guard_mode, "NORMAL")
         if self.pending_guard_activation:
             return (
                 f"{mode_name} MODE — WAITING FOR SAFE CLEANUP",
@@ -5988,6 +6114,9 @@ class ChaosHeistApp:
             if self.last_fault:
                 return "DISABLED — " + self.last_fault, "#ff9966"
             return f"{mode_name} MODE SELECTED — GUARD OFF", "#9e9e9e"
+
+        if self.guard_mode == "garage" and getattr(self, "garage", None):
+            return self.get_garage_control_state()
 
         if self.ring_burst_active:
             if getattr(self, "ring_burst_selection_expired", False):
@@ -6086,6 +6215,12 @@ class ChaosHeistApp:
             + self.cinematic_prepare_state
         )
 
+        if getattr(self, "garage", None) is not None and (
+            self.guard_mode == "garage"
+            or getattr(self, "garage_station_mac", "")
+        ):
+            details_text += "\n" + self.garage_control_details()
+
         self.control_state_var.set(state_text)
         self.control_sensor_var.set(sensor_text)
         self.control_details_var.set(details_text)
@@ -6098,14 +6233,23 @@ class ChaosHeistApp:
             )
         )
         story_selected = self.guard_mode == "story"
+        normal_selected = self.guard_mode == "normal"
+        garage_selected = self.guard_mode == "garage"
         self.control_story_button.configure(
             relief=tk.SUNKEN if story_selected else tk.RAISED,
             background="#d6b84b" if story_selected else "SystemButtonFace",
         )
         self.control_normal_button.configure(
-            relief=tk.SUNKEN if not story_selected else tk.RAISED,
-            background="#66b8e8" if not story_selected else "SystemButtonFace",
+            relief=tk.SUNKEN if normal_selected else tk.RAISED,
+            background="#66b8e8" if normal_selected else "SystemButtonFace",
         )
+        if getattr(self, "control_garage_button", None) is not None:
+            self.control_garage_button.configure(
+                relief=tk.SUNKEN if garage_selected else tk.RAISED,
+                background=(
+                    "#7ccf6b" if garage_selected else "SystemButtonFace"
+                ),
+            )
 
     def set_control_panel_visible(self, visible: bool) -> None:
         # The operator panel now follows ordinary Windows behavior. Big Box
@@ -6232,7 +6376,8 @@ class ChaosHeistApp:
             f"ring_burst={self.ring_burst_active} | "
             f"ring_origin={self.ring_burst_origin or 'none'} | "
             f"normal_ring_lock={self.normal_ring_lock_active} | "
-            f"pending_prize={self.pending_ring_milestone}",
+            f"pending_prize={self.pending_ring_milestone} | "
+            f"garage={self.garage_status_text()}",
             event=False,
         )
 
@@ -8141,6 +8286,7 @@ class ChaosHeistApp:
             ("story question message", self.hide_story_question_message),
             ("audio watchdog", self.cancel_audio_watchdog),
             ("energy meter", self.hide_energy_meter),
+            ("Garage Games ring meter", self.hide_garage_ring_meter),
             ("control panel", lambda: self.set_control_panel_visible(False)),
             ("counter style", self.reset_counter_style),
         ]
@@ -8726,6 +8872,17 @@ class ChaosHeistApp:
     def finish_completion(self) -> None:
         self.completion_after_id = None
 
+        if self.garage_mode_active():
+            # The event's result is already with Garage Games; the screen
+            # clears until the next competitor's run is armed.
+            self.completion_in_progress = False
+            self.final_completion_sound_started = False
+            self.final_completion_sound_playing = False
+            self.final_completion_sound_started_at = 0.0
+            self.garage.finish_presentation()
+            self.apply_garage_updates()
+            return
+
         if (
             self.accepted_count == TOTAL_EMERALDS
             and not self.controller_lost
@@ -8802,6 +8959,555 @@ class ChaosHeistApp:
 
         if self.running:
             self.root.after(500, self.keep_window_on_top)
+
+    # --------------------------------------------------
+    # Garage Games mode
+    # --------------------------------------------------
+
+    def garage_status_text(self) -> str:
+        controller = getattr(self, "garage", None)
+        return controller.status_text() if controller is not None else "off"
+
+    def garage_mode_active(self) -> bool:
+        return bool(
+            getattr(self, "guard_active", False)
+            and getattr(self, "guard_mode", None) == "garage"
+            and getattr(self, "garage", None) is not None
+        )
+
+    def load_garage_state(self) -> None:
+        try:
+            if not self.garage_state_path.exists():
+                return
+            payload = json.loads(
+                self.garage_state_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as error:
+            self.garage_state_warning = (
+                "Garage Games run file unreadable; starting fresh: "
+                + str(error).replace("\n", " ")[:100]
+            )
+            self.write_status("GARAGE GAMES STATE IGNORED | " + self.garage_state_warning)
+            return
+        if self.garage.restore(payload):
+            self.write_status(
+                "GARAGE GAMES STATE RESTORED | " + self.garage.status_text()
+            )
+
+    def write_garage_state_file(self, payload: dict) -> None:
+        payload = dict(payload)
+        payload["app_version"] = GARAGE_STATE_VERSION
+        write_json_atomic(self.garage_state_path, payload)
+
+    def save_garage_state(self) -> None:
+        """Queue the latest run snapshot; a slow disk never stalls the event."""
+        snapshot = self.garage.snapshot()
+        try:
+            self.garage_state_queue.put_nowait(snapshot)
+        except queue.Full:
+            try:
+                self.garage_state_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.garage_state_queue.put_nowait(snapshot)
+            except queue.Full:
+                pass
+
+    def garage_state_worker(self) -> None:
+        while self.running and not self.garage_state_stop_event.is_set():
+            try:
+                payload = self.garage_state_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if payload is None:
+                break
+            try:
+                self.write_garage_state_file(payload)
+                self.garage_state_warning = ""
+            except OSError as error:
+                self.garage_state_warning = (
+                    "Garage Games run file save failed: "
+                    + str(error).replace("\n", " ")[:100]
+                )
+
+    def queue_serial_line(self, line: str) -> bool:
+        try:
+            self.serial_write_queue.put_nowait(line)
+            return True
+        except queue.Full:
+            self.write_status(
+                "GARAGE GAMES COMMAND DROPPED | ESP32 command queue full"
+            )
+            return False
+
+    def serial_writer_worker(self) -> None:
+        """Send commands to the ESP32 without blocking the screen."""
+        while self.running:
+            try:
+                line = self.serial_write_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
+            with self.serial_device_lock:
+                device = self.serial_device
+            if device is None:
+                self.messages.put(
+                    (
+                        "GARAGE_COMMAND_FAILED",
+                        "ESP32 not connected | " + line.strip(),
+                        -1,
+                    )
+                )
+                continue
+            try:
+                device.write(line.encode("ascii"))
+            except (SerialException, OSError, ValueError) as error:
+                self.messages.put(
+                    (
+                        "GARAGE_COMMAND_FAILED",
+                        str(error).replace("\n", " ")[:120]
+                        + " | "
+                        + line.strip(),
+                        -1,
+                    )
+                )
+
+    def handle_garage_station_message(self, line: str) -> None:
+        parsed = garage_games.parse_garage_station_message(line)
+        if parsed is None:
+            return
+        kind = parsed[0]
+        if kind == "station":
+            self.garage_station_mac = parsed[1]
+            self.garage_station_radio = (
+                "radio ready" if parsed[2] == "READY" else "RADIO FAILED"
+            )
+            return
+        if kind == "ident":
+            self.garage_ident_status = (
+                "ID sent - press Assign in Garage Games Setup first"
+                if parsed[1] == "SENT"
+                else "ID not sent - Garage Games must be idle with no run"
+            )
+            self.write_status("GARAGE GAMES STATION ID | " + parsed[1])
+            return
+        if kind == "run":
+            self.garage_link_seen_at = time.monotonic()
+            self.garage_last_run = (parsed[1], parsed[2])
+
+        if not self.garage_mode_active():
+            return
+
+        if kind == "run":
+            previous = (self.garage.link_token, self.garage.link_state)
+            self.garage.handle_run_status(parsed[1], parsed[2])
+            if previous != (parsed[1], parsed[2]):
+                self.write_status(
+                    "GARAGE GAMES RUN | "
+                    f"token={parsed[1] or '-'} | state={parsed[2]}"
+                )
+        elif kind == "event":
+            self.garage.handle_event_state(parsed[1], parsed[2])
+        elif kind == "result":
+            _, token, signal, sequence, state = parsed
+            self.write_status(
+                "GARAGE GAMES RESULT | "
+                f"signal={signal} seq={sequence} state={state}"
+            )
+            self.garage.handle_result(token, signal, sequence, state)
+        elif kind == "noack":
+            _, token, signal, sequence, reason = parsed
+            self.write_status(
+                "GARAGE GAMES NO ANSWER | "
+                f"signal={signal} seq={sequence} reason={reason}"
+            )
+            self.garage.handle_noack(token, signal, sequence, reason)
+        self.apply_garage_updates()
+
+    def handle_garage_link_lost(self) -> None:
+        self.garage_station_radio = "USB disconnected"
+        self.garage_link_seen_at = 0.0
+        self.garage_last_run = None
+        if self.garage_mode_active():
+            self.garage.handle_run_status(None, "STALE")
+            self.apply_garage_updates()
+
+    def handle_garage_count_change(
+        self,
+        previous_count: Optional[int],
+        count: int,
+    ) -> None:
+        placing = self.garage.stage == garage_games.STAGE_PLACING
+        self.garage.handle_count(count)
+        if (
+            self.garage_mode_active()
+            and placing
+            and previous_count is not None
+            and count > previous_count
+        ):
+            self.play_emerald_sound(final=count == TOTAL_EMERALDS)
+        self.apply_garage_updates()
+
+    def garage_heartbeat(self) -> None:
+        try:
+            if self.garage_mode_active():
+                if (
+                    self.garage.link_state != "STALE"
+                    and (
+                        not self.garage_link_seen_at
+                        or time.monotonic() - self.garage_link_seen_at > 3.0
+                    )
+                ):
+                    # The ESP32 reports the run every second; silence means
+                    # its USB link or the radio is down. Never guess a run.
+                    self.garage.handle_run_status(None, "STALE")
+                self.garage.tick()
+                self.apply_garage_updates()
+        except Exception as error:
+            self.recover_garage_error("heartbeat", error)
+        if self.running:
+            self.root.after(100, self.garage_heartbeat)
+
+    def recover_garage_error(self, context: str, error: Exception) -> None:
+        detail = str(error).replace("\n", " ")[:160]
+        self.write_status(f"GARAGE GAMES RECOVERED | {context} | {detail}")
+        if self.overlay_visible or self.suspended_process_handle:
+            # Fail open: release the screen rather than leave it stuck.
+            self.fault_disable_guard(f"Garage Games {context} failed: {detail}")
+
+    def apply_garage_updates(self) -> None:
+        for command in self.garage.take_commands():
+            try:
+                if command[0] == "new_run":
+                    self.garage_new_run(command[1])
+                elif command[0] == "send":
+                    _, token, signal, sequence, age_ms = command
+                    self.queue_serial_line(
+                        garage_games.format_send_command(
+                            token,
+                            signal,
+                            sequence,
+                            age_ms,
+                        )
+                    )
+                    self.write_status(
+                        "GARAGE GAMES SIGNAL SENT | "
+                        f"{'start' if signal == 'S' else 'finish'} "
+                        f"seq={sequence} age_ms={age_ms}"
+                    )
+                elif command[0] == "victory":
+                    self.start_garage_victory()
+            except Exception as error:
+                self.recover_garage_error(f"command {command[0]}", error)
+        if self.garage.take_changed():
+            self.save_garage_state()
+            try:
+                self.render_garage_view()
+            except Exception as error:
+                self.recover_garage_error("screen", error)
+
+    def garage_new_run(self, token: str) -> None:
+        self.write_status(f"GARAGE GAMES NEW RUN | token={token}")
+        if not self.garage_mode_active():
+            return
+        # A new competitor cancels any victory or banner from the last one.
+        self.cancel_final_emerald_transition()
+        self.cancel_completion()
+        self.completion_in_progress = False
+        self.hide_story_announcement()
+        self.garage_view_key = None
+
+    def render_garage_view(self) -> None:
+        if not self.garage_mode_active():
+            return
+        view = self.garage.view()
+        if view == self.garage_view_key:
+            return
+        self.garage_view_key = view
+        if view.kind == garage_games.VIEW_NONE:
+            if self.overlay_visible and not self.completion_in_progress:
+                self.hide_overlay()
+            return
+        if view.kind == garage_games.VIEW_VICTORY:
+            # The victory sequence started by the 20th ring owns the screen.
+            return
+        if self.completion_in_progress:
+            self.cancel_completion()
+            self.completion_in_progress = False
+        if view.kind == garage_games.VIEW_ROBOTNIK:
+            self.show_garage_robotnik(view)
+        else:
+            self.show_garage_rings(view)
+
+    def show_garage_overlay_base(self) -> Optional[bool]:
+        """Cover the arcade display; Big Box is paused only if it is running.
+
+        Returns None on failure, True when the overlay was just raised, and
+        False when the Garage Games screen was already up (a cheap update).
+        """
+        if not self.running or not self.guard_active:
+            return None
+        first_show = not (
+            self.overlay_visible and self.overlay_kind == "garage"
+        )
+        if first_show:
+            self.hide_story_announcement()
+        if not self.overlay_visible:
+            self.capture_return_window()
+            self.prepare_overlay_monitor()
+            if self.return_window_handle and not self.suspend_return_process():
+                self.fault_disable_guard("Could not safely pause Big Box")
+                return None
+        if first_show and not self.mute_other_audio():
+            self.fault_disable_guard("Could not mute background audio")
+            return None
+        if not self.play_missing_music():
+            self.fault_disable_guard("Could not play Robotnik music")
+            return None
+        self.schedule_audio_watchdog()
+        self.overlay_visible = True
+        self.overlay_kind = "garage"
+        if first_show:
+            self.hide_story_question_message()
+        return first_show
+
+    def show_garage_robotnik(self, view) -> None:
+        first_show = self.show_garage_overlay_base()
+        if first_show is None:
+            return
+        self.hide_garage_ring_meter()
+        if self.active_frames is not self.background_frames:
+            self.switch_background(
+                self.background_frames,
+                self.background_delays,
+                loop=True,
+            )
+        _, _, monitor_width, _ = self.overlay_monitor_bounds
+        self.set_robotnik_title(view.headline)
+        if view.warning:
+            self.title_label.configure(foreground=GARAGE_WARNING_COLOR)
+        self.reset_counter_style()
+        count_size = self.fit_font_size(
+            (view.detail,),
+            max_size=self.count_font_size,
+            min_size=12,
+            available_width=monitor_width,
+        )
+        self.count_label.configure(
+            text=view.detail,
+            font=("Arial", count_size, "bold"),
+            foreground=GARAGE_WARNING_COLOR if view.warning else "white",
+            wraplength=max(1, int(monitor_width * 0.82)),
+            justify="center",
+        )
+        self.position_title()
+        self.position_counter()
+        if view.emeralds is None:
+            self.hide_energy_meter()
+        else:
+            self.set_energy_meter(view.emeralds)
+        if first_show and not self.reveal_overlay_window():
+            self.fault_disable_guard("Overlay could not cover the display")
+
+    def show_garage_rings(self, view) -> None:
+        first_show = self.show_garage_overlay_base()
+        if first_show is None:
+            return
+        self.hide_energy_meter()
+        # The Robotnik screen gives way to a plain ring counter.
+        self.active_frames = []
+        self.animation_generation += 1
+        try:
+            self.background_label.configure(image="")
+        except tk.TclError:
+            pass
+        _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
+        title_size = self.fit_font_size(
+            (view.headline,),
+            max_size=self.title_font_size + 8,
+            min_size=12,
+            available_width=monitor_width,
+        )
+        self.title_label.configure(
+            text=view.headline,
+            foreground=GARAGE_RING_COLOR,
+            font=("Arial", title_size, "bold"),
+            wraplength=max(1, int(monitor_width * 0.82)),
+            justify="center",
+        )
+        self.reset_counter_style()
+        ring_text = f"{view.rings} / {view.ring_goal} RINGS"
+        ring_size = self.fit_font_size(
+            (f"{view.ring_goal} / {view.ring_goal} RINGS",),
+            max_size=max(self.count_font_size, int(monitor_height * 0.16)),
+            min_size=12,
+            available_width=monitor_width,
+        )
+        self.count_label.configure(
+            text=ring_text,
+            font=("Arial", ring_size, "bold"),
+            foreground="white",
+            wraplength=0,
+        )
+        self.title_label.place(
+            x=monitor_width / 2,
+            y=monitor_height * 0.2,
+            anchor="center",
+        )
+        self.count_label.place(
+            x=monitor_width / 2,
+            y=monitor_height * 0.45,
+            anchor="center",
+        )
+        self.render_garage_ring_meter(view)
+        if first_show and not self.reveal_overlay_window():
+            self.fault_disable_guard("Overlay could not cover the display")
+
+    def render_garage_ring_meter(self, view) -> None:
+        canvas = self.garage_ring_canvas
+        _, _, monitor_width, monitor_height = self.overlay_monitor_bounds
+        width = max(260, min(1100, int(monitor_width * 0.86)))
+        bar_height = max(24, min(70, int(monitor_height * 0.07)))
+        notice = view.detail or ""
+        notice_size = max(10, min(22, int(monitor_height * 0.03)))
+        height = bar_height + (notice_size * 3 if notice else 8)
+        canvas.configure(width=width, height=height, background="#000000")
+        canvas.delete("all")
+        goal = max(1, view.ring_goal)
+        rings = max(0, min(goal, view.rings))
+        margin = max(6, int(width * 0.02))
+        if goal <= 40:
+            gap = max(2, int(width * 0.004))
+            segment = (width - margin * 2 - gap * (goal - 1)) / goal
+            for index in range(goal):
+                left = margin + index * (segment + gap)
+                canvas.create_rectangle(
+                    left,
+                    4,
+                    left + segment,
+                    bar_height,
+                    fill=GARAGE_RING_COLOR if index < rings else "#181818",
+                    outline="#606060",
+                )
+        else:
+            canvas.create_rectangle(
+                margin, 4, width - margin, bar_height,
+                fill="#181818", outline="#606060",
+            )
+            canvas.create_rectangle(
+                margin,
+                4,
+                margin + (width - margin * 2) * rings / goal,
+                bar_height,
+                fill=GARAGE_RING_COLOR,
+                outline="",
+            )
+        if notice:
+            canvas.create_text(
+                width / 2,
+                bar_height + notice_size * 1.5,
+                text=notice,
+                fill=GARAGE_WARNING_COLOR,
+                width=width - margin * 2,
+                font=("Arial", notice_size, "bold"),
+            )
+        canvas.place(
+            x=monitor_width / 2,
+            y=monitor_height * 0.66,
+            anchor="center",
+        )
+
+    def hide_garage_ring_meter(self) -> None:
+        canvas = getattr(self, "garage_ring_canvas", None)
+        if canvas is not None:
+            canvas.place_forget()
+
+    def start_garage_victory(self) -> None:
+        if not self.garage_mode_active():
+            return
+        self.write_status(
+            "GARAGE GAMES RING GOAL | " + self.garage.status_text()
+        )
+        self.hide_garage_ring_meter()
+        self.cancel_final_emerald_transition()
+        self.show_completion_message()
+        if self.completion_in_progress:
+            self.count_label.configure(text=GARAGE_VICTORY_MESSAGE)
+            self.position_title()
+            self.position_counter()
+
+    def send_garage_station_identity(self) -> None:
+        self.garage_ident_status = "sending ID..."
+        self.queue_serial_line(garage_games.IDENT_COMMAND)
+
+    def get_garage_control_state(self) -> tuple[str, str]:
+        if self.completion_in_progress:
+            return "GARAGE GAMES — SONIC VICTORY", "#66ccff"
+        controller = self.garage
+        if controller.link_state == "STALE":
+            return "GARAGE GAMES — NO SIGNAL FROM THE MASTER", "#ffcc66"
+        stage = controller.stage
+        if stage == garage_games.STAGE_IDLE or (
+            stage == garage_games.STAGE_FINISHED
+            and controller.presentation_done
+        ):
+            return "GARAGE GAMES — WAITING FOR THE NEXT RUN", "#66dd88"
+        if stage == garage_games.STAGE_RESET:
+            if controller.emeralds:
+                return "GARAGE GAMES — REMOVE ALL EMERALDS", "#ff9966"
+            return "GARAGE GAMES — CHECKING THE SHRINE", "#ffcc66"
+        if stage == garage_games.STAGE_PLACING:
+            placed = controller.emeralds or 0
+            if controller.need_replace:
+                return (
+                    "GARAGE GAMES — REPLACE ONE EMERALD TO START",
+                    "#ffcc66",
+                )
+            return (
+                f"GARAGE GAMES — PLACING EMERALDS ({placed}/"
+                f"{TOTAL_EMERALDS})",
+                "#ff6666",
+            )
+        if stage == garage_games.STAGE_RINGS:
+            return (
+                f"GARAGE GAMES — RINGS {controller.rings}/"
+                f"{controller.ring_goal}",
+                GARAGE_RING_COLOR,
+            )
+        return "GARAGE GAMES — EVENT COMPLETE", "#66ccff"
+
+    def garage_control_details(self) -> str:
+        controller = self.garage
+        start_state = controller.start.state if controller.start else "-"
+        finish_state = controller.finish.state if controller.finish else "-"
+        lines = [
+            "Garage Games station: "
+            + (self.garage_station_mac or "unknown")
+            + (
+                f" ({self.garage_station_radio})"
+                if self.garage_station_radio
+                else ""
+            )
+            + f"    Link: {controller.link_state}"
+            + f"    Run: {controller.run_token or '-'}",
+            f"Event: {controller.stage}    Run rings: {controller.rings}/"
+            f"{controller.ring_goal}    Start: {start_state}    "
+            f"Finish: {finish_state}",
+        ]
+        extras = [
+            text
+            for text in (
+                controller.notice,
+                self.garage_ident_status,
+                self.garage_state_warning,
+            )
+            if text
+        ]
+        if extras:
+            lines.append(" | ".join(extras)[:160])
+        return "\n".join(lines)
 
     # --------------------------------------------------
     # Serial connection
@@ -8920,6 +9626,8 @@ class ChaosHeistApp:
                 time.sleep(RECONNECT_DELAY_SECONDS)
                 continue
 
+            with self.serial_device_lock:
+                self.serial_device = device
             try:
                 while (
                     self.running
@@ -8941,6 +9649,10 @@ class ChaosHeistApp:
                                 self.activation_generation,
                             )
                         )
+                    elif line.startswith(garage_games.GG_LINE_PREFIX):
+                        # Garage Games station traffic. It never counts as
+                        # the sensor heartbeat; COUNT lines keep doing that.
+                        self.messages.put(("GARAGE", line, -1))
 
             except (SerialException, OSError) as error:
                 self.messages.put(
@@ -8953,10 +9665,14 @@ class ChaosHeistApp:
                 )
 
             finally:
+                with self.serial_device_lock:
+                    if self.serial_device is device:
+                        self.serial_device = None
                 try:
                     device.close()
                 except Exception:
                     pass
+                self.messages.put(("GARAGE_LINK_LOST", "", -1))
 
             time.sleep(RECONNECT_DELAY_SECONDS)
 
@@ -9010,6 +9726,12 @@ class ChaosHeistApp:
 
         previous_count = self.accepted_count
         self.accepted_count = count
+
+        if self.guard_mode == "garage":
+            # Garage Games mode needs every reading, including the first:
+            # emeralds left on the shrine must be seen and cleared.
+            self.handle_garage_count_change(previous_count, count)
+            return
 
         # The first accepted reading establishes a baseline. In particular,
         # launching while an emerald is already absent must never create a
@@ -9335,6 +10057,20 @@ class ChaosHeistApp:
                     )
                     continue
 
+                if message_type == "GARAGE":
+                    self.handle_garage_station_message(value)
+                    continue
+
+                if message_type == "GARAGE_LINK_LOST":
+                    self.handle_garage_link_lost()
+                    continue
+
+                if message_type == "GARAGE_COMMAND_FAILED":
+                    self.write_status(
+                        "GARAGE GAMES COMMAND NOT DELIVERED | " + value[:160]
+                    )
+                    continue
+
                 if message_type == "CORE_SERVICE_FAULT":
                     self.serial_worker_failed = True
                     self.service_warning = value[:160]
@@ -9416,6 +10152,23 @@ class ChaosHeistApp:
                 "ESP32 serial service stopped; restart the guard application"
             )
 
+        if self.guard_mode == "garage":
+            if not PIL_AVAILABLE:
+                problems.append("Pillow image support unavailable")
+            elif not self.background_frames:
+                problems.append("Robotnik GIF unavailable")
+            elif not self.completion_frames:
+                problems.append("Sonic GIF unavailable")
+            elif not self.supersonic_frames:
+                problems.append("Super Sonic GIF unavailable")
+            if not PYGAME_AVAILABLE or not self.audio_ready:
+                problems.append("audio system unavailable")
+            else:
+                if not self.missing_audio_path.exists():
+                    problems.append("Robotnik music unavailable")
+                if not self.completion_audio_path.exists():
+                    problems.append("victory music unavailable")
+
         if self.guard_mode == "story":
             if not PIL_AVAILABLE:
                 problems.append("Pillow image support unavailable")
@@ -9464,8 +10217,11 @@ class ChaosHeistApp:
     def select_normal_mode(self) -> None:
         self.select_guard_mode("normal")
 
+    def select_garage_mode(self) -> None:
+        self.select_guard_mode("garage")
+
     def select_guard_mode(self, mode: str) -> None:
-        if mode not in {"story", "normal"} or not self.running:
+        if mode not in GUARD_MODES or not self.running:
             return
         if mode == self.guard_mode and self.guard_active:
             self.write_status(f"MODE ALREADY ACTIVE | {mode.upper()}")
@@ -9566,6 +10322,19 @@ class ChaosHeistApp:
         self.reader_connected = False
         self.overlay_gate_state = "WAITING_FOR_SENSOR"
         self.reset_big_box_readiness()
+        self.garage_view_key = None
+        if self.guard_mode == "garage" and getattr(self, "garage", None):
+            # The sensor count is unknown until the ESP32 reports again, so
+            # a reset in progress waits for a fresh zero reading.
+            self.garage.handle_count(None)
+            if (
+                self.garage_last_run is not None
+                and time.monotonic() - self.garage_link_seen_at <= 3.0
+            ):
+                self.garage.handle_run_status(*self.garage_last_run)
+            else:
+                self.garage.handle_run_status(None, "STALE")
+            self.apply_garage_updates()
         self.write_status(f"ACTIVATING GUARD | mode={self.guard_mode}")
 
     def deactivate_guard(self, event=None) -> str:
@@ -9610,6 +10379,7 @@ class ChaosHeistApp:
         self.reset_ring_burst_state(clear_normal_lock=True)
         self.completion_in_progress = False
         self.reset_big_box_readiness()
+        self.garage_view_key = None
         self.overlay_gate_state = (
             "DISABLED_ERROR" if fault_reason else "DORMANT"
         )
@@ -9789,6 +10559,15 @@ class ChaosHeistApp:
         else:
             self.write_status(
                 "CLEANUP WARNING | ring persistence did not stop in time"
+            )
+        try:
+            if getattr(self, "garage", None) is not None:
+                self.garage_state_stop_event.set()
+                self.write_garage_state_file(self.garage.snapshot())
+        except Exception as error:
+            self.write_status(
+                "CLEANUP WARNING | Garage Games state not saved: "
+                + str(error).replace("\n", " ")[:120]
             )
         self.guard_active = False
         self.activation_generation += 1

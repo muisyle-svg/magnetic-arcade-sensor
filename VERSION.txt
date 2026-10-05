@@ -4,7 +4,14 @@ Build family: Story/Normal Mode with Ring Power
 Version: 1.0.0
 Update: 2026-08-25
 
-Latest change: the final Story Mode power failure now unfolds over about ten
+Garage Games Mode (2026-10-05): the shrine can be one timed event of a
+Garage Games run, without Big Box. The ESP32 joins the Garage Games ESP-NOW
+network as a magnetic arcade station. The seventh emerald starts the event
+and the 20th ring finishes it, once each, through the Garage Games master.
+Each new run demands an empty shrine first. Firmware update required (no
+wiring changes); see README "Garage Games Mode".
+
+Previous change: the final Story Mode power failure now unfolds over about ten
 seconds with staged electrical audio, escalating flicker/glitches, and a
 classic CRT collapse from a full-screen line to a dot before black. The
 seven-sensor firmware has the matching long red LED failure sequence.

@@ -2390,5 +2390,310 @@ class GuardLogicTests(unittest.TestCase):
                 kernel32.CloseHandle(legacy_handle)
 
 
+class GarageGamesModeAppTests(unittest.TestCase):
+    TOKEN = "0123456789ABCDEF"
+    OTHER = "FEDCBA9876543210"
+
+    def make_guard(self):
+        import garage_games_mode
+
+        self.clock_now = [1000.0]
+        guard = guard_module.ChaosHeistApp.__new__(guard_module.ChaosHeistApp)
+        guard.running = True
+        guard.guard_active = True
+        guard.guard_mode = "garage"
+        guard.garage = garage_games_mode.GarageRunController(
+            sequence_base=900,
+            clock=lambda: self.clock_now[0],
+        )
+        guard.garage_view_key = None
+        guard.garage_link_seen_at = 0.0
+        guard.garage_last_run = None
+        guard.garage_station_mac = ""
+        guard.garage_station_radio = ""
+        guard.garage_ident_status = ""
+        guard.garage_state_warning = ""
+        guard.garage_state_queue = queue.Queue(maxsize=1)
+        guard.serial_write_queue = queue.Queue()
+        guard.overlay_visible = False
+        guard.completion_in_progress = False
+        guard.accepted_count = None
+        guard.pending_count = None
+        guard.pending_count_since = 0.0
+        guard.ring_count = 10
+        guard.ring_milestones_shown = set()
+        guard.ring_milestones_pending = set()
+        guard.pending_ring_milestone = False
+        guard.ring_burst_active = False
+        guard.write_status = lambda *args, **kwargs: None
+        guard.save_ring_state = lambda: None
+        guard.play_ring_sound = MagicMock()
+        guard.play_emerald_sound = MagicMock()
+        guard.show_garage_robotnik = MagicMock()
+        guard.show_garage_rings = MagicMock()
+        guard.hide_overlay = MagicMock()
+        guard.hide_story_announcement = MagicMock()
+        guard.hide_garage_ring_meter = MagicMock()
+        guard.cancel_final_emerald_transition = MagicMock()
+        guard.position_title = MagicMock()
+        guard.position_counter = MagicMock()
+        guard.count_label = MagicMock()
+        guard.announcements = []
+        guard.request_ring_announcement = guard.announcements.append
+
+        def start_completion():
+            guard.completion_in_progress = True
+            guard.overlay_visible = True
+
+        def cancel_completion():
+            guard.completion_in_progress = False
+
+        guard.show_completion_message = MagicMock(side_effect=start_completion)
+        guard.cancel_completion = MagicMock(side_effect=cancel_completion)
+        return guard
+
+    def station(self, guard, line):
+        guard.handle_garage_station_message("MAGNET_LOCK:GG:" + line)
+
+    def sensor(self, guard, count):
+        guard.pending_count = count
+        guard.pending_count_since = time.monotonic() - 10
+        guard.accept_stable_count()
+
+    def sent(self, guard):
+        lines = []
+        while not guard.serial_write_queue.empty():
+            lines.append(guard.serial_write_queue.get_nowait())
+        return lines
+
+    def advance(self, guard, seconds):
+        self.clock_now[0] += seconds
+        guard.garage.tick()
+        guard.apply_garage_updates()
+
+    def ready_for_placement(self, guard):
+        self.station(guard, f"RUN:{self.TOKEN}:ARMED")
+        self.sensor(guard, 0)
+        self.advance(guard, 1.1)
+        self.station(guard, f"RUN:{self.TOKEN}:COUNTDOWN")
+        self.station(guard, f"RUN:{self.TOKEN}:ACTIVE")
+
+    def test_full_event_start_rings_finish_and_next_competitor(self):
+        guard = self.make_guard()
+        self.station(guard, "STATION:A0B1C2D3E4F5:READY")
+        self.assertEqual(guard.garage_station_mac, "A0B1C2D3E4F5")
+
+        # Arming shows the Robotnik screen and demands an empty shrine.
+        self.sensor(guard, 7)
+        self.station(guard, f"RUN:{self.TOKEN}:ARMED")
+        view = guard.show_garage_robotnik.call_args[0][0]
+        self.assertTrue(view.warning)
+        self.assertIn("REMOVE ALL", view.headline)
+        self.station(guard, f"RUN:{self.TOKEN}:ACTIVE")
+        self.advance(guard, 5)
+        self.assertEqual(self.sent(guard), [], "leftover emeralds never start")
+        guard.cancel_completion.reset_mock()
+
+        self.sensor(guard, 0)
+        self.advance(guard, 1.1)
+        for count in range(1, 8):
+            self.sensor(guard, count)
+        self.assertEqual(
+            self.sent(guard),
+            [f"GG:SEND:{self.TOKEN}:S:900:0\n"],
+        )
+        guard.play_emerald_sound.assert_called_with(final=True)
+        rings_view = guard.show_garage_rings.call_args[0][0]
+        self.assertEqual((rings_view.rings, rings_view.ring_goal), (0, 20))
+
+        # The start notifications for the same run never reset it.
+        self.station(guard, f"RUN:{self.TOKEN}:ACTIVE")
+        self.station(guard, f"RESULT:{self.TOKEN}:S:900:ACTIVE")
+        self.station(guard, f"EVENT:{self.TOKEN}:ACTIVE")
+        self.assertEqual(guard.garage.stage, "rings")
+        guard.cancel_completion.assert_not_called()
+
+        for _ in range(19):
+            guard.handle_ring_entry()
+        self.assertEqual(guard.ring_count, 29, "lifetime total still counts")
+        self.assertEqual(guard.garage.rings, 19)
+        self.assertEqual(guard.announcements, [], "no ring banners in Garage mode")
+        self.assertEqual(self.sent(guard), [])
+
+        guard.handle_ring_entry()
+        self.assertEqual(
+            self.sent(guard),
+            [f"GG:SEND:{self.TOKEN}:F:901:0\n"],
+        )
+        guard.show_completion_message.assert_called_once_with()
+        guard.count_label.configure.assert_called_with(
+            text=guard_module.GARAGE_VICTORY_MESSAGE
+        )
+
+        for _ in range(4):
+            guard.handle_ring_entry()
+        self.assertEqual(self.sent(guard), [], "extra rings send nothing")
+        guard.show_completion_message.assert_called_once_with()
+        self.assertEqual(guard.ring_count, 34)
+
+        # The next competitor cancels the victory and starts over.
+        self.station(guard, f"RUN:{self.OTHER}:ARMED")
+        guard.cancel_completion.assert_called()
+        self.assertFalse(guard.completion_in_progress)
+        view = guard.show_garage_robotnik.call_args[0][0]
+        self.assertTrue(view.warning, "the last competitor's emeralds must come off")
+        self.assertEqual(guard.garage.rings, 0)
+        self.station(guard, f"RUN:{self.OTHER}:ACTIVE")
+        self.advance(guard, 5)
+        self.assertEqual(self.sent(guard), [])
+
+    def test_victory_end_clears_the_screen_until_the_next_run(self):
+        guard = self.make_guard()
+        self.ready_for_placement(guard)
+        for count in range(1, 8):
+            self.sensor(guard, count)
+        self.station(guard, f"RESULT:{self.TOKEN}:S:900:ACTIVE")
+        for _ in range(20):
+            guard.handle_ring_entry()
+        guard.overlay_visible = True
+        guard.finish_completion()
+        self.assertFalse(guard.completion_in_progress)
+        guard.hide_overlay.assert_called()
+
+    def test_station_silence_or_usb_loss_never_sends_a_finish(self):
+        guard = self.make_guard()
+        self.ready_for_placement(guard)
+        for count in range(1, 8):
+            self.sensor(guard, count)
+        self.station(guard, f"RESULT:{self.TOKEN}:S:900:ACTIVE")
+        self.sent(guard)
+        guard.handle_garage_link_lost()
+        for _ in range(20):
+            guard.handle_ring_entry()
+        self.assertEqual(self.sent(guard), [])
+        guard.show_completion_message.assert_called_once_with()
+        # When the station is back on the same run, the finish goes out once.
+        self.station(guard, f"RUN:{self.TOKEN}:ACTIVE")
+        lines = self.sent(guard)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(f"GG:SEND:{self.TOKEN}:F:901:"))
+
+    def test_rings_are_ignored_outside_the_ring_stage(self):
+        guard = self.make_guard()
+        self.station(guard, f"RUN:{self.TOKEN}:ARMED")
+        for _ in range(25):
+            guard.handle_ring_entry()
+        self.assertEqual(guard.garage.rings, 0)
+        self.assertEqual(self.sent(guard), [])
+
+    def test_station_lines_are_ignored_in_story_mode(self):
+        guard = self.make_guard()
+        guard.guard_mode = "story"
+        self.station(guard, f"RUN:{self.TOKEN}:ARMED")
+        self.assertIsNone(guard.garage.run_token)
+        self.assertEqual(guard.garage_last_run, (self.TOKEN, "ARMED"))
+        guard.show_garage_robotnik.assert_not_called()
+
+    def make_screen_guard(self):
+        guard = self.make_guard()
+        for name in (
+            "capture_return_window",
+            "prepare_overlay_monitor",
+            "schedule_audio_watchdog",
+            "switch_background",
+            "set_robotnik_title",
+            "reset_counter_style",
+            "set_energy_meter",
+            "hide_energy_meter",
+            "hide_story_question_message",
+        ):
+            setattr(guard, name, MagicMock())
+        guard.mute_other_audio = MagicMock(return_value=True)
+        guard.play_missing_music = MagicMock(return_value=True)
+        guard.reveal_overlay_window = MagicMock(return_value=True)
+        guard.suspend_return_process = MagicMock(return_value=True)
+        guard.fit_font_size = MagicMock(return_value=30)
+        guard.fault_disable_guard = MagicMock()
+        guard.return_window_handle = 0
+        guard.overlay_kind = None
+        guard.overlay_monitor_bounds = (0, 0, 1280, 1024)
+        guard.title_font_size = 30
+        guard.count_font_size = 60
+        guard.title_label = MagicMock()
+        guard.background_label = MagicMock()
+        guard.garage_ring_canvas = MagicMock()
+        guard.background_frames = ["robotnik"]
+        guard.background_delays = [100]
+        guard.active_frames = []
+        guard.animation_generation = 0
+        del guard.show_garage_robotnik
+        del guard.show_garage_rings
+        del guard.hide_garage_ring_meter
+        return guard
+
+    def test_screens_render_without_big_box_and_update_cheaply(self):
+        guard = self.make_screen_guard()
+        self.sensor(guard, 2)
+        self.station(guard, f"RUN:{self.TOKEN}:ARMED")
+        guard.fault_disable_guard.assert_not_called()
+        guard.suspend_return_process.assert_not_called()
+        self.assertTrue(guard.overlay_visible)
+        self.assertEqual(guard.overlay_kind, "garage")
+        guard.switch_background.assert_called_once()
+        guard.set_energy_meter.assert_called_with(2)
+        guard.title_label.configure.assert_called_with(
+            foreground=guard_module.GARAGE_WARNING_COLOR
+        )
+        self.assertEqual(guard.reveal_overlay_window.call_count, 1)
+        self.assertEqual(guard.mute_other_audio.call_count, 1)
+
+        self.sensor(guard, 0)
+        self.advance(guard, 1.1)
+        self.station(guard, f"RUN:{self.TOKEN}:ACTIVE")
+        for count in range(1, 8):
+            self.sensor(guard, count)
+        guard.garage_ring_canvas.place.assert_called()
+        guard.background_label.configure.assert_called_with(image="")
+        self.assertIn(
+            "0 / 20 RINGS",
+            str(guard.count_label.configure.call_args),
+        )
+        guard.handle_ring_entry()
+        self.assertIn(
+            "1 / 20 RINGS",
+            str(guard.count_label.configure.call_args),
+        )
+        # Updates on an open Garage screen don't re-mute or re-raise it.
+        self.assertEqual(guard.reveal_overlay_window.call_count, 1)
+        self.assertEqual(guard.mute_other_audio.call_count, 1)
+        guard.fault_disable_guard.assert_not_called()
+
+    def test_running_big_box_is_paused_while_the_screen_is_up(self):
+        guard = self.make_screen_guard()
+
+        def capture():
+            guard.return_window_handle = 1234
+
+        guard.capture_return_window = MagicMock(side_effect=capture)
+        self.station(guard, f"RUN:{self.TOKEN}:ARMED")
+        guard.suspend_return_process.assert_called_once_with()
+        guard.fault_disable_guard.assert_not_called()
+
+    def test_screen_failure_fails_open(self):
+        guard = self.make_screen_guard()
+        guard.reveal_overlay_window = MagicMock(return_value=False)
+        self.station(guard, f"RUN:{self.TOKEN}:ARMED")
+        guard.fault_disable_guard.assert_called_once()
+
+    def test_garage_mode_is_a_selectable_default(self):
+        self.assertIn("garage", guard_module.GUARD_MODES)
+        errors, warnings = guard_module.validate_runtime_config_shape(
+            dict(guard_module.DEFAULT_CONFIG, default_mode="garage")
+        )
+        self.assertEqual(errors, [])
+        self.assertFalse(any("default_mode" in item for item in warnings))
+        self.assertEqual(guard_module.GARAGE_RING_GOAL, 20)
+
+
 if __name__ == "__main__":
     unittest.main()

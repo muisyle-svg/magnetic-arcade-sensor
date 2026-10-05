@@ -53,10 +53,10 @@ foreach ($Requirement in Get-Content -LiteralPath requirements.txt) {
     }
 }
 
-& $PythonPath -m py_compile chaos_heist.py test_chaos_heist.py
+& $PythonPath -m py_compile chaos_heist.py garage_games_mode.py test_chaos_heist.py test_garage_games_mode.py
 if ($LASTEXITCODE -ne 0) { throw "Python compilation failed; the EXE was not rebuilt." }
 
-& $PythonPath -m unittest -v test_chaos_heist.py
+& $PythonPath -m unittest -v test_chaos_heist.py test_garage_games_mode.py
 if ($LASTEXITCODE -ne 0) { throw "Tests failed; the EXE was not rebuilt." }
 
 foreach ($BuildOutput in @("dist-chaos-heist", "build-chaos-heist")) {

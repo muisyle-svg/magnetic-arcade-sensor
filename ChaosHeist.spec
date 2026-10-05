@@ -136,7 +136,7 @@ datas = [
     for asset_name in asset_names
 ]
 binaries = []
-hiddenimports = []
+hiddenimports = ['garage_games_mode']
 debug_build = (
     os.environ.get('CHAOS_HEIST_DEBUG_BUILD') == '1'
     or os.environ.get('MAGNET_GUARD_DEBUG_BUILD') == '1'

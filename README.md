@@ -1,6 +1,6 @@
 # ChaosHeist — Production Story/Normal Edition
 
-ChaosHeist is the production version of the seven-emerald arcade experience. It includes Story Mode, Normal Mode, persistent ring counting, one-game Ring Power access, the 50-ring prize announcement, and the ESP32-controlled Master Emerald lighting effects.
+ChaosHeist is the production version of the seven-emerald arcade experience. It includes Story Mode, Normal Mode, Garage Games Mode, persistent ring counting, one-game Ring Power access, the 50-ring prize announcement, and the ESP32-controlled Master Emerald lighting effects.
 
 On the development computer, superseded local builds were preserved on August 25, 2026 at:
 
@@ -34,6 +34,81 @@ Normal Mode reacts only to a new downward sensor transition while Big Box is the
 - A missing count present when the mode starts does not trigger it, and a steady missing count does not retrigger it.
 
 Select either mode from the regular Windows operator panel. Selecting a mode activates the guard in that mode.
+
+### Garage Games Mode
+
+Garage Games Mode turns the shrine into one timed event of a Garage Games run.
+Placing all seven emeralds starts the event and the 20th ring finishes it.
+Those two signals are the event's start and stop presses. Garage Games keeps
+all of the timing, scoring, and results. This mode does not need Big Box.
+
+**How the two computers talk.** The two computers are never networked. The
+shrine's ESP32 joins the Garage Games button network over ESP-NOW as a
+"magnetic arcade" station and passes messages over USB:
+
+```
+Garage Games app --USB-- Garage master ))) radio ((( shrine ESP32 --USB-- ChaosHeist
+```
+
+The master broadcasts the current run (armed, countdown, active, paused,
+finished) about four times a second. The ESP32 relays it to ChaosHeist. When
+ChaosHeist decides the event has started or finished, it asks the ESP32 to send
+that signal. The ESP32 repeats the signal until Garage Games answers through
+the master, for up to about six seconds. Each signal carries how long ago the
+emerald or ring actually happened, so radio delays don't count against the
+competitor.
+
+**One competitor, step by step:**
+
+1. **The operator arms a competitor in Garage Games.** The arcade shows the
+   Robotnik screen and the run's ring counter goes back to zero.
+2. **The shrine has to be empty first.** If any emeralds are still in place,
+   the screen shows a yellow `REMOVE ALL CHAOS EMERALDS` warning. Placements
+   only count after the sensors have read zero for one full second, so
+   emeralds left over from the last competitor can never start the event.
+3. **The competitor places the emeralds.** The seven-segment Master Emerald
+   meter fills as they go. When the seventh is placed while the Garage Games
+   run is ACTIVE, the start is sent once and the screen switches to a
+   `COLLECT 20 RINGS!` counter.
+   - If all seven go in before the run is active (still armed, counting down,
+     or paused), nothing is sent. Once the run is going, the competitor lifts
+     one emerald and puts it back to start.
+   - If Garage Games turns the start down, the screen goes back to Robotnik
+     and asks for one emerald to be replaced.
+4. **The competitor feeds rings.** Only coins entered after the ring screen
+   appears count toward 20. The lifetime ring total still counts every coin.
+   Ring banners, Ring Power, and the 50-ring prize stay hidden in this mode; a
+   prize that becomes due waits until another mode is selected. Moving
+   emeralds during the ring stage does nothing.
+5. **The 20th ring** sends the finish once and plays the Sonic victory
+   sequence, followed by `EVENT COMPLETE!`. Extra rings send nothing. When the
+   victory finishes, the screen clears.
+6. **The next competitor's run** (a different run in Garage Games) cancels any
+   victory or screen still showing and starts again at step 1.
+
+Garage Games sends both "armed" and "started" updates. ChaosHeist only resets
+when the run itself changes, never when the same run changes state. That
+includes the update caused by its own start signal.
+
+**When something goes wrong:**
+
+- **No signal from the master (or the ESP32 is quiet).** ChaosHeist never
+  starts, finishes, or resets anything. The screen stays as it is and the
+  panel reads `NO SIGNAL FROM THE MASTER`. A finish that happened meanwhile is
+  sent once the same run is heard again.
+- **No answer to a signal.** It is resent with the same sequence number, so
+  Garage Games counts it as a duplicate rather than a second start or finish.
+- **The 20th ring lands while the run is paused.** Garage Games turns it down.
+  ChaosHeist sends the finish again when the run resumes; the run clock didn't
+  move during the pause.
+- **The ESP32 is unplugged.** As in the other modes, this turns the guard off
+  and releases the screen, so the arcade is never left locked. Select Garage
+  Games Mode again to carry on.
+- **The app restarts.** The current run's state is kept in
+  `%LOCALAPPDATA%\ChaosHeist\garage-games-run.json`. The same run picks up
+  where it left off, including its ring count.
+- **The station fails partway through.** The operator can start and finish
+  the event from its tile on the Garage Games scorekeeper.
 
 ## Ring input and one-game energy burst
 
@@ -133,6 +208,13 @@ Power every KY-003 from `3V3`, share ground, and leave `D0` and `D9` unconnected
 
 Upload `ChaosHeistController\ChaosHeistController.ino` with Arduino IDE set to `XIAO_ESP32C3` and **Tools > USB CDC On Boot > Enabled**.
 
+The Garage Games station uses the XIAO's built-in radio on ESP-NOW channel 1,
+the same channel as the Garage Games buttons. It needs no wiring changes. If
+the radio cannot start, only the station is switched off; the sensors, LED
+meter, and USB counts keep working exactly as before. The sketch now sends
+extra `MAGNET_LOCK:GG:` lines over USB. Older ChaosHeist builds ignore them, so
+the new firmware is safe with an older app.
+
 ## Fail-open behavior
 
 The guard favors access to the arcade over lockout. An ESP32 disconnect,
@@ -159,7 +241,12 @@ Startup cannot run beside the production app.
 
 ## Operator controls
 
-- Story Mode and Normal Mode buttons select and activate that mode.
+- Story Mode, Normal Mode, and Garage Games Mode buttons select and activate
+  that mode.
+- Send ID to Garage Games announces the shrine's station ID (its MAC address)
+  to Garage Games Setup, the same way pressing a button does. Garage Games must
+  be idle with no run in progress. The panel also shows the station ID, the
+  radio link, the current run, the event stage, and the run's ring count.
 - Deactivate Guard stops monitoring and closes any presentation.
 - Reset Ring Count asks for confirmation, resets the persistent total to zero,
   and re-arms the one-time 50-ring prize announcement. It does not change the
@@ -181,12 +268,15 @@ Status files are written to:
 - `%LOCALAPPDATA%\ChaosHeist\chaos-heist-status.txt`
 - `%LOCALAPPDATA%\ChaosHeist\chaos-heist-events.log`
 - `%LOCALAPPDATA%\ChaosHeist\ring-counter.json`
+- `%LOCALAPPDATA%\ChaosHeist\garage-games-run.json` (Garage Games Mode's current run)
 
 ## Configuration
 
 Keep `chaos-heist-config.json` beside `ChaosHeist.exe`. A legacy `guard-config.json` is still accepted when the new filename is absent, so an older arcade-PC configuration can be migrated safely. The active filename is recorded in the event log. A malformed new config never falls through to an older legacy config: the guard stays disabled/fail-open, ring counting continues, and the error is shown in the panel. Unknown setting names are reported as warnings so spelling mistakes are visible.
 
-- `default_mode`: `story` or `normal`.
+- `default_mode`: `story`, `normal`, or `garage`.
+- `garage_games_ring_goal`: rings needed to finish the Garage Games event; default `20`.
+- `garage_games_zero_confirm_seconds`: how long the shrine must read zero emeralds before a new competitor's placements count; default `1.0` second.
 - `total_emeralds`: must remain `7`; a different value disables the guard because the installed firmware and sensor assembly are fixed at seven inputs.
 - `auto_activate`: normally `false` so the operator chooses a mode after launching.
 - `serial_port`: empty for automatic detection, or a fixed value such as `COM4`.
