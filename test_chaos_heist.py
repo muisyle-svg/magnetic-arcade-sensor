@@ -295,6 +295,10 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(title, guard_module.RING_MILESTONE_TITLE)
         self.assertEqual(detail, guard_module.RING_MILESTONE_MESSAGE)
+        self.assertEqual(
+            detail,
+            "SONIC HOLDS the KEY to your prize... if it hasn't already been taken!",
+        )
         self.assertNotIn("53", detail)
 
     def test_ring_entry_during_active_burst_does_not_rearm_the_burst(self):
@@ -740,6 +744,72 @@ class GuardLogicTests(unittest.TestCase):
 
         self.assertEqual(len(created), 2)
         self.assertEqual(guard.background_label.configure.call_count, 2)
+
+    def test_cinematic_display_uses_opaque_canvas_surface_when_available(self):
+        if not guard_module.PIL_AVAILABLE:
+            self.skipTest("Pillow is not available")
+        guard = self.make_guard()
+        guard.root = MagicMock()
+        guard.overlay_monitor_bounds = (0, 0, 640, 480)
+        guard.cinematic_canvas = MagicMock()
+        guard.cinematic_canvas_image_id = 17
+        guard.cinematic_photo = None
+        guard.cinematic_photo_history = []
+        guard.background_label = MagicMock()
+        frame = guard_module.Image.new("RGB", (320, 240), "black")
+        created = []
+
+        def make_photo(image, **kwargs):
+            photo = MagicMock()
+            created.append((photo, image.copy(), kwargs))
+            return photo
+
+        with (
+            patch.object(
+                guard_module.tk,
+                "PhotoImage",
+                side_effect=guard_module.tk.TclError("test fallback"),
+            ),
+            patch.object(
+                guard_module.ImageTk,
+                "PhotoImage",
+                side_effect=make_photo,
+            ),
+        ):
+            guard.display_cinematic_frame(frame, 1.0)
+
+        self.assertEqual(created[0][2], {"master": guard.root})
+        guard.cinematic_canvas.create_image.assert_called_once_with(
+            160,
+            120,
+            anchor="nw",
+            image=created[0][0],
+        )
+        guard.cinematic_canvas.delete.assert_called_once_with(17)
+        guard.cinematic_canvas.update_idletasks.assert_called_once_with()
+        guard.background_label.configure.assert_not_called()
+
+    def test_cinematic_photo_prefers_native_tk_ppm_upload(self):
+        if not guard_module.PIL_AVAILABLE:
+            self.skipTest("Pillow is not available")
+        guard = self.make_guard()
+        guard.root = MagicMock()
+        frame = guard_module.Image.new("RGB", (2, 1), "black")
+        native_photo = MagicMock()
+
+        with patch.object(
+            guard_module.tk,
+            "PhotoImage",
+            return_value=native_photo,
+        ) as photo_image:
+            result = guard.create_cinematic_photo(frame)
+
+        self.assertIs(result, native_photo)
+        args = photo_image.call_args.kwargs
+        self.assertEqual(args["master"], guard.root)
+        self.assertEqual(args["format"], "PPM")
+        self.assertTrue(args["data"].startswith(b"P6\n2 1\n255\n"))
+        self.assertEqual(len(args["data"]), len(b"P6\n2 1\n255\n") + 6)
 
     def test_ring_power_timeout_waits_for_safe_menu_before_restoring_lock(self):
         guard = self.make_guard()

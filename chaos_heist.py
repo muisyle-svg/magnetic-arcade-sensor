@@ -682,7 +682,7 @@ RING_MILESTONE_ANNOUNCEMENT_SECONDS = config_number(
 RING_MILESTONE = 50
 RING_MILESTONE_TITLE = "50 Rings!"
 RING_MILESTONE_MESSAGE = (
-    "Sonic holds the KEY to your prize... if it hasn't already been taken!"
+    "SONIC HOLDS the KEY to your prize... if it hasn't already been taken!"
 )
 RING_COUNT_TITLE = "RING COLLECTED!"
 RING_BURST_TITLE = "RING POWER!"
@@ -1449,6 +1449,9 @@ class ChaosHeistApp:
         self.cinematic_worker_done = False
         self.cinematic_worker_error = ""
         self.cinematic_photo = None
+        self.cinematic_photo_history = []
+        self.cinematic_canvas = None
+        self.cinematic_canvas_image_id = None
         self.return_window_handle = 0
         self.suspended_process_handle = None
         self.suspended_process_id = 0
@@ -1890,6 +1893,25 @@ class ChaosHeistApp:
             highlightthickness=0,
         )
         self.energy_canvas.place_forget()
+
+        # Render the cinematic on its own opaque full-monitor surface. The
+        # normal Label is intentionally not reused: repeatedly replacing a
+        # Label image can leave partial repaint artifacts on some arcade
+        # display drivers. Keeping a small PhotoImage history also prevents
+        # Tk from destroying the previous image while an expose event is
+        # still pending.
+        self.cinematic_canvas = tk.Canvas(
+            self.root,
+            background="#000000",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self.cinematic_canvas_image_id = self.cinematic_canvas.create_image(
+            0,
+            0,
+            anchor="nw",
+        )
+        self.cinematic_canvas.place_forget()
 
         self.messages: queue.Queue[tuple[str, str, int]] = queue.Queue()
         self.create_announcement_window()
@@ -3009,6 +3031,14 @@ class ChaosHeistApp:
             justify="center",
         )
         self.announcement_detail_label.pack(pady=(2, 10))
+        self.announcement_rich_detail_canvas = tk.Canvas(
+            self.announcement_window,
+            width=1,
+            height=1,
+            background="#090909",
+            borderwidth=0,
+            highlightthickness=0,
+        )
         self.announcement_energy_canvas = tk.Canvas(
             self.announcement_window,
             background="#000000",
@@ -3334,6 +3364,110 @@ class ChaosHeistApp:
         self.overlay_monitor_bounds = monitor_bounds
         return True
 
+    def wrap_announcement_detail_words(
+        self,
+        detail: str,
+        font,
+        available_width: int,
+    ) -> list[list[str]]:
+        """Wrap detail text while retaining words for colored rendering."""
+        lines = []
+        for paragraph in str(detail).splitlines() or [""]:
+            words = paragraph.split()
+            if not words:
+                lines.append([])
+                continue
+            current = []
+            for word in words:
+                candidate = " ".join((*current, word))
+                if current and font.measure(candidate) > available_width:
+                    lines.append(current)
+                    current = [word]
+                else:
+                    current.append(word)
+            lines.append(current)
+        return lines or [[]]
+
+    def fit_wrapped_announcement_detail_font_size(
+        self,
+        detail: str,
+        max_size: int,
+        min_size: int,
+        available_width: int,
+    ) -> int:
+        """Choose the largest size whose wrapped detail fits horizontally."""
+        for size in range(max_size, min_size - 1, -1):
+            font = tkfont.Font(
+                root=self.root,
+                family="Arial",
+                size=size,
+                weight="bold",
+            )
+            lines = self.wrap_announcement_detail_words(
+                detail,
+                font,
+                available_width,
+            )
+            if max(
+                (font.measure(" ".join(line)) for line in lines),
+                default=0,
+            ) <= available_width:
+                return size
+        return min_size
+
+    def render_colored_announcement_detail(
+        self,
+        detail: str,
+        font_size: int,
+        available_width: int,
+    ) -> None:
+        """Render the 50-ring detail with Sonic-themed word colors."""
+        canvas = getattr(self, "announcement_rich_detail_canvas", None)
+        if canvas is None:
+            return
+        font = tkfont.Font(
+            root=self.root,
+            family="Arial",
+            size=font_size,
+            weight="bold",
+        )
+        lines = self.wrap_announcement_detail_words(
+            detail,
+            font,
+            available_width,
+        )
+        line_spacing = max(1, int(font.metrics("linespace")))
+        canvas.configure(
+            width=max(1, available_width),
+            height=max(1, line_spacing * len(lines) + 4),
+        )
+        canvas.delete("all")
+        for line_index, words in enumerate(lines):
+            line_text = " ".join(words)
+            x_position = (
+                available_width - font.measure(line_text)
+            ) / 2
+            y_position = 2 + line_index * line_spacing
+            for word_index, word in enumerate(words):
+                displayed_word = word
+                if word_index < len(words) - 1:
+                    displayed_word += " "
+                if word == "SONIC":
+                    word_color = "#3b9cff"
+                elif word == "KEY":
+                    word_color = "#c0c0c0"
+                else:
+                    word_color = "#f4f4f4"
+                canvas.create_text(
+                    x_position,
+                    y_position,
+                    anchor="nw",
+                    text=displayed_word,
+                    fill=word_color,
+                    font=font,
+                )
+                x_position += font.measure(displayed_word)
+
     def configure_announcement_content(
         self,
         title: str,
@@ -3349,18 +3483,45 @@ class ChaosHeistApp:
         x, y, monitor_width, monitor_height = self.overlay_monitor_bounds
         banner_width = max(1, int(monitor_width * 0.90))
         wraplength = max(1, int(banner_width * 0.82))
+        rich_detail_canvas = getattr(
+            self,
+            "announcement_rich_detail_canvas",
+            None,
+        )
+        use_rich_detail = (
+            detail == RING_MILESTONE_MESSAGE
+            and rich_detail_canvas is not None
+        )
         title_size = self.fit_font_size(
             tuple(title.splitlines()) or (title,),
             max_size=title_max_size,
             min_size=title_min_size,
             available_width=banner_width,
         )
-        detail_size = self.fit_font_size(
-            tuple(detail.splitlines()) or (detail,),
-            max_size=detail_max_size,
-            min_size=detail_min_size,
-            available_width=banner_width,
-        )
+        if use_rich_detail:
+            detail_size = self.fit_wrapped_announcement_detail_font_size(
+                detail,
+                max_size=detail_max_size,
+                min_size=detail_min_size,
+                available_width=wraplength,
+            )
+            try:
+                self.announcement_detail_label.pack_forget()
+                rich_detail_canvas.pack(pady=(2, 10))
+            except tk.TclError:
+                pass
+        else:
+            detail_size = self.fit_font_size(
+                tuple(detail.splitlines()) or (detail,),
+                max_size=detail_max_size,
+                min_size=detail_min_size,
+                available_width=banner_width,
+            )
+            try:
+                rich_detail_canvas.pack_forget()
+                self.announcement_detail_label.pack(pady=(2, 10))
+            except (AttributeError, tk.TclError):
+                pass
 
         # The old fixed 30%-of-screen banner could clip packed labels at the
         # top and bottom on short arcade displays. Allow a taller centered
@@ -3378,16 +3539,28 @@ class ChaosHeistApp:
                 wraplength=wraplength,
                 justify="center",
             )
-            self.announcement_detail_label.configure(
-                text=detail,
-                font=("Arial", detail_size, "bold"),
-                wraplength=wraplength,
-                justify="center",
-            )
+            if use_rich_detail:
+                self.render_colored_announcement_detail(
+                    detail,
+                    detail_size,
+                    wraplength,
+                )
+            else:
+                self.announcement_detail_label.configure(
+                    text=detail,
+                    font=("Arial", detail_size, "bold"),
+                    wraplength=wraplength,
+                    justify="center",
+                )
             self.announcement_window.update_idletasks()
+            detail_widget = (
+                rich_detail_canvas
+                if use_rich_detail
+                else self.announcement_detail_label
+            )
             required_height = (
                 self.announcement_title_label.winfo_reqheight()
-                + self.announcement_detail_label.winfo_reqheight()
+                + detail_widget.winfo_reqheight()
                 + (
                     self.announcement_energy_canvas.winfo_reqheight()
                     if (
@@ -3870,18 +4043,13 @@ class ChaosHeistApp:
         self.overlay_kind = "cinematic"
         self.hide_energy_meter()
         self.hide_story_question_message()
-        # No power-loss filter or CRT/glitch surface may survive into the
-        # video. Those windows are independent of the full-screen root, so
-        # explicitly withdraw them at the handoff as well as during normal
-        # power-loss cleanup.
-        self.hide_announcement_flash()
-        self.hide_power_loss_crt()
         self.title_label.configure(text="")
         self.count_label.configure(text="")
         self.animation_generation += 1
         self.active_frames = []
         self.active_delays = []
         self.background_label.configure(image="", background="black")
+        self.show_cinematic_surface()
         self.stop_music()
         self.stop_event_sound()
 
@@ -3923,6 +4091,57 @@ class ChaosHeistApp:
             self.cinematic_sound = None
             return False
 
+    def show_cinematic_surface(self) -> None:
+        """Show a dedicated opaque surface for every cinematic frame."""
+        canvas = getattr(self, "cinematic_canvas", None)
+        if canvas is None:
+            return
+
+        _x, _y, monitor_width, monitor_height = self.overlay_monitor_bounds
+        try:
+            # Start each cinematic with a fresh Canvas image item. This
+            # invalidates the complete previous image bounds instead of
+            # asking Tk to repaint an item that was updated many times on a
+            # display driver that has already shown stale rectangles.
+            canvas.delete("all")
+            self.cinematic_canvas_image_id = None
+            self.background_label.place_forget()
+            canvas.configure(
+                width=max(1, int(monitor_width)),
+                height=max(1, int(monitor_height)),
+                background="#000000",
+            )
+            canvas.place(
+                x=0,
+                y=0,
+                width=max(1, int(monitor_width)),
+                height=max(1, int(monitor_height)),
+            )
+            canvas.lift()
+            canvas.update_idletasks()
+        except (AttributeError, tk.TclError):
+            pass
+
+    def hide_cinematic_surface(self) -> None:
+        """Remove the cinematic surface and restore the normal image label."""
+        canvas = getattr(self, "cinematic_canvas", None)
+        if canvas is not None:
+            try:
+                canvas.delete("all")
+                self.cinematic_canvas_image_id = None
+                canvas.place_forget()
+            except (AttributeError, tk.TclError):
+                pass
+
+        try:
+            self.background_label.place(
+                relx=0.5,
+                rely=0.5,
+                anchor="center",
+            )
+        except (AttributeError, tk.TclError):
+            pass
+
     def display_cinematic_frame(
         self,
         frame_image,
@@ -3933,17 +4152,81 @@ class ChaosHeistApp:
             black_frame = Image.new("RGB", frame_image.size, "black")
             frame_image = Image.blend(black_frame, frame_image, alpha)
 
-        # Install a fresh Tk photo for every frame. Reusing PhotoImage.paste()
-        # was efficient on a desktop display but can leave partial dirty
-        # rectangles on the arcade CRT path; the symptom is two solid,
-        # partial-height black bars over otherwise clean video. The source
-        # frame is already bounded to the configured cinematic FPS, so this
-        # more conservative swap is preferable to risking stale pixels.
-        self.cinematic_photo = ImageTk.PhotoImage(frame_image)
+        photo = self.create_cinematic_photo(frame_image)
+        self.cinematic_photo = photo
+        photo_history = getattr(self, "cinematic_photo_history", None)
+        if photo_history is None:
+            photo_history = []
+            self.cinematic_photo_history = photo_history
+        photo_history.append(photo)
+        if len(photo_history) > 4:
+            del photo_history[:-4]
+
+        if (
+            getattr(self, "cinematic_canvas", None) is not None
+        ):
+            _x, _y, monitor_width, monitor_height = (
+                self.overlay_monitor_bounds
+            )
+            image_x = max(
+                0,
+                (int(monitor_width) - frame_image.width) // 2,
+            )
+            image_y = max(
+                0,
+                (int(monitor_height) - frame_image.height) // 2,
+            )
+            canvas = self.cinematic_canvas
+            old_image_id = self.cinematic_canvas_image_id
+            new_image_id = canvas.create_image(
+                image_x,
+                image_y,
+                anchor="nw",
+                image=photo,
+            )
+            if old_image_id is not None:
+                canvas.delete(old_image_id)
+            self.cinematic_canvas_image_id = new_image_id
+            canvas.update_idletasks()
+            return
+
+        # Compatibility fallback for lightweight test doubles and older
+        # instances that were created before the dedicated surface existed.
         self.background_label.configure(
-            image=self.cinematic_photo,
+            image=photo,
             background="black",
         )
+
+    def create_cinematic_photo(self, frame_image):
+        """Create a tightly packed Tk image without ImageTk's upload path.
+
+        The source frames are already detached RGB Pillow images. Tk's native
+        PPM loader gives the arcade display a complete packed image for every
+        frame, avoiding ImageTk's incremental conversion/upload path. Keep the
+        ImageTk fallback for test doubles and older Tk builds that reject raw
+        PPM bytes.
+        """
+        photo_kwargs = {}
+        if getattr(self, "root", None) is not None:
+            photo_kwargs["master"] = self.root
+        ppm_header = (
+            f"P6\n{frame_image.width} {frame_image.height}\n255\n"
+        ).encode("ascii")
+        ppm_data = ppm_header + frame_image.tobytes("raw", "RGB")
+        try:
+            return tk.PhotoImage(
+                data=ppm_data,
+                format="PPM",
+                **photo_kwargs,
+            )
+        except (
+            AttributeError,
+            RuntimeError,
+            tk.TclError,
+            TypeError,
+            ValueError,
+        ):
+            return ImageTk.PhotoImage(frame_image, **photo_kwargs)
 
     def poll_cinematic_playback(self) -> None:
         self.cinematic_after_id = None
@@ -4064,9 +4347,11 @@ class ChaosHeistApp:
                 self.cinematic_channel.stop()
             except pygame.error:
                 pass
+        self.hide_cinematic_surface()
         self.cinematic_sound = None
         self.cinematic_pending_frame = None
         self.cinematic_photo = None
+        self.cinematic_photo_history = []
 
     def finish_story_cinematic(self) -> None:
         self.cancel_cinematic()

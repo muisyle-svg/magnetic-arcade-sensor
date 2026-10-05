@@ -8,6 +8,16 @@ $ErrorActionPreference = "Stop"
 $ProjectDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $ProjectDirectory
 
+# Tcl/Tk in the bundled Python runtime cannot read an 8.3 extraction path
+# such as C:\Users\PROJEC~1. Normalize TEMP/TMP for PyInstaller and the
+# packaged self-test so the one-file bundle extracts under the full profile
+# path. This only affects this build process and its child processes.
+$BuildTempDirectory = Join-Path $env:LOCALAPPDATA "Temp"
+if (Test-Path -LiteralPath $BuildTempDirectory -PathType Container) {
+    $env:TEMP = $BuildTempDirectory
+    $env:TMP = $BuildTempDirectory
+}
+
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
     throw "Python was not found at $PythonPath. Pass -PythonPath with the full path to python.exe."
 }

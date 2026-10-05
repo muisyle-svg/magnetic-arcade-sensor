@@ -90,7 +90,7 @@ be counted twice.
   never reaches an emulator remains available for another attempt.
   The Robotnik screen is then restored if emeralds are still missing.
 - At the first total of 50 rings, the non-blocking message `50 Rings!` and
-  `Sonic holds the KEY to your prize... if it hasn't already been taken!` is shown for at least 10 seconds when Big Box is
+  `SONIC HOLDS the KEY to your prize... if it hasn't already been taken!` is shown for at least 10 seconds when Big Box is
   safely visible. If a game is active at that moment, the message remains
   pending and is shown the next time Big Box returns. Sensor and mode changes
   wait behind its ten-second priority interval. If a game interrupts the
